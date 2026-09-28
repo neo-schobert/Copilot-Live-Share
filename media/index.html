@@ -21,16 +21,27 @@
 
   <div id="app" class="app" hidden>
     <header class="topbar">
-      <h1>Shared Copilot Chat</h1>
+      <button id="toggle-convs" class="ghost icon drawer-toggle" type="button" aria-controls="convs" aria-expanded="false" title="Discussions">☰<span id="unread-total" class="dot" hidden></span></button>
+      <div class="title-wrap">
+        <h1 id="conv-title" class="conv-title"></h1>
+        <form id="rename-form" class="rename-form" hidden>
+          <input id="rename-input" maxlength="60" aria-label="Titre de la discussion">
+        </form>
+        <button id="rename" class="ghost icon" type="button" title="Renommer la discussion">✎</button>
+      </div>
       <span id="connection" class="connection" data-state="connecting">Connexion…</span>
-      <button id="toggle-people" class="ghost people-toggle" type="button" aria-controls="people" aria-expanded="false">
-        Participants <span id="people-count" class="count">0</span>
+      <button id="toggle-people" class="ghost drawer-toggle" type="button" title="Participants" aria-controls="people" aria-expanded="false">
+        <span class="people-label">Participants</span> <span id="people-count" class="count">0</span>
       </button>
     </header>
 
     <div class="layout">
+      <nav id="convs" class="convs drawer drawer-left" aria-label="Discussions">
+        <button id="new-conv" class="new-conv" type="button">+ Nouvelle discussion</button>
+        <ul id="conv-list"></ul>
+      </nav>
       <main id="messages" class="messages" aria-live="polite"></main>
-      <aside id="people" class="people">
+      <aside id="people" class="people drawer drawer-right">
         <h2>Participants</h2>
         <ul id="people-list"></ul>
       </aside>
@@ -44,7 +55,10 @@
       </div>
       <form id="ask-form" class="ask">
         <textarea id="ask-input" rows="2" maxlength="8000" placeholder="Posez une question… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
-        <button id="ask-send" type="submit">Envoyer</button>
+        <div class="ask-bar">
+          <select id="model-select" class="model-select" aria-label="Modèle"></select>
+          <button id="ask-send" type="submit">Envoyer</button>
+        </div>
       </form>
     </footer>
   </div>

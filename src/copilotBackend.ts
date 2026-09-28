@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 import type { ModelBackend, ModelResponse, ModelTurn } from './chatRoom';
+import type { ModelInfo } from './protocol';
 
 /** Accès aux modèles Copilot via l'API Language Model de VS Code. */
 export class CopilotBackend implements ModelBackend {
-  async ask(turns: ModelTurn[], signal: AbortSignal): Promise<ModelResponse> {
-    const model = await selectModel();
+  async ask(turns: ModelTurn[], signal: AbortSignal, modelId?: string): Promise<ModelResponse> {
+    const model = modelId ? await selectById(modelId) : await selectModel();
 
     const cts = new vscode.CancellationTokenSource();
     const onAbort = () => cts.cancel();
@@ -46,6 +47,31 @@ export class CopilotBackend implements ModelBackend {
 
     return { modelName: model.name, chunks: stream() };
   }
+}
+
+/** Modèles Copilot disponibles, dédoublonnés et triés par nom. */
+export async function listCopilotModels(): Promise<ModelInfo[]> {
+  const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+  const byId = new Map<string, ModelInfo>();
+  for (const m of models) {
+    byId.set(m.id, { id: m.id, name: m.name, family: m.family });
+  }
+  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Modèle par défaut : premier de la famille configurée, sinon premier disponible. */
+export function defaultModelId(models: ModelInfo[]): string | null {
+  const family = vscode.workspace.getConfiguration('sharedCopilotChat').get<string>('modelFamily', '').trim();
+  const match = family ? models.find((m) => m.family === family) : undefined;
+  return (match ?? models[0])?.id ?? null;
+}
+
+async function selectById(id: string): Promise<vscode.LanguageModelChat> {
+  const [model] = await vscode.lm.selectChatModels({ vendor: 'copilot', id });
+  if (!model) {
+    throw new Error("Le modèle choisi n'est plus disponible chez l'hôte. Choisissez-en un autre.");
+  }
+  return model;
 }
 
 async function selectModel(): Promise<vscode.LanguageModelChat> {

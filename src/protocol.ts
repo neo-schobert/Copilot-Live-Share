@@ -8,10 +8,23 @@ export interface Participant {
   clientId: string;
   name: string;
   isHost: boolean;
+  /** Discussion actuellement affichée par ce participant. */
+  viewing: string | null;
+}
+
+/** Une discussion : un fil de messages avec son propre historique envoyé au modèle. */
+export interface Conversation {
+  id: string;
+  title: string;
+  createdAt: number;
+  createdBy: string;
+  /** Id client du créateur, pour que son navigateur ouvre la discussion créée. */
+  createdByClientId: string;
 }
 
 interface BaseEntry {
   id: string;
+  conversationId: string;
   /** Horodatage epoch en millisecondes. */
   timestamp: number;
 }
@@ -59,13 +72,29 @@ export interface SystemEntry extends BaseEntry {
 
 export type ChatEntry = UserEntry | AssistantEntry | ContextEntry | SystemEntry;
 
+export interface ModelInfo {
+  id: string;
+  name: string;
+  family: string;
+}
+
+export interface ModelsState {
+  available: ModelInfo[];
+  /** Modèle utilisé quand une question n'en précise pas (null : aucun modèle). */
+  defaultId: string | null;
+  /** Si false, seules les questions de l'hôte peuvent choisir un autre modèle. */
+  guestsCanChoose: boolean;
+}
+
 export interface QueueItem {
   /** Id de la UserEntry correspondante. */
   entryId: string;
+  conversationId: string;
   clientId: string;
   author: string;
 }
 
+/** File unique pour toute la session : une seule question traitée à la fois. */
 export interface QueueState {
   /** Question en cours de traitement par le modèle. */
   current: QueueItem | null;
@@ -77,8 +106,14 @@ export interface QueueState {
 
 export type ClientMessage =
   | { type: 'hello'; name: string; clientId: string }
-  | { type: 'ask'; text: string }
-  | { type: 'cancel' };
+  /** `modelId` absent : modèle par défaut de la session. */
+  | { type: 'ask'; conversationId: string; text: string; modelId?: string }
+  | { type: 'cancel' }
+  | { type: 'view'; conversationId: string }
+  | { type: 'createConversation' }
+  | { type: 'renameConversation'; conversationId: string; title: string }
+  /** Réservé à l'hôte. */
+  | { type: 'deleteConversation'; conversationId: string };
 
 // ---- Serveur -> client ----
 
@@ -86,10 +121,16 @@ export type ServerMessage =
   | {
       type: 'welcome';
       you: Participant;
+      conversations: Conversation[];
+      /** Entrées de toutes les discussions, dans l'ordre chronologique. */
       history: ChatEntry[];
       participants: Participant[];
       queue: QueueState;
+      models: ModelsState;
     }
+  /** Discussion créée ou renommée. */
+  | { type: 'conversation'; conversation: Conversation }
+  | { type: 'conversationDeleted'; conversationId: string }
   | { type: 'entry'; entry: ChatEntry }
   | { type: 'chunk'; entryId: string; text: string }
   | {
@@ -101,16 +142,22 @@ export type ServerMessage =
     }
   | { type: 'participants'; participants: Participant[] }
   | { type: 'queue'; queue: QueueState }
+  | { type: 'models'; models: ModelsState }
   | { type: 'error'; message: string }
   | { type: 'sessionEnded'; reason: string };
 
 export const LIMITS = {
   maxNameLength: 32,
+  maxTitleLength: 60,
+  maxConversations: 50,
   maxQuestionLength: 8000,
   maxPendingPerClient: 5,
   /** Taille max d'une trame WebSocket entrante, en octets. */
   maxPayloadBytes: 64 * 1024,
 } as const;
+
+/** Titre d'une discussion tant qu'aucune question n'y a été posée. */
+export const DEFAULT_CONVERSATION_TITLE = 'Nouvelle discussion';
 
 /** Codes de fermeture WebSocket applicatifs (plage 4000-4999). */
 export const CLOSE_CODES = {

@@ -3,7 +3,7 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
 import { ChatRoom } from './chatRoom';
-import { CopilotBackend } from './copilotBackend';
+import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
 import { ChatServer } from './server';
 
 const CONFIG = 'sharedCopilotChat';
@@ -83,6 +83,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('sharedCopilotChat.shareSelection', withSession(shareSelection)),
     vscode.commands.registerCommand('sharedCopilotChat.cancelResponse', withSession(cancelResponse)),
     vscode.commands.registerCommand('sharedCopilotChat.stopSession', withSession(stopSession)),
+    vscode.commands.registerCommand('sharedCopilotChat.selectModel', selectDefaultModel),
+    vscode.lm.onDidChangeChatModels(() => void refreshModels()),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration(`${CONFIG}.modelFamily`) || e.affectsConfiguration(`${CONFIG}.allowGuestModelChoice`)) {
+        void refreshModels();
+      }
+    }),
   );
 }
 
@@ -109,7 +116,6 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
 }
 
 async function createSession(context: vscode.ExtensionContext): Promise<void> {
-
   const config = vscode.workspace.getConfiguration(CONFIG);
   const port = config.get<number>('port', 3717);
 
@@ -163,7 +169,60 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   session = new Session(server, room, guestToken, hostToken);
   await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', true);
   updateStatusBar(0);
+  void refreshModels();
   void showSessionNotification(session, 'Session démarrée');
+}
+
+/** Envoie aux participants la liste des modèles Copilot et le modèle par défaut. */
+async function refreshModels(): Promise<void> {
+  const s = session;
+  if (!s) {
+    return;
+  }
+  let available: Awaited<ReturnType<typeof listCopilotModels>> = [];
+  try {
+    available = await listCopilotModels();
+  } catch {
+    // Copilot absent ou pas encore prêt : liste vide, le chat affichera l'erreur à la première question.
+  }
+  if (session !== s) {
+    return;
+  }
+  s.room.setModels({
+    available,
+    defaultId: defaultModelId(available),
+    guestsCanChoose: vscode.workspace.getConfiguration(CONFIG).get<boolean>('allowGuestModelChoice', true),
+  });
+}
+
+async function selectDefaultModel(): Promise<void> {
+  const models = await listCopilotModels();
+  if (!models.length) {
+    void vscode.window.showErrorMessage(
+      'Shared Copilot : aucun modèle Copilot disponible. Vérifiez que GitHub Copilot Chat est installé et connecté.',
+    );
+    return;
+  }
+  const currentId = defaultModelId(models);
+  const picked = await vscode.window.showQuickPick(
+    models.map((m) => ({
+      label: m.id === currentId ? `$(check) ${m.name}` : m.name,
+      description: m.family,
+      model: m,
+    })),
+    { title: 'Modèle par défaut de la session partagée', placeHolder: 'Utilisé quand un participant ne choisit pas de modèle' },
+  );
+  if (!picked) {
+    return;
+  }
+  // Le paramètre est stocké par famille ; on respecte le niveau (espace de travail ou utilisateur) déjà utilisé.
+  const config = vscode.workspace.getConfiguration(CONFIG);
+  const target =
+    config.inspect('modelFamily')?.workspaceValue !== undefined
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+  await config.update('modelFamily', picked.model.family, target);
+  vscode.window.setStatusBarMessage(`Shared Copilot : modèle par défaut → ${picked.model.name}`, 3000);
 }
 
 async function showSessionNotification(s: Session, title: string): Promise<void> {
@@ -230,14 +289,40 @@ async function shareSelection(s: Session): Promise<void> {
     }
   }
   const endLine = hasSelection && sel.end.character === 0 && sel.end.line > sel.start.line ? sel.end.line : sel.end.line + 1;
-  s.room.addContext({
+  const context = {
     author: hostName(),
     fileName: vscode.workspace.asRelativePath(doc.uri, false),
     languageId: doc.languageId,
     range: hasSelection ? `lignes ${sel.start.line + 1}-${endLine}` : undefined,
     code,
-  });
-  vscode.window.setStatusBarMessage('Shared Copilot : contexte partagé', 3000);
+  };
+  const conversationId = await pickTargetConversation(s);
+  if (!conversationId) {
+    return;
+  }
+  if (!s.room.addContext(conversationId, context)) {
+    void vscode.window.showWarningMessage("Shared Copilot : cette discussion n'existe plus.");
+    return;
+  }
+  const title = s.room.conversationList.find((c) => c.id === conversationId)?.title;
+  vscode.window.setStatusBarMessage(`Shared Copilot : contexte partagé dans « ${title} »`, 3000);
+}
+
+/** Discussion ouverte dans la webview de l'hôte, la seule existante, ou choisie dans une liste. */
+async function pickTargetConversation(s: Session): Promise<string | undefined> {
+  const viewing = s.room.hostViewing;
+  if (viewing) {
+    return viewing;
+  }
+  const conversations = s.room.conversationList;
+  if (conversations.length === 1) {
+    return conversations[0].id;
+  }
+  const picked = await vscode.window.showQuickPick(
+    [...conversations].reverse().map((c) => ({ label: c.title, description: `créée par ${c.createdBy}`, id: c.id })),
+    { title: 'Partager dans quelle discussion ?' },
+  );
+  return picked?.id;
 }
 
 function cancelResponse(s: Session): void {

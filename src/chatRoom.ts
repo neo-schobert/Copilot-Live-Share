@@ -5,7 +5,10 @@ import {
   ClientMessage,
   CLOSE_CODES,
   ContextEntry,
+  Conversation,
+  DEFAULT_CONVERSATION_TITLE,
   LIMITS,
+  ModelsState,
   Participant,
   QueueItem,
   QueueState,
@@ -15,8 +18,9 @@ import {
 import type { Connection, ConnectionHandler } from './server';
 
 /**
- * État d'une session de chat : historique, participants et file d'attente des
- * questions. Indépendant de VS Code : le modèle est fourni via {@link ModelBackend}.
+ * État d'une session de chat : discussions, historique, participants et file
+ * d'attente des questions. Indépendant de VS Code : le modèle est fourni via
+ * {@link ModelBackend}.
  */
 
 export interface ModelTurn {
@@ -30,8 +34,11 @@ export interface ModelResponse {
 }
 
 export interface ModelBackend {
-  /** Lance une requête. Doit lever une Error au message lisible par les participants en cas d'échec. */
-  ask(turns: ModelTurn[], signal: AbortSignal): Promise<ModelResponse>;
+  /**
+   * Lance une requête sur le modèle `modelId` (ou le modèle par défaut s'il est absent).
+   * Doit lever une Error au message lisible par les participants en cas d'échec.
+   */
+  ask(turns: ModelTurn[], signal: AbortSignal, modelId?: string): Promise<ModelResponse>;
 }
 
 export interface ChatRoomOptions {
@@ -46,6 +53,13 @@ interface ClientState extends Participant {
 
 interface QueuedQuestion extends QueueItem {
   text: string;
+  /** Modèle choisi par l'auteur ; absent : modèle par défaut au moment du traitement. */
+  modelId?: string;
+}
+
+interface ConversationState extends Conversation {
+  /** Titre encore automatique : il prendra le texte de la première question. */
+  autoTitle: boolean;
 }
 
 const SYSTEM_PROMPT = [
@@ -56,21 +70,25 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 export class ChatRoom implements ConnectionHandler {
+  private readonly conversations: ConversationState[] = [];
   private readonly entries: ChatEntry[] = [];
   private readonly clients = new Map<Connection, ClientState>();
   private readonly queue: QueuedQuestion[] = [];
   private current: { item: QueuedQuestion; abort: AbortController } | undefined;
+  private models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
   private disposed = false;
 
   constructor(
     private readonly backend: ModelBackend,
     private readonly options: ChatRoomOptions,
-  ) {}
+  ) {
+    this.createConversation('hôte', '');
+  }
 
   // ---- ConnectionHandler ----
 
   onOpen(conn: Connection): void {
-    this.clients.set(conn, { clientId: '', name: '', isHost: conn.isHost, joined: false });
+    this.clients.set(conn, { clientId: '', name: '', isHost: conn.isHost, viewing: null, joined: false });
   }
 
   onClose(conn: Connection): void {
@@ -101,15 +119,47 @@ export class ChatRoom implements ConnectionHandler {
       conn.send({ type: 'error', message: "Choisissez d'abord un pseudo." });
       return;
     }
+    const fail = (message: string) => conn.send({ type: 'error', message });
+
     switch (msg.type) {
       case 'ask':
-        this.handleAsk(conn, state, msg.text);
+        this.handleAsk(state, msg.conversationId, msg.text, msg.modelId, fail);
         break;
       case 'cancel':
         if (!state.isHost) {
-          conn.send({ type: 'error', message: "Seul l'hôte peut annuler une réponse." });
+          fail("Seul l'hôte peut annuler une réponse.");
         } else if (!this.cancelCurrent()) {
-          conn.send({ type: 'error', message: 'Aucune réponse en cours.' });
+          fail('Aucune réponse en cours.');
+        }
+        break;
+      case 'view':
+        if (this.findConversation(msg.conversationId) && state.viewing !== msg.conversationId) {
+          state.viewing = msg.conversationId;
+          this.broadcastParticipants();
+        }
+        break;
+      case 'createConversation':
+        if (this.conversations.length >= LIMITS.maxConversations) {
+          fail(`Nombre maximal de discussions atteint (${LIMITS.maxConversations}).`);
+        } else {
+          this.createConversation(state.name, state.clientId);
+        }
+        break;
+      case 'renameConversation': {
+        const conv = this.findConversation(msg.conversationId);
+        const title = sanitizeLine(msg.title, LIMITS.maxTitleLength);
+        if (conv && title) {
+          conv.title = title;
+          conv.autoTitle = false;
+          this.broadcastConversation(conv);
+        }
+        break;
+      }
+      case 'deleteConversation':
+        if (!state.isHost) {
+          fail("Seul l'hôte peut supprimer une discussion.");
+        } else {
+          this.deleteConversation(msg.conversationId);
         }
         break;
     }
@@ -121,10 +171,24 @@ export class ChatRoom implements ConnectionHandler {
     const byId = new Map<string, Participant>();
     for (const c of this.clients.values()) {
       if (c.joined) {
-        byId.set(c.clientId, { clientId: c.clientId, name: c.name, isHost: c.isHost });
+        byId.set(c.clientId, { clientId: c.clientId, name: c.name, isHost: c.isHost, viewing: c.viewing });
       }
     }
     return [...byId.values()];
+  }
+
+  get conversationList(): Conversation[] {
+    return this.conversations.map(publicConversation);
+  }
+
+  /** Discussion affichée par l'hôte (webview), s'il est connecté. */
+  get hostViewing(): string | undefined {
+    for (const c of this.clients.values()) {
+      if (c.joined && c.isHost && c.viewing && this.findConversation(c.viewing)) {
+        return c.viewing;
+      }
+    }
+    return undefined;
   }
 
   get isAnswering(): boolean {
@@ -140,13 +204,19 @@ export class ChatRoom implements ConnectionHandler {
     return true;
   }
 
-  addContext(context: Omit<ContextEntry, 'kind' | 'id' | 'timestamp'>): void {
-    const entry: ContextEntry = { kind: 'context', id: newId(), timestamp: Date.now(), ...context };
-    this.pushEntry(entry);
+  /** Ajoute un contexte partagé. Renvoie false si la discussion n'existe plus. */
+  addContext(conversationId: string, context: Omit<ContextEntry, 'kind' | 'id' | 'timestamp' | 'conversationId'>): boolean {
+    if (!this.findConversation(conversationId)) {
+      return false;
+    }
+    this.pushEntry({ kind: 'context', id: newId(), conversationId, timestamp: Date.now(), ...context });
+    return true;
   }
 
-  addSystemMessage(text: string, level: 'info' | 'error' = 'info'): void {
-    this.pushEntry({ kind: 'system', id: newId(), timestamp: Date.now(), level, text });
+  /** Met à jour la liste des modèles proposés et la diffuse. */
+  setModels(models: ModelsState): void {
+    this.models = models;
+    this.broadcast({ type: 'models', models });
   }
 
   /** Prévient les clients, annule la réponse en cours et libère l'état. La fermeture des sockets revient au serveur. */
@@ -159,13 +229,14 @@ export class ChatRoom implements ConnectionHandler {
     this.current?.abort.abort();
     this.queue.length = 0;
     this.entries.length = 0;
+    this.conversations.length = 0;
     this.clients.clear();
   }
 
   // ---- Gestion des messages ----
 
   private handleHello(conn: Connection, state: ClientState, rawName: string, rawClientId: string): void {
-    const name = sanitizeName(rawName);
+    const name = sanitizeLine(rawName, LIMITS.maxNameLength);
     if (!name) {
       conn.send({ type: 'error', message: 'Pseudo invalide.' });
       conn.close(CLOSE_CODES.protocolError, 'Invalid name');
@@ -177,32 +248,58 @@ export class ChatRoom implements ConnectionHandler {
 
     conn.send({
       type: 'welcome',
-      you: { clientId: state.clientId, name: state.name, isHost: state.isHost },
+      you: { clientId: state.clientId, name: state.name, isHost: state.isHost, viewing: state.viewing },
+      conversations: this.conversationList,
       history: this.entries,
       participants: this.participantList,
       queue: this.queueState(),
+      models: this.models,
     });
     this.broadcastParticipants();
   }
 
-  private handleAsk(conn: Connection, state: ClientState, rawText: string): void {
+  private handleAsk(
+    state: ClientState,
+    conversationId: string,
+    rawText: string,
+    rawModelId: string | undefined,
+    fail: (message: string) => void,
+  ): void {
+    const conv = this.findConversation(conversationId);
+    if (!conv) {
+      fail("Cette discussion n'existe plus.");
+      return;
+    }
     const text = rawText.trim();
     if (!text) {
       return;
     }
     if (text.length > LIMITS.maxQuestionLength) {
-      conn.send({ type: 'error', message: `Question trop longue (max ${LIMITS.maxQuestionLength} caractères).` });
+      fail(`Question trop longue (max ${LIMITS.maxQuestionLength} caractères).`);
       return;
+    }
+    let modelId: string | undefined;
+    if (rawModelId) {
+      if (!state.isHost && !this.models.guestsCanChoose) {
+        fail("L'hôte a fixé le modèle : choix de modèle non autorisé.");
+        return;
+      }
+      if (!this.models.available.some((m) => m.id === rawModelId)) {
+        fail("Ce modèle n'est plus disponible. Choisissez-en un autre.");
+        return;
+      }
+      modelId = rawModelId;
     }
     const pendingForClient = this.queue.filter((q) => q.clientId === state.clientId).length;
     if (pendingForClient >= LIMITS.maxPendingPerClient) {
-      conn.send({ type: 'error', message: `Vous avez déjà ${pendingForClient} questions en attente.` });
+      fail(`Vous avez déjà ${pendingForClient} questions en attente.`);
       return;
     }
 
     const entry: UserEntry = {
       kind: 'user',
       id: newId(),
+      conversationId,
       timestamp: Date.now(),
       author: state.name,
       clientId: state.clientId,
@@ -210,9 +307,59 @@ export class ChatRoom implements ConnectionHandler {
       text,
     };
     this.pushEntry(entry);
-    this.queue.push({ entryId: entry.id, clientId: state.clientId, author: state.name, text });
+    if (conv.autoTitle) {
+      conv.title = sanitizeLine(text, LIMITS.maxTitleLength) || conv.title;
+      conv.autoTitle = false;
+      this.broadcastConversation(conv);
+    }
+    this.queue.push({ entryId: entry.id, conversationId, clientId: state.clientId, author: state.name, text, modelId });
     this.broadcastQueue();
     this.pump();
+  }
+
+  // ---- Discussions ----
+
+  private findConversation(id: string): ConversationState | undefined {
+    return this.conversations.find((c) => c.id === id);
+  }
+
+  private createConversation(author: string, clientId: string): ConversationState {
+    const conv: ConversationState = {
+      id: newId(),
+      title: DEFAULT_CONVERSATION_TITLE,
+      createdAt: Date.now(),
+      createdBy: author,
+      createdByClientId: clientId,
+      autoTitle: true,
+    };
+    this.conversations.push(conv);
+    this.broadcastConversation(conv);
+    return conv;
+  }
+
+  private deleteConversation(id: string): void {
+    const index = this.conversations.findIndex((c) => c.id === id);
+    if (index < 0) {
+      return;
+    }
+    this.conversations.splice(index, 1);
+    removeWhere(this.entries, (e) => e.conversationId === id);
+    removeWhere(this.queue, (q) => q.conversationId === id);
+    if (this.current?.item.conversationId === id) {
+      this.current.abort.abort();
+    }
+    for (const c of this.clients.values()) {
+      if (c.viewing === id) {
+        c.viewing = null;
+      }
+    }
+    this.broadcast({ type: 'conversationDeleted', conversationId: id });
+    // Il reste toujours au moins une discussion.
+    if (!this.conversations.length) {
+      this.createConversation('hôte', '');
+    }
+    this.broadcastQueue();
+    this.broadcastParticipants();
   }
 
   // ---- File d'attente ----
@@ -242,6 +389,7 @@ export class ChatRoom implements ConnectionHandler {
     const entry: AssistantEntry = {
       kind: 'assistant',
       id: newId(),
+      conversationId: item.conversationId,
       timestamp: Date.now(),
       replyTo: item.entryId,
       replyToAuthor: item.author,
@@ -252,7 +400,7 @@ export class ChatRoom implements ConnectionHandler {
     this.broadcastQueue();
 
     try {
-      const response = await this.backend.ask(turns, signal);
+      const response = await this.backend.ask(turns, signal, item.modelId ?? this.models.defaultId ?? undefined);
       entry.model = response.modelName;
       this.broadcast({ type: 'entryUpdate', entryId: entry.id, status: 'streaming', model: entry.model });
       for await (const chunk of response.chunks) {
@@ -284,11 +432,13 @@ export class ChatRoom implements ConnectionHandler {
 
   /**
    * Construit les messages envoyés au modèle : consigne, puis les N derniers
-   * échanges terminés (chaque question suivie de sa réponse), puis la question.
+   * échanges terminés de la même discussion (chaque question suivie de sa
+   * réponse), puis la question.
    */
   private buildTurns(question: QueuedQuestion): ModelTurn[] {
+    const entries = this.entries.filter((e) => e.conversationId === question.conversationId);
     const answers = new Map<string, AssistantEntry>();
-    for (const e of this.entries) {
+    for (const e of entries) {
       if (e.kind === 'assistant') {
         answers.set(e.replyTo, e);
       }
@@ -296,7 +446,7 @@ export class ChatRoom implements ConnectionHandler {
 
     // Une « unité » = une question et sa réponse, ou un contexte partagé.
     const units: ModelTurn[][] = [];
-    for (const e of this.entries) {
+    for (const e of entries) {
       if (e.kind === 'context') {
         units.push([{ role: 'user', content: formatContext(e) }]);
       } else if (e.kind === 'user' && e.id !== question.entryId) {
@@ -323,7 +473,12 @@ export class ChatRoom implements ConnectionHandler {
   }
 
   private queueState(): QueueState {
-    const strip = ({ entryId, clientId, author }: QueueItem): QueueItem => ({ entryId, clientId, author });
+    const strip = ({ entryId, conversationId, clientId, author }: QueueItem): QueueItem => ({
+      entryId,
+      conversationId,
+      clientId,
+      author,
+    });
     return {
       current: this.current ? strip(this.current.item) : null,
       pending: this.queue.map(strip),
@@ -338,6 +493,10 @@ export class ChatRoom implements ConnectionHandler {
     }
     this.entries.push(entry);
     this.broadcast({ type: 'entry', entry });
+  }
+
+  private broadcastConversation(conv: ConversationState): void {
+    this.broadcast({ type: 'conversation', conversation: publicConversation(conv) });
   }
 
   private broadcastQueue(): void {
@@ -370,26 +529,43 @@ function parseClientMessage(data: string): ClientMessage | undefined {
     return undefined;
   }
   const m = raw as Record<string, unknown>;
+  const str = (v: unknown): v is string => typeof v === 'string';
   switch (m.type) {
     case 'hello':
-      return typeof m.name === 'string' && typeof m.clientId === 'string'
-        ? { type: 'hello', name: m.name, clientId: m.clientId }
-        : undefined;
+      return str(m.name) && str(m.clientId) ? { type: 'hello', name: m.name, clientId: m.clientId } : undefined;
     case 'ask':
-      return typeof m.text === 'string' ? { type: 'ask', text: m.text } : undefined;
+      if (!str(m.text) || !str(m.conversationId) || (m.modelId !== undefined && !str(m.modelId))) {
+        return undefined;
+      }
+      return { type: 'ask', conversationId: m.conversationId, text: m.text, modelId: m.modelId || undefined };
     case 'cancel':
       return { type: 'cancel' };
+    case 'view':
+      return str(m.conversationId) ? { type: 'view', conversationId: m.conversationId } : undefined;
+    case 'createConversation':
+      return { type: 'createConversation' };
+    case 'renameConversation':
+      return str(m.conversationId) && str(m.title)
+        ? { type: 'renameConversation', conversationId: m.conversationId, title: m.title }
+        : undefined;
+    case 'deleteConversation':
+      return str(m.conversationId) ? { type: 'deleteConversation', conversationId: m.conversationId } : undefined;
     default:
       return undefined;
   }
 }
 
-function sanitizeName(raw: string): string {
-  return raw
-    .replace(/[\u0000-\u001f\u007f]/g, '')
+/** Texte sur une ligne : sans caractères de contrôle, espaces normalisés, tronqué. */
+function sanitizeLine(raw: string, maxLength: number): string {
+  const clean = raw
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, LIMITS.maxNameLength);
+    .trim();
+  return clean.length > maxLength ? `${clean.slice(0, maxLength - 1).trimEnd()}…` : clean;
+}
+
+function publicConversation({ id, title, createdAt, createdBy, createdByClientId }: ConversationState): Conversation {
+  return { id, title, createdAt, createdBy, createdByClientId };
 }
 
 function formatContext(e: ContextEntry): string {
@@ -409,6 +585,14 @@ function mergeConsecutive(turns: ModelTurn[]): ModelTurn[] {
     }
   }
   return out;
+}
+
+function removeWhere<T>(list: T[], pred: (item: T) => boolean): void {
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (pred(list[i])) {
+      list.splice(i, 1);
+    }
+  }
 }
 
 function newId(): string {

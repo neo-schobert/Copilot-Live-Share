@@ -48,6 +48,11 @@
         "command": "sharedCopilotChat.stopSession",
         "title": "Stop Session",
         "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.selectModel",
+        "title": "Select Default Model",
+        "category": "Shared Copilot"
       }
     ],
     "menus": {
@@ -94,7 +99,12 @@
         "sharedCopilotChat.modelFamily": {
           "type": "string",
           "default": "",
-          "description": "Famille du modèle Copilot à utiliser (ex. « gpt-4o », « claude-sonnet-4 »). Vide : premier modèle Copilot disponible."
+          "description": "Famille du modèle Copilot utilisé par défaut (ex. « gpt-4o », « claude-sonnet-4 »). Vide : premier modèle Copilot disponible. Modifiable avec « Shared Copilot: Select Default Model »."
+        },
+        "sharedCopilotChat.allowGuestModelChoice": {
+          "type": "boolean",
+          "default": true,
+          "description": "Autorise les invités à choisir un autre modèle pour leurs questions. Toutes les requêtes utilisent le quota Copilot de l'hôte, y compris les modèles premium."
         },
         "sharedCopilotChat.historyLength": {
           "type": "integer",

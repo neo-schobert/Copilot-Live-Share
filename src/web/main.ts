@@ -2,7 +2,9 @@ import {
   AssistantEntry,
   ChatEntry,
   CLOSE_CODES,
+  Conversation,
   LIMITS,
+  ModelsState,
   Participant,
   QueueState,
   ServerMessage,
@@ -18,6 +20,15 @@ const joinForm = $<HTMLFormElement>('join-form');
 const nameInput = $<HTMLInputElement>('name-input');
 const app = $<HTMLElement>('app');
 const connectionEl = $<HTMLElement>('connection');
+const convTitle = $<HTMLElement>('conv-title');
+const renameBtn = $<HTMLButtonElement>('rename');
+const renameForm = $<HTMLFormElement>('rename-form');
+const renameInput = $<HTMLInputElement>('rename-input');
+const convsEl = $<HTMLElement>('convs');
+const convList = $<HTMLUListElement>('conv-list');
+const newConvBtn = $<HTMLButtonElement>('new-conv');
+const convsToggle = $<HTMLButtonElement>('toggle-convs');
+const unreadTotal = $<HTMLElement>('unread-total');
 const messagesEl = $<HTMLElement>('messages');
 const peopleEl = $<HTMLElement>('people');
 const peopleList = $<HTMLUListElement>('people-list');
@@ -29,6 +40,7 @@ const cancelBtn = $<HTMLButtonElement>('cancel');
 const askForm = $<HTMLFormElement>('ask-form');
 const askInput = $<HTMLTextAreaElement>('ask-input');
 const askSend = $<HTMLButtonElement>('ask-send');
+const modelSelect = $<HTMLSelectElement>('model-select');
 const toastEl = $<HTMLElement>('toast');
 
 // ---- État ----
@@ -44,10 +56,18 @@ let ended = false;
 let reconnectDelay = 1000;
 let reconnectTimer: number | undefined;
 
+let conversations: Conversation[] = [];
+let activeId: string | null = null;
+/** Nombre de nouveaux messages par discussion non affichée. */
+const unread = new Map<string, number>();
+/** Entrées de toutes les discussions ; seules celles de la discussion active sont dans le DOM. */
 const entries = new Map<string, ChatEntry>();
 const entryEls = new Map<string, HTMLElement>();
 let participants: Participant[] = [];
 let queue: QueueState = { current: null, pending: [] };
+let models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
+/** Modèle choisi par ce participant ; '' = modèle par défaut de la session. */
+let chosenModel = storage('local', 'scc.model') ?? '';
 /** Entrées dont le rendu doit être rafraîchi à la prochaine frame (streaming). */
 const dirty = new Set<string>();
 let frameRequested = false;
@@ -56,6 +76,7 @@ let frameRequested = false;
 
 nameInput.maxLength = LIMITS.maxNameLength;
 askInput.maxLength = LIMITS.maxQuestionLength;
+renameInput.maxLength = LIMITS.maxTitleLength;
 nameInput.value = params.get('name') ?? storage('session', 'scc.name') ?? storage('local', 'scc.name') ?? '';
 
 // Reconnexion après rechargement de l'onglet, ou pseudo fourni par l'hôte (webview) : on rejoint directement.
@@ -128,7 +149,6 @@ function scheduleReconnect(): void {
     return;
   }
   setConnection('offline', `Déconnecté — nouvelle tentative dans ${Math.round(reconnectDelay / 1000)} s`);
-  updateComposer();
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = undefined;
     connect();
@@ -158,6 +178,7 @@ function endSession(reason: string): void {
   queue = { current: null, pending: [] };
   participants = [];
   renderParticipants();
+  renderConversations();
   updateComposer();
   updateActivity();
 }
@@ -166,30 +187,71 @@ function endSession(reason: string): void {
 
 function handle(msg: ServerMessage): void {
   switch (msg.type) {
-    case 'welcome':
+    case 'welcome': {
       me = msg.you;
       myName = msg.you.name;
       setConnection('online', 'Connecté');
+      conversations = msg.conversations;
       entries.clear();
-      entryEls.clear();
-      dirty.clear();
-      messagesEl.replaceChildren();
       for (const entry of msg.history) {
-        addEntry(entry);
-      }
-      if (!msg.history.length) {
-        messagesEl.append(emptyState());
+        entries.set(entry.id, entry);
       }
       participants = msg.participants;
       queue = msg.queue;
+      models = msg.models;
+      const remembered = activeId ?? storage('session', 'scc.conv');
+      const known = conversations.some((c) => c.id === remembered);
+      openConversation(known ? remembered! : lastConversationId(), true);
       renderParticipants();
+      renderModels();
       updateActivity();
-      updateComposer();
-      scrollToBottom(true);
       break;
+    }
+    case 'conversation': {
+      const index = conversations.findIndex((c) => c.id === msg.conversation.id);
+      if (index >= 0) {
+        conversations[index] = msg.conversation;
+      } else {
+        conversations.push(msg.conversation);
+      }
+      // Discussion que je viens de créer, ou remplaçante de la dernière supprimée : on l'ouvre.
+      if (index < 0 && (msg.conversation.createdByClientId === clientId || activeId === null)) {
+        openConversation(msg.conversation.id);
+      } else {
+        renderConversations();
+        renderTitle();
+        renderParticipants();
+      }
+      break;
+    }
+    case 'conversationDeleted': {
+      conversations = conversations.filter((c) => c.id !== msg.conversationId);
+      unread.delete(msg.conversationId);
+      for (const [id, e] of entries) {
+        if (e.conversationId === msg.conversationId) {
+          entries.delete(id);
+        }
+      }
+      if (activeId === msg.conversationId) {
+        toast('Cette discussion a été supprimée par l’hôte.');
+        activeId = null;
+        if (conversations.length) {
+          openConversation(lastConversationId());
+        }
+      } else {
+        renderConversations();
+      }
+      break;
+    }
     case 'entry':
-      messagesEl.querySelector('.empty')?.remove();
-      withAutoScroll(() => addEntry(msg.entry));
+      entries.set(msg.entry.id, msg.entry);
+      if (msg.entry.conversationId === activeId) {
+        messagesEl.querySelector('.empty')?.remove();
+        withAutoScroll(() => appendEntry(msg.entry));
+      } else if (msg.entry.kind !== 'system') {
+        unread.set(msg.entry.conversationId, (unread.get(msg.entry.conversationId) ?? 0) + 1);
+        renderConversations();
+      }
       break;
     case 'chunk': {
       const entry = entries.get(msg.entryId);
@@ -216,6 +278,11 @@ function handle(msg: ServerMessage): void {
     case 'queue':
       queue = msg.queue;
       updateActivity();
+      renderConversations();
+      break;
+    case 'models':
+      models = msg.models;
+      renderModels();
       break;
     case 'error':
       toast(msg.message);
@@ -226,10 +293,174 @@ function handle(msg: ServerMessage): void {
   }
 }
 
+// ---- Discussions ----
+
+function lastConversationId(): string {
+  return conversations[conversations.length - 1].id;
+}
+
+function openConversation(id: string, force = false): void {
+  if (id === activeId && !force) {
+    closeDrawers();
+    return;
+  }
+  activeId = id;
+  unread.delete(id);
+  store('session', 'scc.conv', id);
+  send({ type: 'view', conversationId: id });
+  cancelRename();
+
+  entryEls.clear();
+  dirty.clear();
+  messagesEl.replaceChildren();
+  const list = [...entries.values()].filter((e) => e.conversationId === id);
+  for (const entry of list) {
+    appendEntry(entry);
+  }
+  if (!list.length) {
+    messagesEl.append(emptyState());
+  }
+  renderConversations();
+  renderTitle();
+  renderParticipants();
+  updateActivity();
+  updateComposer();
+  closeDrawers();
+  scrollToBottom(true);
+}
+
+function renderTitle(): void {
+  const conv = conversations.find((c) => c.id === activeId);
+  convTitle.textContent = conv?.title ?? '';
+  convTitle.title = conv ? `Créée par ${conv.createdBy} à ${formatTime(conv.createdAt)}` : '';
+  document.title = conv ? `${conv.title} — Shared Copilot Chat` : 'Shared Copilot Chat';
+}
+
+function renderConversations(): void {
+  const answering = queue.current?.conversationId;
+  const waiting = new Set(queue.pending.map((q) => q.conversationId));
+  convList.replaceChildren(
+    ...[...conversations].reverse().map((conv) => {
+      const li = document.createElement('li');
+      li.className = 'conv';
+      li.classList.toggle('active', conv.id === activeId);
+      li.dataset.id = conv.id;
+
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'conv-open';
+      const title = document.createElement('span');
+      title.className = 'conv-name';
+      title.textContent = conv.title;
+      const meta = document.createElement('span');
+      meta.className = 'conv-meta';
+      meta.textContent = conv.id === answering ? 'Le modèle répond…' : waiting.has(conv.id) ? 'En attente…' : formatTime(conv.createdAt);
+      open.append(title, meta);
+      li.append(open);
+
+      const count = unread.get(conv.id);
+      if (count) {
+        const badge = document.createElement('span');
+        badge.className = 'unread';
+        badge.textContent = String(count);
+        li.append(badge);
+      }
+      if (me?.isHost && !ended) {
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'conv-delete ghost icon';
+        del.title = 'Supprimer la discussion';
+        del.textContent = '🗑';
+        li.append(del);
+      }
+      return li;
+    }),
+  );
+  unreadTotal.hidden = ![...unread.values()].some(Boolean);
+  newConvBtn.disabled = ended;
+}
+
+convList.addEventListener('click', (e) => {
+  const target = e.target as HTMLElement;
+  const li = target.closest<HTMLLIElement>('li.conv');
+  const id = li?.dataset.id;
+  if (!li || !id) {
+    return;
+  }
+  const del = target.closest<HTMLButtonElement>('.conv-delete');
+  if (!del) {
+    openConversation(id);
+    return;
+  }
+  // Confirmation en deux clics (confirm() n'est pas disponible dans les webviews).
+  if (del.dataset.confirm) {
+    send({ type: 'deleteConversation', conversationId: id });
+    return;
+  }
+  del.dataset.confirm = '1';
+  del.textContent = 'Supprimer ?';
+  del.classList.add('confirm');
+  setTimeout(() => {
+    if (del.isConnected) {
+      delete del.dataset.confirm;
+      del.textContent = '🗑';
+      del.classList.remove('confirm');
+    }
+  }, 3000);
+});
+
+newConvBtn.addEventListener('click', () => {
+  // Une discussion vide existe déjà : on l'ouvre plutôt que d'en créer une autre.
+  const empty = [...conversations].reverse().find((c) => ![...entries.values()].some((e) => e.conversationId === c.id));
+  if (empty) {
+    openConversation(empty.id);
+    askInput.focus();
+    return;
+  }
+  if (!send({ type: 'createConversation' })) {
+    toast('Non connecté.');
+  }
+  askInput.focus();
+});
+
+renameBtn.addEventListener('click', () => {
+  const conv = conversations.find((c) => c.id === activeId);
+  if (!conv || ended) {
+    return;
+  }
+  renameInput.value = conv.title;
+  convTitle.hidden = true;
+  renameBtn.hidden = true;
+  renameForm.hidden = false;
+  renameInput.focus();
+  renameInput.select();
+});
+
+renameForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const title = renameInput.value.trim();
+  if (title && activeId) {
+    send({ type: 'renameConversation', conversationId: activeId, title });
+  }
+  cancelRename();
+});
+
+renameInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    cancelRename();
+  }
+});
+renameInput.addEventListener('blur', () => cancelRename());
+
+function cancelRename(): void {
+  renameForm.hidden = true;
+  convTitle.hidden = false;
+  renameBtn.hidden = false;
+}
+
 // ---- Rendu des messages ----
 
-function addEntry(entry: ChatEntry): void {
-  entries.set(entry.id, entry);
+function appendEntry(entry: ChatEntry): void {
   const el = document.createElement('article');
   entryEls.set(entry.id, el);
   messagesEl.append(el);
@@ -302,9 +533,8 @@ function header(author: string, timestamp: number, badge?: string): HTMLElement 
     h.append(b);
   }
   const time = document.createElement('time');
-  const d = new Date(timestamp);
-  time.dateTime = d.toISOString();
-  time.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  time.dateTime = new Date(timestamp).toISOString();
+  time.textContent = formatTime(timestamp);
   h.append(time);
   return h;
 }
@@ -326,12 +556,15 @@ function note(text: string, isError = false): HTMLElement {
 function emptyState(): HTMLElement {
   const div = document.createElement('div');
   div.className = 'empty';
-  div.textContent = 'Aucun message pour l’instant. Posez la première question !';
+  div.textContent = 'Aucun message dans cette discussion. Posez la première question !';
   return div;
 }
 
 /** Regroupe les re-rendus du streaming sur une frame d'affichage. */
 function markDirty(id: string): void {
+  if (!entryEls.has(id)) {
+    return; // Discussion non affichée : les données sont à jour, rien à redessiner.
+  }
   dirty.add(id);
   if (!frameRequested) {
     frameRequested = true;
@@ -363,35 +596,83 @@ function scrollToBottom(instant = false): void {
   messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: instant ? 'auto' : 'smooth' });
 }
 
-// ---- Participants, file d'attente, saisie ----
+// ---- Participants, modèles, file d'attente, saisie ----
 
 function renderParticipants(): void {
   peopleCount.textContent = String(participants.length);
   peopleList.replaceChildren(
     ...participants.map((p) => {
       const li = document.createElement('li');
-      li.textContent = p.name;
+      const name = document.createElement('span');
+      name.className = 'person';
+      name.textContent = p.name;
+      li.append(name);
       if (p.isHost) {
         const b = document.createElement('span');
         b.className = 'badge';
         b.textContent = 'hôte';
-        li.append(b);
+        name.append(b);
       }
       if (p.clientId === me?.clientId) {
         const you = document.createElement('span');
         you.className = 'you';
         you.textContent = '(vous)';
-        li.append(you);
+        name.append(you);
+      }
+      const where = conversations.find((c) => c.id === p.viewing);
+      if (where) {
+        const w = document.createElement('button');
+        w.type = 'button';
+        w.className = 'where';
+        w.textContent = where.id === activeId ? 'ici' : `dans « ${where.title} »`;
+        w.disabled = where.id === activeId;
+        w.addEventListener('click', () => openConversation(where.id));
+        li.append(w);
       }
       return li;
     }),
   );
 }
 
+function renderModels(): void {
+  const defaultModel = models.available.find((m) => m.id === models.defaultId);
+  const canChoose = !!me?.isHost || models.guestsCanChoose;
+  if (chosenModel && !models.available.some((m) => m.id === chosenModel)) {
+    chosenModel = '';
+  }
+
+  const options: HTMLOptionElement[] = [];
+  if (!models.available.length) {
+    options.push(new Option('Aucun modèle disponible', ''));
+  } else {
+    options.push(new Option(defaultModel ? `${defaultModel.name} (par défaut)` : 'Modèle par défaut', ''));
+    if (canChoose) {
+      for (const m of models.available) {
+        if (m.id !== models.defaultId) {
+          options.push(new Option(m.name, m.id));
+        }
+      }
+    }
+  }
+  modelSelect.replaceChildren(...options);
+  modelSelect.value = canChoose ? chosenModel : '';
+  modelSelect.disabled = ended || !canChoose || models.available.length < 2;
+  modelSelect.title = canChoose ? 'Modèle utilisé pour vos questions' : "L'hôte a fixé le modèle de la session";
+}
+
+modelSelect.addEventListener('change', () => {
+  chosenModel = modelSelect.value;
+  store('local', 'scc.model', chosenModel);
+});
+
 function updateActivity(): void {
   const parts: string[] = [];
-  if (queue.current) {
-    parts.push(`Le modèle répond à ${queue.current.clientId === me?.clientId ? 'vous' : queue.current.author}…`);
+  const current = queue.current;
+  if (current) {
+    const who = current.clientId === me?.clientId ? 'vous' : current.author;
+    const conv = conversations.find((c) => c.id === current.conversationId);
+    const where = current.conversationId === activeId || !conv ? '' : ` dans « ${conv.title} »`;
+    parts.push(`Le modèle répond à ${who}${where}…`);
   }
   const mine = queue.pending.findIndex((q) => q.clientId === me?.clientId);
   if (mine >= 0) {
@@ -400,14 +681,18 @@ function updateActivity(): void {
     parts.push(`${queue.pending.length} question(s) en attente.`);
   }
   activityText.textContent = parts.join(' ');
-  activityText.parentElement!.classList.toggle('busy', queue.current !== null);
-  cancelBtn.hidden = !(me?.isHost && queue.current);
+  activityText.parentElement!.classList.toggle('busy', current !== null);
+  cancelBtn.hidden = !(me?.isHost && current);
 }
 
 function updateComposer(): void {
-  const online = !!ws && ws.readyState === WebSocket.OPEN && !!me && !ended;
+  const online = !!ws && ws.readyState === WebSocket.OPEN && !!me && !ended && !!activeId;
   askInput.disabled = ended;
   askSend.disabled = !online;
+  renameBtn.disabled = ended || !activeId;
+  if (ended) {
+    modelSelect.disabled = true;
+  }
 }
 
 askForm.addEventListener('submit', (e) => {
@@ -424,10 +709,12 @@ askInput.addEventListener('keydown', (e) => {
 
 function submitQuestion(): void {
   const text = askInput.value.trim();
-  if (!text) {
+  if (!text || !activeId) {
     return;
   }
-  if (!send({ type: 'ask', text })) {
+  const canChoose = !!me?.isHost || models.guestsCanChoose;
+  const msg = { type: 'ask', conversationId: activeId, text, modelId: (canChoose && chosenModel) || undefined };
+  if (!send(msg)) {
     toast('Non connecté : la question sera à renvoyer après la reconnexion.');
     return;
   }
@@ -438,10 +725,28 @@ cancelBtn.addEventListener('click', () => {
   send({ type: 'cancel' });
 });
 
-peopleToggle.addEventListener('click', () => {
-  const open = peopleEl.classList.toggle('open');
-  peopleToggle.setAttribute('aria-expanded', String(open));
-});
+// ---- Tiroirs (écrans étroits) ----
+
+function toggleDrawer(drawer: HTMLElement, button: HTMLButtonElement): void {
+  const open = !drawer.classList.contains('open');
+  closeDrawers();
+  drawer.classList.toggle('open', open);
+  button.setAttribute('aria-expanded', String(open));
+}
+
+function closeDrawers(): void {
+  for (const [drawer, button] of [
+    [convsEl, convsToggle],
+    [peopleEl, peopleToggle],
+  ] as const) {
+    drawer.classList.remove('open');
+    button.setAttribute('aria-expanded', 'false');
+  }
+}
+
+convsToggle.addEventListener('click', () => toggleDrawer(convsEl, convsToggle));
+peopleToggle.addEventListener('click', () => toggleDrawer(peopleEl, peopleToggle));
+messagesEl.addEventListener('pointerdown', () => closeDrawers());
 
 // Boutons « copier » des blocs de code (délégation, car le contenu est re-rendu pendant le streaming).
 messagesEl.addEventListener('click', (e) => {
@@ -480,6 +785,10 @@ function setConnection(state: 'connecting' | 'online' | 'offline', label: string
   connectionEl.dataset.state = state;
   connectionEl.textContent = label;
   updateComposer();
+}
+
+function formatTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 let toastTimer: number | undefined;

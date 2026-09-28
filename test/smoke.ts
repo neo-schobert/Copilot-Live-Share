@@ -18,9 +18,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Modèle factice : répond « Réponse à <question> » en plusieurs morceaux. */
 class FakeBackend implements ModelBackend {
   readonly calls: ModelTurn[][] = [];
+  readonly modelIds: (string | undefined)[] = [];
 
-  async ask(turns: ModelTurn[], signal: AbortSignal) {
+  async ask(turns: ModelTurn[], signal: AbortSignal, modelId?: string) {
     this.calls.push(turns);
+    this.modelIds.push(modelId);
     const question = turns[turns.length - 1].content.split('\n\n').pop() ?? '';
     const slow = question.includes('lent');
     async function* chunks() {
@@ -32,13 +34,15 @@ class FakeBackend implements ModelBackend {
         yield `${word} `;
       }
     }
-    return { modelName: 'fake-model', chunks: chunks() };
+    return { modelName: modelId ?? 'fake-model', chunks: chunks() };
   }
 }
 
 class Client {
   readonly messages: ServerMessage[] = [];
   closeCode: number | undefined;
+  /** Discussion par défaut, reçue dans le welcome. */
+  conv = '';
   private constructor(readonly ws: WebSocket) {
     ws.on('message', (d) => this.messages.push(JSON.parse(d.toString()) as ServerMessage));
     ws.on('close', (code) => (this.closeCode = code));
@@ -52,8 +56,15 @@ class Client {
     });
     const c = new Client(ws);
     c.send({ type: 'hello', name, clientId: `${name}-client-id` });
-    await c.waitFor((m) => m.type === 'welcome');
+    const welcome = await c.waitFor((m) => m.type === 'welcome');
+    if (welcome.type === 'welcome') {
+      c.conv = welcome.conversations[0].id;
+    }
     return c;
+  }
+
+  ask(text: string, extra: object = {}) {
+    this.send({ type: 'ask', conversationId: this.conv, text, ...extra });
   }
 
   send(msg: object) {
@@ -143,8 +154,8 @@ async function main() {
   const alice = await Client.join('alice');
   const bob = await Client.join('bob');
   await alice.waitFor((m) => m.type === 'participants' && m.participants.length === 2);
-  alice.send({ type: 'ask', text: 'Question 1' });
-  bob.send({ type: 'ask', text: 'Question 2' });
+  alice.ask('Question 1');
+  bob.ask('Question 2');
 
   const doneCount = (c: Client) => c.messages.filter((m) => m.type === 'entryUpdate' && m.status === 'done').length;
   for (let i = 0; i < 300 && (doneCount(alice) < 2 || doneCount(bob) < 2); i++) {
@@ -174,13 +185,13 @@ async function main() {
   ok('Historique envoyé au modèle avec le pseudo de chaque auteur');
 
   // 5. Contexte partagé
-  room.addContext({ author: 'hôte', fileName: 'src/a.ts', languageId: 'typescript', range: 'lignes 1-2', code: 'const a = 1;' });
+  room.addContext(alice.conv, { author: 'hôte', fileName: 'src/a.ts', languageId: 'typescript', range: 'lignes 1-2', code: 'const a = 1;' });
   await bob.waitFor((m) => m.type === 'entry' && m.entry.kind === 'context');
   ok('Contexte partagé diffusé à tous');
 
   // 6. Annulation : refusée pour un invité, acceptée pour l'hôte
   const host = await Client.join('hote', HOST);
-  bob.send({ type: 'ask', text: 'Question lente' });
+  bob.ask('Question lente');
   await bob.waitFor((m) => m.type === 'chunk' && m.text.includes('Question'));
   bob.send({ type: 'cancel' });
   await bob.waitFor((m) => m.type === 'error' && m.message.includes("l'hôte"));
@@ -189,7 +200,61 @@ async function main() {
   assert.ok(backend.calls[2].some((t) => t.content.includes('src/a.ts')), 'le contexte est envoyé au modèle');
   ok('Seul l’hôte peut annuler ; la réponse passe à « cancelled »');
 
-  // 7. Reconnexion avec le même pseudo : historique complet renvoyé
+  // 7. Discussions : création, historique séparé, renommage, suppression par l'hôte
+  alice.send({ type: 'createConversation' });
+  const created = await alice.waitFor((m) => m.type === 'conversation' && m.conversation.createdBy === 'alice');
+  assert.ok(created.type === 'conversation');
+  const conv2 = created.conversation.id;
+  await bob.waitFor((m) => m.type === 'conversation' && m.conversation.id === conv2);
+  const before = backend.calls.length;
+  alice.send({ type: 'ask', conversationId: conv2, text: 'Question dans la discussion 2' });
+  await alice.waitFor((m) => m.type === 'conversation' && m.conversation.id === conv2 && m.conversation.title === 'Question dans la discussion 2');
+  for (let i = 0; i < 300 && backend.calls.length === before; i++) {
+    await sleep(10);
+  }
+  const isolated = backend.calls[before];
+  assert.ok(!isolated.some((t) => t.content.includes('Question 1')), "l'historique de la discussion 1 ne fuit pas");
+  assert.ok(!isolated.some((t) => t.content.includes('src/a.ts')), 'le contexte de la discussion 1 ne fuit pas');
+  ok('Nouvelle discussion : titre automatique, historique du modèle séparé');
+
+  bob.send({ type: 'renameConversation', conversationId: conv2, title: '  Renommée  ' });
+  await alice.waitFor((m) => m.type === 'conversation' && m.conversation.id === conv2 && m.conversation.title === 'Renommée');
+  bob.send({ type: 'view', conversationId: conv2 });
+  await alice.waitFor((m) => m.type === 'participants' && m.participants.some((p) => p.name === 'bob' && p.viewing === conv2));
+  bob.send({ type: 'deleteConversation', conversationId: conv2 });
+  await bob.waitFor((m) => m.type === 'error' && m.message.includes('supprimer'));
+  host.send({ type: 'deleteConversation', conversationId: conv2 });
+  await alice.waitFor((m) => m.type === 'conversationDeleted' && m.conversationId === conv2);
+  ok('Renommage par tous, présence par discussion, suppression réservée à l’hôte');
+
+  // 8. Choix du modèle
+  const available = [
+    { id: 'model-a', name: 'Model A', family: 'a' },
+    { id: 'model-b', name: 'Model B', family: 'b' },
+  ];
+  room.setModels({ available, defaultId: 'model-a', guestsCanChoose: true });
+  await alice.waitFor((m) => m.type === 'models' && m.models.available.length === 2);
+  const waitIdle = async () => {
+    for (let i = 0; i < 300 && room.isAnswering; i++) {
+      await sleep(10);
+    }
+  };
+  await waitIdle();
+  alice.ask('Question modèle B', { modelId: 'model-b' });
+  await alice.waitFor((m) => m.type === 'entryUpdate' && m.model === 'model-b' && m.status === 'done');
+  alice.ask('Question modèle par défaut');
+  await alice.waitFor((m) => m.type === 'entryUpdate' && m.model === 'model-a' && m.status === 'done');
+  alice.ask('Question modèle inconnu', { modelId: 'nope' });
+  await alice.waitFor((m) => m.type === 'error' && m.message.includes("n'est plus disponible"));
+  room.setModels({ available, defaultId: 'model-a', guestsCanChoose: false });
+  await bob.waitFor((m) => m.type === 'models' && !m.models.guestsCanChoose);
+  bob.ask('Invité veut B', { modelId: 'model-b' });
+  await bob.waitFor((m) => m.type === 'error' && m.message.includes('fixé le modèle'));
+  host.ask('Hôte veut B', { modelId: 'model-b' });
+  await host.waitFor((m) => m.type === 'entryUpdate' && m.status === 'done' && backend.modelIds.at(-1) === 'model-b');
+  ok('Choix du modèle par question, modèle par défaut, restriction des invités');
+
+  // 9. Reconnexion avec le même pseudo : historique complet renvoyé
   bob.ws.close();
   await host.waitFor((m) => m.type === 'participants' && m.participants.length === 2);
   const bob2 = await Client.join('bob');
@@ -199,7 +264,7 @@ async function main() {
   assert.ok(welcome.history.length >= 6);
   ok('Reconnexion : même identité et historique complet');
 
-  // 8. Arrêt : tous les clients sont prévenus et déconnectés
+  // 10. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");
   await server.stop('Session ended');
   await sleep(50);
