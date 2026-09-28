@@ -96,6 +96,8 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
   statusBar.command = 'sharedCopilotChat.copyInviteLink';
   lastTextEditor = vscode.window.activeTextEditor;
 
+  log(`Extension activée : ${describeEnvironment(context)}`);
+
   context.subscriptions.push(
     output,
     vscode.workspace.registerTextDocumentContentProvider(PROPOSAL_SCHEME, proposals),
@@ -169,13 +171,20 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
   if (starting) {
+    void vscode.window.showInformationMessage('Shared Copilot : démarrage de la session déjà en cours…');
     return;
   }
   starting = true;
+  log(`Start Session : ${describeEnvironment(context)}`);
   try {
     // Windows + WSL : proposition de rouvrir dans WSL, installation de ce qui manque.
     const setup = await prepareEnvironment(context, log);
-    if (setup.outcome !== 'continue') {
+    log(`Préparation de l'environnement : ${setup.outcome}${setup.redetect ? ' (nouvelle détection du bac à sable)' : ''}`);
+    if (setup.outcome === 'cancelled') {
+      void vscode.window.showInformationMessage('Shared Copilot : démarrage de la session annulé.');
+      return;
+    }
+    if (setup.outcome === 'reopening') {
       return;
     }
     // Bac à sable absent jusqu'ici (ex. bubblewrap installé entre-temps) : nouvelle détection.
@@ -183,8 +192,29 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
       sandboxReady = tools.initSandbox(log, true);
     }
     await createSession(context);
+    const started = session as Session | undefined; // modifiée par createSession
+    log(started ? `Session démarrée sur ${started.localUrl}` : 'Session non démarrée.');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`Erreur au démarrage de la session : ${err instanceof Error && err.stack ? err.stack : message}`);
+    void showError(`impossible de démarrer la session (${message}).`);
   } finally {
     starting = false;
+  }
+}
+
+/** Contexte d'exécution, pour le journal : système, fenêtre locale ou distante, mode de l'extension. */
+function describeEnvironment(context: vscode.ExtensionContext): string {
+  const mode = { 1: 'installée', 2: 'développement (F5)', 3: 'test' }[context.extensionMode] ?? String(context.extensionMode);
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? 'aucun dossier';
+  return `${process.platform}, fenêtre ${vscode.env.remoteName ? `distante (${vscode.env.remoteName})` : 'locale'}, extension ${mode}, VS Code ${vscode.version}, dossier ${folder}`;
+}
+
+/** Message d'erreur avec accès direct au journal. */
+async function showError(message: string): Promise<void> {
+  const logs = 'Voir le journal';
+  if ((await vscode.window.showErrorMessage(`Shared Copilot : ${message}`, logs)) === logs) {
+    output.show(true);
   }
 }
 

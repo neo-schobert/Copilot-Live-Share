@@ -244,5 +244,8 @@
     "chatSessionsProvider",
     "chatParticipantPrivate",
     "chatParticipantAdditions"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
   ]
 }

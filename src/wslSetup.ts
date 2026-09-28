@@ -65,6 +65,7 @@ async function windowsSetup(
   log: (m: string) => void,
 ): Promise<SetupResult> {
   const mode = config().get<WslMode>('wslMode', 'ask');
+  log(`Windows : wslMode = ${mode}, dossier ${folder.uri.fsPath}`);
   if (mode === 'off') {
     return { outcome: 'continue', redetect: false };
   }
@@ -73,7 +74,7 @@ async function windowsSetup(
     { location: vscode.ProgressLocation.Notification, title: 'Shared Copilot : recherche de WSL…' },
     () => inspectWsl(distro, config().get<string[]>('sandboxReadOnlyPaths', [])),
   );
-  log(info.detail);
+  log(`WSL : ${info.status}${info.distro ? `, distribution ${info.distro}` : ''}, montage ${info.mountRoot} — ${info.detail}`);
   if (info.status === 'absent') {
     return { outcome: 'continue', redetect: false };
   }
@@ -99,6 +100,7 @@ async function windowsSetup(
       reopen,
       stay,
     );
+    log(`Choix de l'hôte : ${answer ?? 'fenêtre fermée sans réponse'}`);
     if (!answer) {
       return { outcome: 'cancelled', redetect: false };
     }
@@ -117,6 +119,7 @@ async function windowsSetup(
 
   if (choice === 'reopen') {
     const reopened = await reopenInWsl(context, folder, info, log);
+    log(reopened ? 'Réouverture dans WSL lancée.' : 'Réouverture dans WSL impossible : la session démarre sous Windows.');
     if (reopened) {
       return { outcome: 'reopening', redetect };
     }
@@ -137,6 +140,7 @@ async function offerWslBubblewrap(info: WslInfo, log: (m: string) => void): Prom
     },
     install,
   );
+  log(`Installation de bubblewrap : ${answer === install ? 'acceptée' : 'refusée'}`);
   if (answer !== install) {
     return false;
   }
@@ -179,6 +183,7 @@ async function reopenInWsl(
       { modal: true },
       install,
     );
+    log(`Installation de l'extension WSL : ${answer === install ? 'acceptée' : 'refusée'}`);
     if (answer !== install) {
       return false;
     }
@@ -194,6 +199,7 @@ async function reopenInWsl(
   // Installe automatiquement cette extension dans WSL à la connexion (réglage de VS Code).
   const remote = vscode.workspace.getConfiguration('remote');
   const autoInstall = remote.get<string[]>('defaultExtensionsIfInstalledLocally', []);
+  log(`Installation automatique dans WSL : ${context.extension.id} (remote.defaultExtensionsIfInstalledLocally)`);
   if (!autoInstall.includes(context.extension.id)) {
     await remote.update('defaultExtensionsIfInstalledLocally', [...autoInstall, context.extension.id], vscode.ConfigurationTarget.Global);
   }
