@@ -1,5 +1,8 @@
 import * as crypto from 'crypto';
 import {
+  AgentQuestion,
+  ApprovalDecision,
+  ApprovalRequest,
   AssistantEntry,
   ChatEntry,
   ClientMessage,
@@ -42,6 +45,46 @@ export interface ModelRequest {
   modelId?: string;
   /** Auteur de la question (affiché dans les demandes de validation de l'hôte). */
   author: string;
+  authorClientId: string;
+  /** Attente des décisions humaines pendant la réponse. */
+  interaction: ToolInteraction;
+}
+
+/**
+ * Pont entre l'agent et les participants. L'action concernée a déjà été diffusée
+ * (statut awaitingApproval / awaitingAnswer) quand ces méthodes sont appelées.
+ */
+export interface ToolInteraction {
+  /** Attend la décision (de l'hôte, ou de l'auteur si l'action reste dans le projet) ; « deny » si la réponse est annulée. */
+  approval(tool: ToolActivity & { approval: ApprovalRequest }): Promise<ApprovalOutcome>;
+  /** Attend la première réponse d'un participant ; texte vide si la réponse est annulée. */
+  answer(tool: ToolActivity & { question: AgentQuestion }): Promise<AnswerOutcome>;
+}
+
+export interface AnswerOutcome {
+  text: string;
+  /** Qui a répondu (vide si annulé). */
+  by: string;
+}
+
+export interface ApprovalOutcome {
+  decision: ApprovalDecision;
+  /** Qui a décidé (vide si annulé). */
+  by: string;
+}
+
+/** Action en attente de validation, transmise à l'extension pour notifier l'hôte dans VS Code. */
+export interface PendingApproval {
+  entryId: string;
+  conversationId: string;
+  tool: ToolActivity & { approval: ApprovalRequest };
+  author: string;
+}
+
+export interface PendingQuestion {
+  entryId: string;
+  conversationId: string;
+  tool: ToolActivity & { question: AgentQuestion };
 }
 
 export interface ModelBackend {
@@ -56,8 +99,19 @@ export interface ChatRoomOptions {
   /** Nombre d'échanges précédents envoyés au modèle (lu à chaque question). */
   historyLength: () => number;
   onParticipantsChanged?: (participants: Participant[]) => void;
+  /** Pseudo de l'hôte, affiché comme créateur de la première discussion. */
+  hostName?: string;
   /** Consignes ajoutées au prompt système (ex. description de l'espace de travail et des outils). */
   extraInstructions?: () => string;
+  onApprovalRequested?: (pending: PendingApproval) => void;
+  onQuestionAsked?: (pending: PendingQuestion) => void;
+  /** L'hôte demande à voir le diff complet d'une action. */
+  onShowDiff?: (entryId: string, toolId: string) => void;
+}
+
+interface Waiter<T> {
+  resolve: (value: T) => void;
+  info: { entryId: string; tool: ToolActivity };
 }
 
 interface ClientState extends Participant {
@@ -91,12 +145,14 @@ export class ChatRoom implements ConnectionHandler {
   private models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
   private disposed = false;
   private readonly listeners = new Set<(msg: ServerMessage) => void>();
+  private readonly approvals = new Map<string, Waiter<ApprovalOutcome>>();
+  private readonly questions = new Map<string, Waiter<AnswerOutcome>>();
 
   constructor(
     private readonly backend: ModelBackend,
     private readonly options: ChatRoomOptions,
   ) {
-    this.createConversation('hôte', '');
+    this.createConversation(options.hostName ?? 'hôte', '');
   }
 
   // ---- ConnectionHandler ----
@@ -146,6 +202,11 @@ export class ChatRoom implements ConnectionHandler {
           fail('Aucune réponse en cours.');
         }
         break;
+      case 'typing':
+        if (this.findConversation(msg.conversationId)) {
+          this.broadcast({ type: 'typing', conversationId: msg.conversationId, clientId: state.clientId, name: state.name });
+        }
+        break;
       case 'view':
         if (this.findConversation(msg.conversationId) && state.viewing !== msg.conversationId) {
           state.viewing = msg.conversationId;
@@ -176,6 +237,27 @@ export class ChatRoom implements ConnectionHandler {
           this.deleteConversation(msg.conversationId);
         }
         break;
+      case 'approve': {
+        const refusal = this.approvalRefusal(state, msg.entryId, msg.toolId, msg.decision);
+        if (refusal) {
+          fail(refusal);
+        } else {
+          this.resolveApproval(msg.entryId, msg.toolId, msg.decision, state.name);
+        }
+        break;
+      }
+      case 'showDiff':
+        if (state.isHost) {
+          this.options.onShowDiff?.(msg.entryId, msg.toolId);
+        }
+        break;
+      case 'answer': {
+        // Tout participant peut répondre ; la première réponse l'emporte.
+        if (!this.answerQuestion(msg.entryId, msg.toolId, msg.text, state.name)) {
+          fail("Cette question n'attend plus de réponse.");
+        }
+        break;
+      }
     }
   }
 
@@ -240,6 +322,64 @@ export class ChatRoom implements ConnectionHandler {
 
   entriesOf(conversationId: string): ChatEntry[] {
     return this.entries.filter((e) => e.conversationId === conversationId);
+  }
+
+  /**
+   * Applique une décision sur une action en attente (appel de l'extension : décision de l'hôte).
+   * Renvoie false si l'action n'attend plus.
+   */
+  resolveApproval(entryId: string, toolId: string, decision: ApprovalDecision, by: string): boolean {
+    const k = key(entryId, toolId);
+    const waiter = this.approvals.get(k);
+    if (!waiter) {
+      return false;
+    }
+    this.approvals.delete(k);
+    waiter.resolve({ decision, by });
+    return true;
+  }
+
+  /** Motif de refus si ce participant ne peut pas prendre cette décision, sinon undefined. */
+  private approvalRefusal(state: ClientState, entryId: string, toolId: string, decision: ApprovalDecision): string | undefined {
+    const waiter = this.approvals.get(key(entryId, toolId));
+    const approval = waiter?.info.tool.approval;
+    if (!approval) {
+      return "Cette action n'attend plus de validation.";
+    }
+    if (state.isHost) {
+      return undefined;
+    }
+    const answer = this.entries.find((e) => e.id === entryId);
+    const question = answer?.kind === 'assistant' ? this.entries.find((e) => e.id === answer.replyTo) : undefined;
+    const isRequester = question?.kind === 'user' && question.clientId === state.clientId;
+    if (!isRequester) {
+      return "Seuls l'hôte et l'auteur de la demande peuvent décider.";
+    }
+    if (approval.hostOnly) {
+      return "Cette action sort du projet : seul l'hôte peut la valider ou la refuser.";
+    }
+    if (decision === 'session') {
+      return "Seul l'hôte peut autoriser une action pour toute la session.";
+    }
+    return undefined;
+  }
+
+  /** Transmet la réponse à une question de l'agent. Renvoie false si elle n'attend plus (ou réponse vide). */
+  answerQuestion(entryId: string, toolId: string, text: string, by: string): boolean {
+    const k = key(entryId, toolId);
+    const waiter = this.questions.get(k);
+    const answer = text.trim().slice(0, LIMITS.maxAnswerLength);
+    if (!waiter || !answer) {
+      return false;
+    }
+    this.questions.delete(k);
+    waiter.resolve({ text: answer, by });
+    return true;
+  }
+
+  /** Actions en attente de validation (pour l'extension). */
+  pendingApproval(entryId: string, toolId: string): ToolActivity | undefined {
+    return this.approvals.get(key(entryId, toolId))?.info.tool;
   }
 
   /** Réponse (terminée ou en cours) à une question, si elle a commencé. */
@@ -480,7 +620,13 @@ export class ChatRoom implements ConnectionHandler {
 
     try {
       const response = await this.backend.ask(
-        { turns, modelId: item.modelId ?? this.models.defaultId ?? undefined, author: item.author },
+        {
+          turns,
+          modelId: item.modelId ?? this.models.defaultId ?? undefined,
+          author: item.author,
+          authorClientId: item.clientId,
+          interaction: this.interactionFor(entry, signal),
+        },
         signal,
       );
       entry.model = response.modelName;
@@ -515,6 +661,42 @@ export class ChatRoom implements ConnectionHandler {
         error: entry.error,
       });
     }
+  }
+
+  private interactionFor(entry: AssistantEntry, signal: AbortSignal): ToolInteraction {
+    const wait = <T>(map: Map<string, Waiter<T>>, tool: ToolActivity, onCancel: T, notify: () => void): Promise<T> =>
+      new Promise<T>((resolve) => {
+        if (signal.aborted) {
+          resolve(onCancel);
+          return;
+        }
+        const k = key(entry.id, tool.id);
+        const done = (value: T) => {
+          signal.removeEventListener('abort', cancel);
+          map.delete(k);
+          resolve(value);
+        };
+        const cancel = () => done(onCancel);
+        signal.addEventListener('abort', cancel, { once: true });
+        map.set(k, { resolve: done, info: { entryId: entry.id, tool } });
+        notify();
+      });
+
+    return {
+      approval: (tool) =>
+        wait<ApprovalOutcome>(this.approvals, tool, { decision: 'deny', by: '' }, () =>
+          this.options.onApprovalRequested?.({
+            entryId: entry.id,
+            conversationId: entry.conversationId,
+            tool,
+            author: entry.replyToAuthor,
+          }),
+        ),
+      answer: (tool) =>
+        wait<AnswerOutcome>(this.questions, tool, { text: '', by: '' }, () =>
+          this.options.onQuestionAsked?.({ entryId: entry.id, conversationId: entry.conversationId, tool }),
+        ),
+    };
   }
 
   /**
@@ -637,6 +819,8 @@ function parseClientMessage(data: string): ClientMessage | undefined {
       return { type: 'cancel' };
     case 'view':
       return str(m.conversationId) ? { type: 'view', conversationId: m.conversationId } : undefined;
+    case 'typing':
+      return str(m.conversationId) ? { type: 'typing', conversationId: m.conversationId } : undefined;
     case 'createConversation':
       return { type: 'createConversation' };
     case 'renameConversation':
@@ -645,6 +829,16 @@ function parseClientMessage(data: string): ClientMessage | undefined {
         : undefined;
     case 'deleteConversation':
       return str(m.conversationId) ? { type: 'deleteConversation', conversationId: m.conversationId } : undefined;
+    case 'approve':
+      return str(m.entryId) && str(m.toolId) && (m.decision === 'once' || m.decision === 'session' || m.decision === 'deny')
+        ? { type: 'approve', entryId: m.entryId, toolId: m.toolId, decision: m.decision }
+        : undefined;
+    case 'showDiff':
+      return str(m.entryId) && str(m.toolId) ? { type: 'showDiff', entryId: m.entryId, toolId: m.toolId } : undefined;
+    case 'answer':
+      return str(m.entryId) && str(m.toolId) && str(m.text)
+        ? { type: 'answer', entryId: m.entryId, toolId: m.toolId, text: m.text }
+        : undefined;
     default:
       return undefined;
   }
@@ -699,6 +893,10 @@ function upsertTool(entry: AssistantEntry, tool: ToolActivity): void {
   } else {
     entry.parts.push({ type: 'tool', tool: { ...tool } });
   }
+}
+
+function key(entryId: string, toolId: string): string {
+  return `${entryId}/${toolId}`;
 }
 
 function removeWhere<T>(list: T[], pred: (item: T) => boolean): void {

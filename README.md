@@ -5,7 +5,7 @@ Extension VS Code qui permet à plusieurs personnes de partager **un même chat 
 - L'extension tourne **uniquement chez l'hôte**. Les invités n'ont besoin que d'un navigateur.
 - Au démarrage d'une session, elle lance un petit serveur HTTP + WebSocket sur `127.0.0.1:3717`, qui sert une page de chat.
 - Toutes les questions sont envoyées au modèle par l'hôte, via l'API Language Model de VS Code (`vscode.lm`). Les réponses sont diffusées en streaming à tous les participants.
-- Comme l'agent Copilot, le modèle travaille dans l'espace de travail de l'hôte : il lit, cherche, modifie des fichiers et lance des commandes. **Chaque modification et chaque commande doit être validée par l'hôte.**
+- Comme l'agent Copilot, le modèle travaille dans le projet de l'hôte : il lit, cherche, pose des questions, modifie des fichiers et lance des commandes. **Il est confiné au projet**, et chaque modification ou commande est validée (par l'hôte seul dès qu'elle sort du projet).
 - Les discussions apparaissent aussi dans le **panneau Chat natif** de VS Code chez l'hôte.
 
 ```
@@ -16,7 +16,7 @@ Extension VS Code qui permet à plusieurs personnes de partager **un même chat 
 
 ## Prérequis
 
-- VS Code ≥ 1.136
+- VS Code ≥ 1.136, sous Windows, Linux ou macOS
 - Extension **GitHub Copilot Chat** installée et connectée chez l'hôte
 - Node.js ≥ 18 (pour compiler)
 
@@ -47,23 +47,35 @@ Dans la palette de commandes (`Ctrl+Maj+P`) :
 
 La première question déclenche en général une demande de **consentement** de VS Code (« autoriser Shared Copilot Chat à utiliser les modèles de langage ? ») : l'hôte doit l'accepter. S'il refuse, les participants voient un message d'erreur explicite dans le chat.
 
-## L'agent : accès à l'espace de travail
+## L'agent : un Copilot à plusieurs, confiné au projet
 
-Pour répondre, le modèle dispose d'outils qui agissent dans le dossier ouvert chez l'hôte. Ses actions s'affichent en direct dans la réponse (✓ terminé, ✋ en attente de validation, ⛔ refusé).
+Comme l'agent Copilot, le modèle explore le projet de l'hôte, pose des questions, modifie des fichiers et lance des commandes. Ses actions s'affichent en direct dans la réponse ; les actions sensibles apparaissent sous forme de **carte de validation** avec un aperçu (diff ou commande).
 
-| Outil | Rôle | Validation de l'hôte |
+| Outil | Rôle | Validation |
 | --- | --- | --- |
-| `list_directory`, `find_files` | Lister un dossier, trouver des fichiers par motif | non |
-| `read_file` | Lire un fichier (y compris les modifications non enregistrées) | non |
-| `search_text` | Chercher du texte ou une regex (ripgrep de VS Code) | non |
-| `get_diagnostics` | Erreurs et avertissements connus de VS Code | non |
-| `edit_file`, `create_file` | Modifier ou créer un fichier | **oui**, avec aperçu du diff |
-| `run_command` | Lancer une commande shell (sortie dans le canal de sortie « Shared Copilot ») | **oui**, commande affichée |
+| `list_directory`, `find_files`, `read_file`, `search_text`, `get_diagnostics` | Explorer le projet | aucune |
+| `ask_user` | Poser une question aux participants (avec réponses proposées) | visible par tous, **n'importe quel participant** répond (la première réponse l'emporte) |
+| `edit_file`, `create_file` | Modifier ou créer un fichier du projet | auteur de la demande **ou** hôte |
+| `run_command` | Commande dans le bac à sable (projet seul, sans réseau) | auteur de la demande **ou** hôte |
+| `run_command` avec `outsideProject` | Commande hors bac à sable (réseau, installation…) | **hôte uniquement** |
 
-- La validation s'affiche dans VS Code chez l'hôte, avec le nom de l'auteur de la question. « Voir les modifications » ouvre le diff avant de décider. Un refus est signalé au modèle, qui doit proposer une autre approche.
-- Les chemins sont limités aux dossiers de l'espace de travail : tout chemin qui en sort est refusé.
-- Les modifications passent par l'éditeur de VS Code : elles s'annulent avec Ctrl+Z.
-- Le paramètre `sharedCopilotChat.agentMode` règle l'accès : `full` (défaut), `readOnly` ou `off`. Dans un espace de travail non approuvé (Workspace Trust), l'accès est limité à la lecture.
+**Qui valide quoi**
+
+- Une action qui reste dans le projet peut être validée par la personne qui a posé la question, ou par l'hôte.
+- Une action qui sort du projet (commande hors bac à sable) ne peut être validée ou refusée **que par l'hôte**.
+- « Autoriser pour la session » (réservé à l'hôte) valide d'office les actions suivantes de la même catégorie (modifications de fichiers, ou commandes dans le bac à sable) ; il ne s'applique jamais aux actions hors du projet.
+- L'hôte peut décider depuis la page web, depuis le panneau Chat natif ou depuis la notification VS Code (avec « Voir les modifications » pour ouvrir le diff complet). La première décision l'emporte.
+- Un refus est transmis au modèle, qui doit proposer une autre approche. Arrêter la réponse refuse les actions en attente.
+
+**Environnement fermé**
+
+- Tous les chemins sont vérifiés une fois les liens symboliques résolus : rien en dehors des dossiers ouverts n'est lisible, listable ou modifiable (y compris via un lien vers `/etc` ou un lien cassé pointant ailleurs).
+- Les fichiers sensibles du projet sont invisibles pour l'agent : `.git`, `.env*`, clés (`*.pem`, `*.key`, `id_rsa*`…), `.npmrc`, `.netrc`, `.ssh`, `.aws`. Ajoutez vos motifs avec `sharedCopilotChat.protectedFiles`.
+- Les commandes s'exécutent dans un bac à sable [bubblewrap](https://github.com/containers/bubblewrap) (Linux) : seul le projet est visible et modifiable, le dossier personnel est absent, le réseau coupé, les fichiers protégés masqués. Les outils du `PATH` (ex. Node installé dans le dossier personnel) y sont visibles en lecture seule ; `sharedCopilotChat.sandboxReadOnlyPaths` en ajoute d'autres.
+- Sans bubblewrap (Windows, macOS, ou Linux sans bubblewrap), toute commande est considérée comme hors du projet : seul l'hôte peut la valider.
+- Sous Windows, les commandes s'exécutent avec PowerShell ; le modèle est informé du système et du shell de l'hôte pour en respecter la syntaxe. Arrêter une réponse arrête la commande et tous ses sous-processus.
+- Les modifications passent par l'éditeur de VS Code : elles s'annulent avec Ctrl+Z. La sortie des commandes est copiée dans le canal de sortie « Shared Copilot ».
+- `sharedCopilotChat.agentMode` règle l'accès : `full` (défaut), `readOnly` ou `off`. Dans un espace de travail non approuvé (Workspace Trust), l'accès est limité à la lecture.
 
 ## Panneau Chat natif
 
@@ -106,6 +118,7 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 4. **Modèle** : comme dans Copilot Chat, le menu sous la zone de saisie choisit le modèle pour vos questions. Ce choix est mémorisé par le navigateur ; « (par défaut) » suit le modèle par défaut choisi par l'hôte.
 5. Les questions sont traitées une par une, dans l'ordre d'arrivée, toutes discussions confondues ; la page indique qui reçoit une réponse et la position de sa propre question dans la file.
 6. En cas de coupure réseau, la page se reconnecte automatiquement avec le même pseudo et revient sur la même discussion.
+7. **Présence en temps réel** : la liste des discussions montre les avatars des participants présents dans chacune, et « Camille écrit… » quand quelqu'un tape ; au-dessus de la zone de saisie, on voit qui est dans la discussion et qui est en train d'écrire.
 
 ## Paramètres
 
@@ -113,7 +126,9 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 | --- | --- | --- |
 | `sharedCopilotChat.port` | `3717` | Port local du serveur. |
 | `sharedCopilotChat.modelFamily` | `""` | Famille du modèle Copilot par défaut (ex. `gpt-4o`, `claude-sonnet-4`). Vide : premier modèle Copilot disponible. Se règle aussi avec **Select Default Model**. |
-| `sharedCopilotChat.agentMode` | `full` | Accès du modèle à l'espace de travail : `full` (lecture, modifications et commandes validées par l'hôte), `readOnly`, `off`. |
+| `sharedCopilotChat.agentMode` | `full` | Accès du modèle au projet : `full` (lecture, modifications et commandes validées), `readOnly`, `off`. |
+| `sharedCopilotChat.protectedFiles` | `[]` | Motifs glob de fichiers supplémentaires invisibles pour l'agent. |
+| `sharedCopilotChat.sandboxReadOnlyPaths` | `[]` | Dossiers supplémentaires visibles en lecture seule dans le bac à sable des commandes. |
 | `sharedCopilotChat.nativeChat` | `true` | Affiche les discussions dans le panneau Chat natif (API expérimentale, voir plus haut). |
 | `sharedCopilotChat.allowGuestModelChoice` | `true` | Autorise les invités à choisir un autre modèle que celui par défaut. À désactiver pour éviter que des invités consomment les requêtes premium de l'hôte. L'hôte peut toujours choisir. |
 | `sharedCopilotChat.historyLength` | `20` | Nombre d'échanges précédents (question + réponse, ou contexte partagé) envoyés au modèle avec chaque question. |
@@ -126,8 +141,9 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 - **Aucune persistance** : l'historique vit en mémoire et disparaît à l'arrêt de la session.
 - Une seule question est traitée à la fois pour toute la session, même avec plusieurs discussions ; chaque participant peut avoir au plus 5 questions en attente.
 - Les modèles premium choisis par les invités sont décomptés sur le quota de l'hôte (voir `allowGuestModelChoice`).
-- Le token est la seule protection : quiconque obtient le lien peut poser des questions, et donc faire **lire tout l'espace de travail** par le modèle (les écritures et commandes restent soumises à votre validation). N'invitez que des personnes de confiance, ou passez `agentMode` à `off`.
-- Une demande de validation bloque la file d'attente jusqu'à la réponse de l'hôte.
+- Le token est la seule protection : quiconque obtient le lien peut poser des questions, et donc faire **lire tout le projet** par le modèle (hors fichiers protégés), et valider les modifications que l'agent propose en réponse à **ses propres** questions. N'invitez que des personnes de confiance, ou passez `agentMode` à `readOnly` ou `off`.
+- Une action en attente de validation ou une question de l'agent bloque la file d'attente jusqu'à la réponse.
+- Le bac à sable des commandes n'existe que sous Linux avec bubblewrap ; ailleurs, chaque commande doit être validée par l'hôte.
 - Seul l'hôte peut annuler une réponse.
 - Le Markdown est volontairement simple (pas de tableaux ni de coloration syntaxique).
 
@@ -139,15 +155,17 @@ src/
   server.ts          Serveur HTTP + WebSocket, authentification par token
   chatRoom.ts        Historique, participants, file FIFO, construction du prompt
   copilotBackend.ts  Appels à vscode.lm : sélection du modèle, boucle agent (outils), erreurs, annulation
-  agentTools.ts      Outils de l'espace de travail et demandes de validation
+  agentTools.ts      Outils de l'agent, confinement au projet, bac à sable des commandes
   nativeChat.ts      Intégration au panneau Chat natif (API proposée chatSessionsProvider)
   types/             Définitions des API proposées de VS Code utilisées
   extension.ts       Commandes, webview, barre d'état
   web/               Client navigateur (TypeScript vanilla, bundlé par esbuild)
 media/               index.html et style.css servis aux navigateurs
 test/smoke.ts        Test de bout en bout avec un modèle simulé
+test/vscode/         Test d'intégration du confinement dans un vrai VS Code
 ```
 
 - `npm run watch` : recompilation continue
 - `npm run check-types` : vérification TypeScript stricte (extension et client)
-- `npm test` : lance le vrai serveur avec un modèle simulé et vérifie l'authentification, la diffusion identique à plusieurs clients, l'ordre FIFO, l'annulation, les discussions (historiques séparés, renommage, suppression), le choix du modèle, les actions d'outils, les questions et annulations depuis VS Code, la reconnexion et l'arrêt de session.
+- `npm test` : lance le vrai serveur avec un modèle simulé et vérifie l'authentification, la diffusion identique à plusieurs clients, l'ordre FIFO, l'annulation, les discussions (historiques séparés, renommage, suppression), le choix du modèle, les actions d'outils, les règles de validation (auteur / hôte / hors projet), les questions de l'agent, la reconnexion et l'arrêt de session.
+- `npm run test:vscode` : lance un VS Code isolé (profil temporaire) sur un projet piégé (`.env`, `.git`, liens vers `/etc` et hors du projet) et vérifie le confinement de l'agent et du bac à sable. Nécessite la commande `code` et un affichage.

@@ -23,12 +23,41 @@ class FakeBackend implements ModelBackend {
   readonly calls: ModelTurn[][] = [];
   readonly modelIds: (string | undefined)[] = [];
 
-  async ask({ turns, modelId }: ModelRequest, signal: AbortSignal) {
+  readonly outcomes: string[] = [];
+
+  async ask({ turns, modelId, interaction, author, authorClientId }: ModelRequest, signal: AbortSignal) {
     this.calls.push(turns);
     this.modelIds.push(modelId);
     const question = turns[turns.length - 1].content.split('\n\n').pop() ?? '';
     const slow = question.includes('lent');
+    const outcomes = this.outcomes;
     async function* events(): AsyncGenerator<ModelEvent> {
+      // « modifie » : action dans le projet ; « réseau » : commande hors du projet (hôte seul).
+      if (question.includes('modifie') || question.includes('réseau')) {
+        const hostOnly = question.includes('réseau');
+        const tool = {
+          id: `a${outcomes.length}`,
+          title: hostOnly ? 'Exécuter hors du projet' : 'Modifier src/a.ts',
+          status: 'awaitingApproval' as const,
+          approval: { kind: hostOnly ? ('command' as const) : ('write' as const), preview: '- a\n+ b', canShowDiff: !hostOnly, hostOnly },
+        };
+        yield { type: 'tool', tool };
+        const outcome = await interaction.approval(tool);
+        outcomes.push(`${outcome.decision}:${outcome.by}`);
+        yield { type: 'tool', tool: { ...tool, status: outcome.decision === 'deny' ? 'rejected' : 'done', detail: outcome.by } };
+      }
+      if (question.includes('demande-moi')) {
+        const tool = {
+          id: 'q1',
+          title: 'Question',
+          status: 'awaitingAnswer' as const,
+          question: { text: 'Quel framework ?', options: ['React', 'Vue'], requesterClientId: authorClientId, requesterName: author },
+        };
+        yield { type: 'tool', tool };
+        const answer = await interaction.answer(tool);
+        outcomes.push(`answer:${answer.text}:${answer.by}`);
+        yield { type: 'tool', tool: { ...tool, status: 'done', answer: answer.text, answeredBy: answer.by } };
+      }
       if (question.includes('outil')) {
         yield { type: 'text', text: 'Je regarde le fichier. ' };
         yield { type: 'tool', tool: { id: 't1', title: 'Lecture de src/a.ts', status: 'running' } };
@@ -288,7 +317,67 @@ async function main() {
   unsubscribe();
   ok('Annulation depuis VS Code : réponse en cours arrêtée, question en attente retirée');
 
-  // 10. Reconnexion avec le même pseudo : historique complet renvoyé
+  // 10. Validations : auteur ou hôte dans le projet, hôte seul hors du projet ; questions de l'agent
+  const toolMsg = (c: Client, status: string) =>
+    c.waitFor((m) => m.type === 'tool' && m.tool.status === status && !c.messages.slice(c.messages.indexOf(m) + 1).some((n) => n.type === 'tool' && n.tool.id === m.tool.id));
+  const lastTool = async (c: Client, status: string) => {
+    const m = await toolMsg(c, status);
+    return m.type === 'tool' ? m : undefined;
+  };
+  const waitAnswered = async (count: number) => {
+    for (let i = 0; i < 300 && backend.outcomes.length < count; i++) {
+      await sleep(10);
+    }
+  };
+
+  alice.messages.length = 0;
+  bob.messages.length = 0;
+  host.messages.length = 0;
+  alice.ask('Stp modifie le fichier');
+  const pending1 = (await lastTool(bob, 'awaitingApproval'))!;
+  bob.send({ type: 'approve', entryId: pending1.entryId, toolId: pending1.tool.id, decision: 'once' });
+  await bob.waitFor((m) => m.type === 'error' && m.message.includes("l'auteur de la demande"));
+  alice.send({ type: 'approve', entryId: pending1.entryId, toolId: pending1.tool.id, decision: 'session' });
+  await alice.waitFor((m) => m.type === 'error' && m.message.includes('toute la session'));
+  alice.send({ type: 'approve', entryId: pending1.entryId, toolId: pending1.tool.id, decision: 'once' });
+  await waitAnswered(1);
+  assert.equal(backend.outcomes[0], 'once:alice');
+  ok("Action dans le projet : validée par l'auteur ; refusée à un tiers ; « pour la session » réservé à l'hôte");
+
+  await waitIdle();
+  alice.ask('Installe via le réseau');
+  const pending2 = (await lastTool(alice, 'awaitingApproval'))!;
+  assert.equal(pending2.tool.approval?.hostOnly, true);
+  alice.send({ type: 'approve', entryId: pending2.entryId, toolId: pending2.tool.id, decision: 'once' });
+  await alice.waitFor((m) => m.type === 'error' && m.message.includes('sort du projet'));
+  host.send({ type: 'approve', entryId: pending2.entryId, toolId: pending2.tool.id, decision: 'deny' });
+  await waitAnswered(2);
+  assert.equal(backend.outcomes[1], 'deny:hote');
+  ok("Commande hors du projet : seul l'hôte peut décider (refus de l'hôte transmis à l'agent)");
+
+  await waitIdle();
+  alice.ask('Stp demande-moi le framework');
+  const pending3 = (await lastTool(bob, 'awaitingAnswer'))!;
+  assert.equal(pending3.tool.question?.text, 'Quel framework ?', 'la question est visible par un autre participant');
+  bob.send({ type: 'answer', entryId: pending3.entryId, toolId: pending3.tool.id, text: 'Vue' });
+  await waitAnswered(3);
+  assert.equal(backend.outcomes[2], 'answer:Vue:bob');
+  alice.send({ type: 'answer', entryId: pending3.entryId, toolId: pending3.tool.id, text: 'React' });
+  await alice.waitFor((m) => m.type === 'error' && m.message.includes("n'attend plus"));
+  await alice.waitFor((m) => m.type === 'tool' && m.tool.id === 'q1' && m.tool.answer === 'Vue' && m.tool.answeredBy === 'bob');
+  ok("Question de l'agent : visible par tous, n'importe qui répond, la première réponse l'emporte et revient à l'agent");
+
+  await waitIdle();
+  alice.ask('Stp modifie encore');
+  const pending4 = (await lastTool(host, 'awaitingApproval'))!;
+  assert.ok(room.pendingApproval(pending4.entryId, pending4.tool.id));
+  host.send({ type: 'cancel' });
+  await waitAnswered(4);
+  assert.equal(backend.outcomes[3], 'deny:');
+  assert.equal(room.pendingApproval(pending4.entryId, pending4.tool.id), undefined);
+  ok("Annulation pendant une validation : l'action est refusée et la file repart");
+
+  // 11. Reconnexion avec le même pseudo : historique complet renvoyé
   bob.ws.close();
   await host.waitFor((m) => m.type === 'participants' && m.participants.length === 2);
   const bob2 = await Client.join('bob');
@@ -298,7 +387,7 @@ async function main() {
   assert.ok(welcome.history.length >= 6);
   ok('Reconnexion : même identité et historique complet');
 
-  // 11. Arrêt : tous les clients sont prévenus et déconnectés
+  // 12. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");
   await server.stop('Session ended');
   await sleep(50);

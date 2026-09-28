@@ -1,32 +1,39 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { AgentQuestion, ApprovalKind, ApprovalRequest } from './protocol';
 
 /**
  * Outils donnés au modèle pour travailler dans l'espace de travail de l'hôte.
- * Les outils de lecture s'exécutent directement ; toute écriture ou commande
- * doit être validée par l'hôte dans VS Code.
+ *
+ * L'agent est confiné au dossier ouvert : chemins réels vérifiés (pas de sortie
+ * par lien symbolique), fichiers sensibles invisibles, commandes exécutées dans
+ * un bac à sable bubblewrap (projet en écriture, pas de dossier personnel, pas
+ * de réseau). Une commande qui doit sortir de ce cadre ne peut être validée que
+ * par l'hôte.
  */
 
 export type AgentMode = 'full' | 'readOnly' | 'off';
 
-/** Préparation d'un appel : titre affiché et, pour les actions sensibles, demande de validation. */
+/** Demande de validation préparée par un outil, avec le diff complet pour l'hôte. */
+export interface PreparedApproval extends ApprovalRequest {
+  diff?: { uri: vscode.Uri; original: string; modified: string };
+}
+
 export interface PreparedCall {
   title: string;
-  approval?: {
-    /** Détail affiché dans la demande de validation (commande, fichier…). */
-    detail: string;
-    /** Modification proposée, affichable sous forme de diff. */
-    diff?: { uri: vscode.Uri; original: string; modified: string };
-  };
+  approval?: PreparedApproval;
+  /** Outil interactif : l'agent pose une question au lieu d'agir. */
+  question?: Pick<AgentQuestion, 'text' | 'options'>;
   /** Exécute l'action ; renvoie le résultat pour le modèle et un résumé pour le chat. */
   execute(signal: AbortSignal): Promise<{ result: string; summary?: string }>;
 }
 
 interface AgentTool {
   definition: vscode.LanguageModelChatTool;
-  /** true : écriture ou exécution, soumise à validation et exclue en lecture seule. */
+  /** true : écriture ou exécution, exclue en lecture seule. */
   sensitive: boolean;
   prepare(input: Record<string, unknown>): Promise<PreparedCall>;
 }
@@ -35,8 +42,9 @@ const MAX_READ_CHARS = 60_000;
 const MAX_READ_LINES = 2000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT = 20_000;
+const MAX_PREVIEW_LINES = 40;
 const COMMAND_TIMEOUT_MS = 120_000;
-const EXCLUDE_GLOB = '**/{node_modules,.git,dist,out,build,.venv,__pycache__}/**';
+const SEARCH_EXCLUDE_GLOB = '**/{node_modules,.git,dist,out,build,.venv,__pycache__}/**';
 
 export const PROPOSAL_SCHEME = 'shared-copilot-proposal';
 
@@ -62,6 +70,10 @@ export class ProposalContentProvider implements vscode.TextDocumentContentProvid
 
 export class WorkspaceTools {
   private readonly tools: AgentTool[];
+  /** Catégories autorisées par l'hôte pour toute la session (« Autoriser pour la session »). */
+  private readonly grants = new Set<ApprovalKind>();
+  /** Diffs des actions en attente, par id d'action, pour « Voir les modifications ». */
+  private readonly diffs = new Map<string, NonNullable<PreparedApproval['diff']>>();
 
   constructor(
     private readonly proposals: ProposalContentProvider,
@@ -73,6 +85,7 @@ export class WorkspaceTools {
       readFileTool(),
       searchTextTool(),
       diagnosticsTool(),
+      askUserTool(),
       editFileTool(),
       createFileTool(),
       runCommandTool(output),
@@ -81,7 +94,7 @@ export class WorkspaceTools {
 
   /** Mode effectif : un espace de travail non approuvé ou sans dossier limite les outils. */
   effectiveMode(): AgentMode {
-    const configured = vscode.workspace.getConfiguration('sharedCopilotChat').get<AgentMode>('agentMode', 'full');
+    const configured = config().get<AgentMode>('agentMode', 'full');
     if (configured === 'off' || !vscode.workspace.workspaceFolders?.length) {
       return 'off';
     }
@@ -104,14 +117,20 @@ export class WorkspaceTools {
     }
     const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => `« ${f.name} »`).join(', ');
     const lines = [
-      `Tu as accès à l'espace de travail VS Code de l'hôte (dossiers : ${folders}) via des outils.`,
+      `Tu travailles dans l'espace de travail VS Code de l'hôte (dossiers : ${folders}) via des outils, comme l'agent GitHub Copilot.`,
+      "Tu es confiné à ce projet : aucun fichier extérieur n'est accessible, et certains fichiers sensibles (.env, clés, .git…) sont protégés.",
       'Les chemins sont relatifs à la racine du dossier ; en multi-dossier, préfixe-les par le nom du dossier.',
       'Avant de répondre sur le code, explore-le : liste, cherche et lis les fichiers utiles plutôt que de supposer leur contenu.',
+      "Si la demande est ambiguë ou qu'un choix important revient aux utilisateurs, pose la question avec ask_user plutôt que de deviner : tous les participants la voient et le premier qui répond l'emporte.",
     ];
     if (mode === 'full') {
       lines.push(
-        "Tu peux modifier ou créer des fichiers et lancer des commandes : chaque action est soumise à la validation de l'hôte, qui peut refuser.",
-        'Pour modifier un fichier, lis-le d\'abord puis utilise edit_file avec un extrait exact et unique du contenu actuel.',
+        "Tu peux modifier ou créer des fichiers et lancer des commandes : chaque action est validée par l'auteur de la demande ou par l'hôte, qui peuvent refuser.",
+        "Pour modifier un fichier, lis-le d'abord puis utilise edit_file avec un extrait exact et unique du contenu actuel.",
+        sandboxAvailable()
+          ? "Les commandes s'exécutent dans un bac à sable : projet seul, sans réseau ni dossier personnel. Si une commande a besoin du réseau ou de fichiers hors du projet (installation de dépendances, etc.), relance-la avec outsideProject: true ; seul l'hôte peut alors la valider."
+          : "Les commandes s'exécutent hors bac à sable : seul l'hôte peut les valider.",
+        `Système et shell des commandes : ${shellDescription()}. Utilise la syntaxe correspondante.`,
         "N'effectue une modification ou une commande que si la demande le justifie clairement.",
       );
     } else {
@@ -120,58 +139,61 @@ export class WorkspaceTools {
     return lines.join('\n');
   }
 
-  async prepare(name: string, input: unknown): Promise<PreparedCall & { sensitive: boolean }> {
+  async prepare(name: string, input: unknown): Promise<PreparedCall> {
     const tool = this.tools.find((t) => t.definition.name === name);
     const mode = this.effectiveMode();
     if (!tool || mode === 'off' || (tool.sensitive && mode !== 'full')) {
       throw new Error(`Outil « ${name} » indisponible.`);
     }
     const args = typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {};
-    const prepared = await tool.prepare(args);
-    return { ...prepared, sensitive: tool.sensitive };
+    return tool.prepare(args);
   }
 
-  /**
-   * Demande à l'hôte de valider une action. Pour une modification de fichier,
-   * propose d'afficher le diff avant de décider.
-   */
-  async requestApproval(call: PreparedCall, author: string): Promise<boolean> {
-    const approval = call.approval;
-    if (!approval) {
-      return true;
-    }
-    const allow = 'Autoriser';
-    const showDiff = 'Voir les modifications';
-    const buttons = approval.diff ? [allow, showDiff] : [allow];
-    const choice = await vscode.window.showWarningMessage(
-      `Shared Copilot — question de ${author} : ${call.title}`,
-      { modal: true, detail: approval.detail },
-      ...buttons,
-    );
-    if (choice === allow) {
-      return true;
-    }
-    if (choice !== showDiff || !approval.diff) {
+  /** true si l'hôte a déjà autorisé cette catégorie d'action pour la session (jamais pour une action hors du projet). */
+  isGranted(approval: PreparedApproval): boolean {
+    return !approval.hostOnly && this.grants.has(approval.kind);
+  }
+
+  grant(kind: ApprovalKind): void {
+    this.grants.add(kind);
+  }
+
+  /** Réinitialise l'état propre à une session (autorisations, diffs). */
+  resetSession(): void {
+    this.grants.clear();
+    this.diffs.clear();
+    this.proposals.clear();
+  }
+
+  rememberDiff(toolId: string, diff: NonNullable<PreparedApproval['diff']>): void {
+    this.diffs.set(toolId, diff);
+  }
+
+  forgetDiff(toolId: string): void {
+    this.diffs.delete(toolId);
+  }
+
+  /** Ouvre dans VS Code le diff complet d'une modification proposée. Renvoie false si elle n'existe plus. */
+  async showDiff(toolId: string): Promise<boolean> {
+    const diff = this.diffs.get(toolId);
+    if (!diff) {
       return false;
     }
-    const { uri, original, modified } = approval.diff;
-    const name = path.basename(uri.path);
-    const left = this.proposals.register(original, name);
-    const right = this.proposals.register(modified, name);
+    const name = path.basename(diff.uri.path);
+    const left = this.proposals.register(diff.original, name);
+    const right = this.proposals.register(diff.modified, name);
     await vscode.commands.executeCommand('vscode.diff', left, right, `${name} : modification proposée (Shared Copilot)`, {
       preview: true,
     });
-    // Non modale, pour pouvoir parcourir le diff avant de répondre.
-    const decision = await vscode.window.showWarningMessage(
-      `Shared Copilot — appliquer la modification proposée pour ${author} : ${call.title} ?`,
-      allow,
-      'Refuser',
-    );
-    return decision === allow;
+    return true;
   }
 }
 
-// ---- Résolution des chemins ----
+function config(): vscode.WorkspaceConfiguration {
+  return vscode.workspace.getConfiguration('sharedCopilotChat');
+}
+
+// ---- Confinement : chemins et fichiers protégés ----
 
 function workspaceFolders(): readonly vscode.WorkspaceFolder[] {
   const folders = vscode.workspace.workspaceFolders;
@@ -181,8 +203,15 @@ function workspaceFolders(): readonly vscode.WorkspaceFolder[] {
   return folders;
 }
 
-/** Convertit un chemin donné par le modèle en URI, en refusant tout ce qui sort de l'espace de travail. */
-function resolvePath(raw: unknown): vscode.Uri {
+interface Resolved {
+  uri: vscode.Uri;
+  folder: vscode.WorkspaceFolder;
+  /** Chemin relatif au dossier, séparateurs « / ». */
+  rel: string;
+}
+
+/** Résolution purement textuelle d'un chemin donné par le modèle, sans sortie du dossier. */
+function resolveLexical(raw: unknown): Resolved {
   const folders = workspaceFolders();
   const input = typeof raw === 'string' && raw.trim() ? raw.trim() : '.';
   let folder = folders[0];
@@ -207,7 +236,45 @@ function resolvePath(raw: unknown): vscode.Uri {
   if (!isInside(folder.uri.fsPath, full)) {
     throw new Error(`Chemin hors de l'espace de travail : ${input}`);
   }
-  return vscode.Uri.file(full);
+  return { uri: vscode.Uri.file(full), folder, rel: toPosix(path.relative(folder.uri.fsPath, full)) };
+}
+
+/**
+ * Résout un chemin et vérifie qu'il reste dans l'espace de travail une fois les
+ * liens symboliques suivis, et qu'il n'est pas protégé.
+ */
+async function resolveSafe(raw: unknown): Promise<Resolved> {
+  const resolved = resolveLexical(raw);
+  if (isProtected(resolved.rel)) {
+    throw new Error(`Fichier protégé, non accessible à l'agent : ${resolved.rel}`);
+  }
+  const root = await fs.promises.realpath(resolved.folder.uri.fsPath);
+  // Pour un fichier à créer, on vérifie le plus proche parent existant.
+  let probe = resolved.uri.fsPath;
+  let real: string | undefined;
+  while (real === undefined) {
+    try {
+      real = await fs.promises.realpath(probe);
+    } catch (err) {
+      const parent = path.dirname(probe);
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT' || parent === probe) {
+        throw err;
+      }
+      // Lien symbolique cassé : écrire à travers lui créerait un fichier ailleurs.
+      if (await fs.promises.lstat(probe).then((st) => st.isSymbolicLink(), () => false)) {
+        throw new Error(`Lien symbolique non suivi : ${resolved.rel}`);
+      }
+      probe = parent;
+    }
+  }
+  if (!isInside(root, real)) {
+    throw new Error(`Chemin hors de l'espace de travail (lien symbolique) : ${resolved.rel}`);
+  }
+  // Un lien interne peut pointer vers un fichier protégé (ex. config -> .env).
+  if (isProtected(toPosix(path.relative(root, real)))) {
+    throw new Error(`Fichier protégé, non accessible à l'agent : ${resolved.rel}`);
+  }
+  return resolved;
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -215,8 +282,101 @@ function isInside(root: string, candidate: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
+function toPosix(p: string): string {
+  return p.split(path.sep).join('/');
+}
+
+const DEFAULT_PROTECTED = [
+  '**/.git',
+  '**/.git/**',
+  '**/.env',
+  '**/.env.*',
+  '**/*.pem',
+  '**/*.key',
+  '**/*.p12',
+  '**/*.pfx',
+  '**/id_rsa*',
+  '**/id_ed25519*',
+  '**/.npmrc',
+  '**/.pypirc',
+  '**/.netrc',
+  '**/.aws/**',
+  '**/.ssh/**',
+];
+
+let protectedCache: { source: string; patterns: RegExp[] } | undefined;
+
+/** Fichiers invisibles pour l'agent : liste par défaut + paramètre `protectedFiles`. */
+function isProtected(rel: string): boolean {
+  if (!rel || rel === '.') {
+    return false;
+  }
+  const extra = config().get<string[]>('protectedFiles', []);
+  const source = JSON.stringify(extra);
+  if (protectedCache?.source !== source) {
+    protectedCache = { source, patterns: [...DEFAULT_PROTECTED, ...extra].map(globToRegExp) };
+  }
+  return protectedCache.patterns.some((re) => re.test(rel));
+}
+
+/** Convertit un glob (**, *, ?, {a,b}) en expression régulière sur un chemin relatif « / ». */
+export function globToRegExp(glob: string): RegExp {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        const slash = glob[i + 2] === '/';
+        re += slash ? '(?:.*/)?' : '.*';
+        i += slash ? 2 : 1;
+      } else {
+        re += '[^/]*';
+      }
+    } else if (c === '?') {
+      re += '[^/]';
+    } else if (c === '{') {
+      const end = glob.indexOf('}', i);
+      if (end < 0) {
+        re += '\\{';
+      } else {
+        re += `(?:${glob.slice(i + 1, end).split(',').map(escapeRegExp).join('|')})`;
+        i = end;
+      }
+    } else {
+      re += escapeRegExp(c);
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+}
+
 function display(uri: vscode.Uri): string {
   return vscode.workspace.asRelativePath(uri, (vscode.workspace.workspaceFolders?.length ?? 0) > 1);
+}
+
+/** Chemin relatif au dossier d'appartenance, ou undefined si l'URI est hors de l'espace de travail. */
+function workspaceRel(uri: vscode.Uri): string | undefined {
+  const folder = vscode.workspace.getWorkspaceFolder(uri);
+  return folder && uri.scheme === 'file' ? toPosix(path.relative(folder.uri.fsPath, uri.fsPath)) : undefined;
+}
+
+/** Fichier du projet accessible à l'agent : dans un dossier ouvert, non protégé, et sans sortie par lien symbolique. */
+function visible(uri: vscode.Uri): boolean {
+  const rel = workspaceRel(uri);
+  if (rel === undefined || isProtected(rel)) {
+    return false;
+  }
+  const folder = vscode.workspace.getWorkspaceFolder(uri)!;
+  try {
+    const root = fs.realpathSync(folder.uri.fsPath);
+    const real = fs.realpathSync(uri.fsPath);
+    return isInside(root, real) && !isProtected(toPosix(path.relative(root, real)));
+  } catch {
+    return false;
+  }
 }
 
 function str(v: unknown): string | undefined {
@@ -256,6 +416,19 @@ async function exists(uri: vscode.Uri): Promise<boolean> {
   }
 }
 
+function preview(prefix: string, text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  const shown = lines.slice(0, MAX_PREVIEW_LINES).map((l) => `${prefix}${l}`);
+  if (lines.length > MAX_PREVIEW_LINES) {
+    shown.push(`  … ${lines.length - MAX_PREVIEW_LINES} ligne(s) de plus`);
+  }
+  return shown;
+}
+
+function countLines(text: string): number {
+  return text ? text.split(/\r?\n/).length : 0;
+}
+
 // ---- Outils de lecture ----
 
 function listDirectoryTool(): AgentTool {
@@ -270,11 +443,13 @@ function listDirectoryTool(): AgentTool {
       },
     },
     async prepare(input) {
-      const uri = resolvePath(input.path);
+      const { uri, rel } = await resolveSafe(input.path);
       return {
-        title: `Liste de ${display(uri) || '.'}`,
+        title: `Liste de ${rel || '.'}`,
         async execute() {
-          const entries = await vscode.workspace.fs.readDirectory(uri);
+          const entries = (await vscode.workspace.fs.readDirectory(uri)).filter(
+            ([name]) => !isProtected(rel && rel !== '.' ? `${rel}/${name}` : name),
+          );
           entries.sort(([a, ta], [b, tb]) => (tb & vscode.FileType.Directory) - (ta & vscode.FileType.Directory) || a.localeCompare(b));
           const lines = entries.slice(0, 500).map(([name, type]) => (type & vscode.FileType.Directory ? `${name}/` : name));
           if (entries.length > 500) {
@@ -296,7 +471,7 @@ function findFilesTool(): AgentTool {
       inputSchema: {
         type: 'object',
         properties: {
-          pattern: { type: 'string', description: 'Motif glob relatif aux dossiers de l\'espace de travail.' },
+          pattern: { type: 'string', description: "Motif glob relatif aux dossiers de l'espace de travail." },
           maxResults: { type: 'number', description: 'Nombre maximal de résultats (défaut 200).' },
         },
         required: ['pattern'],
@@ -312,7 +487,7 @@ function findFilesTool(): AgentTool {
       return {
         title: `Recherche de fichiers « ${pattern} »`,
         async execute() {
-          const uris = await vscode.workspace.findFiles(pattern, EXCLUDE_GLOB, max);
+          const uris = (await vscode.workspace.findFiles(pattern, SEARCH_EXCLUDE_GLOB, max * 2)).filter(visible).slice(0, max);
           const lines = uris.map(display).sort();
           return { result: lines.join('\n') || 'Aucun fichier trouvé.', summary: `${uris.length} fichier(s)` };
         },
@@ -338,11 +513,11 @@ function readFileTool(): AgentTool {
       },
     },
     async prepare(input) {
-      const uri = resolvePath(input.path);
+      const { uri, rel } = await resolveSafe(input.path);
       const start = Math.max(1, int(input.startLine) ?? 1);
       const requestedEnd = int(input.endLine);
       return {
-        title: `Lecture de ${display(uri)}${requestedEnd || start > 1 ? ` (lignes ${start}-${requestedEnd ?? 'fin'})` : ''}`,
+        title: `Lecture de ${rel}${requestedEnd || start > 1 ? `, lignes ${start} à ${requestedEnd ?? 'la fin'}` : ''}`,
         async execute() {
           const lines = (await readText(uri)).split(/\r?\n/);
           const end = Math.min(lines.length, requestedEnd ?? lines.length, start + MAX_READ_LINES - 1);
@@ -352,7 +527,7 @@ function readFileTool(): AgentTool {
             body = body.slice(0, MAX_READ_CHARS);
             truncated = true;
           }
-          const header = `${display(uri)} — lignes ${start}-${end} sur ${lines.length}${truncated ? ' (tronqué : relis la suite avec startLine)' : ''}`;
+          const header = `${rel} — lignes ${start}-${end} sur ${lines.length}${truncated ? ' (tronqué : relis la suite avec startLine)' : ''}`;
           return { result: `${header}\n${body}`, summary: `lignes ${start}-${end} sur ${lines.length}` };
         },
       };
@@ -411,20 +586,24 @@ function diagnosticsTool(): AgentTool {
       description: "Renvoie les erreurs et avertissements (compilateur, linter) connus de VS Code, pour un fichier ou tout l'espace de travail.",
       inputSchema: {
         type: 'object',
-        properties: { path: { type: 'string', description: 'Fichier à examiner ; absent : tout l\'espace de travail.' } },
+        properties: { path: { type: 'string', description: "Fichier à examiner ; absent : tout l'espace de travail." } },
       },
     },
     async prepare(input) {
-      const uri = input.path ? resolvePath(input.path) : undefined;
+      const target = input.path ? await resolveSafe(input.path) : undefined;
       return {
-        title: uri ? `Diagnostics de ${display(uri)}` : 'Diagnostics de l’espace de travail',
+        title: target ? `Problèmes dans ${target.rel}` : 'Problèmes du projet',
         async execute() {
-          const all: [vscode.Uri, readonly vscode.Diagnostic[]][] = uri
-            ? [[uri, vscode.languages.getDiagnostics(uri)]]
+          const all: [vscode.Uri, readonly vscode.Diagnostic[]][] = target
+            ? [[target.uri, vscode.languages.getDiagnostics(target.uri)]]
             : vscode.languages.getDiagnostics();
           const severity = ['erreur', 'avertissement', 'info', 'suggestion'];
           const lines: string[] = [];
           for (const [file, diags] of all) {
+            // Seulement les fichiers du projet : VS Code connaît aussi des fichiers ouverts ailleurs.
+            if (!visible(file)) {
+              continue;
+            }
             for (const d of diags) {
               if (d.severity <= vscode.DiagnosticSeverity.Warning) {
                 lines.push(`${display(file)}:${d.range.start.line + 1}:${d.range.start.character + 1} ${severity[d.severity]} : ${d.message}`);
@@ -441,7 +620,42 @@ function diagnosticsTool(): AgentTool {
   };
 }
 
-// ---- Outils d'écriture (validés par l'hôte) ----
+function askUserTool(): AgentTool {
+  return {
+    sensitive: false,
+    definition: {
+      name: 'ask_user',
+      description:
+        "Pose une question aux participants du chat et attend la première réponse (choix entre options ou réponse libre). Tous voient la question et n'importe qui peut répondre. À utiliser quand la demande est ambiguë ou qu'une décision revient aux utilisateurs.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'La question, courte et précise.' },
+          options: { type: 'array', items: { type: 'string' }, description: 'Réponses proposées (2 à 6), facultatif.' },
+        },
+        required: ['question'],
+      },
+    },
+    async prepare(input) {
+      const text = str(input.question)?.trim();
+      if (!text) {
+        throw new Error('Paramètre « question » manquant.');
+      }
+      const options = Array.isArray(input.options)
+        ? input.options.filter((o): o is string => typeof o === 'string' && !!o.trim()).map((o) => o.trim().slice(0, 120)).slice(0, 6)
+        : [];
+      return {
+        title: 'Question',
+        question: { text: text.slice(0, 1000), options },
+        async execute() {
+          return { result: '' };
+        },
+      };
+    },
+  };
+}
+
+// ---- Outils d'écriture (validés) ----
 
 function editFileTool(): AgentTool {
   return {
@@ -449,7 +663,7 @@ function editFileTool(): AgentTool {
     definition: {
       name: 'edit_file',
       description:
-        "Remplace dans un fichier existant un extrait exact (oldText, qui doit apparaître une seule fois) par newText. Lis le fichier avant. L'hôte valide chaque modification.",
+        "Remplace dans un fichier existant un extrait exact (oldText, qui doit apparaître une seule fois) par newText. Lis le fichier avant. Chaque modification est validée.",
       inputSchema: {
         type: 'object',
         properties: {
@@ -461,7 +675,7 @@ function editFileTool(): AgentTool {
       },
     },
     async prepare(input) {
-      const uri = resolvePath(input.path);
+      const { uri, rel } = await resolveSafe(input.path);
       const oldText = str(input.oldText);
       const newText = str(input.newText);
       if (!oldText || newText === undefined) {
@@ -472,31 +686,38 @@ function editFileTool(): AgentTool {
       const find = oldText.replace(/\r?\n/g, eol);
       const first = original.indexOf(find);
       if (first < 0) {
-        throw new Error(`Extrait introuvable dans ${display(uri)} : relis le fichier et recopie le texte exact.`);
+        throw new Error(`Extrait introuvable dans ${rel} : relis le fichier et recopie le texte exact.`);
       }
       if (original.indexOf(find, first + 1) >= 0) {
-        throw new Error(`Extrait présent plusieurs fois dans ${display(uri)} : ajoute du contexte pour le rendre unique.`);
+        throw new Error(`Extrait présent plusieurs fois dans ${rel} : ajoute du contexte pour le rendre unique.`);
       }
       const replacement = newText.replace(/\r?\n/g, eol);
       const modified = original.slice(0, first) + replacement + original.slice(first + find.length);
+      const line = original.slice(0, first).split(/\r?\n/).length;
       return {
-        title: `Modification de ${display(uri)}`,
+        title: `Modifier ${rel}`,
         approval: {
-          detail: `Fichier : ${display(uri)}\n${countLines(find)} ligne(s) remplacée(s) par ${countLines(replacement)}.`,
+          kind: 'write',
+          hostOnly: false,
+          canShowDiff: true,
+          preview: [`@@ ${rel}, ligne ${line}`, ...preview('- ', oldText), ...preview('+ ', newText)].join('\n'),
           diff: { uri, original, modified },
         },
         async execute() {
           const doc = await vscode.workspace.openTextDocument(uri);
           if (doc.getText() !== original) {
-            throw new Error(`${display(uri)} a changé entre-temps : relis-le avant de réessayer.`);
+            throw new Error(`${rel} a changé entre-temps : relis-le avant de réessayer.`);
           }
           const edit = new vscode.WorkspaceEdit();
           edit.replace(uri, new vscode.Range(doc.positionAt(first), doc.positionAt(first + find.length)), replacement);
           if (!(await vscode.workspace.applyEdit(edit))) {
-            throw new Error("VS Code a refusé la modification.");
+            throw new Error('VS Code a refusé la modification.');
           }
           await doc.save();
-          return { result: `Modification appliquée à ${display(uri)}.`, summary: 'appliquée' };
+          return {
+            result: `Modification appliquée à ${rel}.`,
+            summary: `+${countLines(replacement)} −${countLines(find)}`,
+          };
         },
       };
     },
@@ -508,7 +729,7 @@ function createFileTool(): AgentTool {
     sensitive: true,
     definition: {
       name: 'create_file',
-      description: "Crée un nouveau fichier (le fichier ne doit pas exister ; utilise edit_file sinon). L'hôte valide chaque création.",
+      description: "Crée un nouveau fichier (le fichier ne doit pas exister ; utilise edit_file sinon). Chaque création est validée.",
       inputSchema: {
         type: 'object',
         properties: {
@@ -519,23 +740,26 @@ function createFileTool(): AgentTool {
       },
     },
     async prepare(input) {
-      const uri = resolvePath(input.path);
+      const { uri, rel } = await resolveSafe(input.path);
       const content = str(input.content);
       if (content === undefined) {
         throw new Error('Paramètre « content » requis.');
       }
       if (await exists(uri)) {
-        throw new Error(`${display(uri)} existe déjà : utilise edit_file pour le modifier.`);
+        throw new Error(`${rel} existe déjà : utilise edit_file pour le modifier.`);
       }
       return {
-        title: `Création de ${display(uri)}`,
+        title: `Créer ${rel}`,
         approval: {
-          detail: `Nouveau fichier : ${display(uri)} (${countLines(content)} ligne(s)).`,
+          kind: 'write',
+          hostOnly: false,
+          canShowDiff: true,
+          preview: [`@@ nouveau fichier ${rel}`, ...preview('+ ', content)].join('\n'),
           diff: { uri, original: '', modified: content },
         },
         async execute() {
           await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
-          return { result: `Fichier créé : ${display(uri)}.`, summary: 'créé' };
+          return { result: `Fichier créé : ${rel}.`, summary: `+${countLines(content)}` };
         },
       };
     },
@@ -547,12 +771,19 @@ function runCommandTool(output: vscode.OutputChannel): AgentTool {
     sensitive: true,
     definition: {
       name: 'run_command',
-      description: `Exécute une commande shell dans un dossier de l'espace de travail et renvoie sa sortie (délai max ${COMMAND_TIMEOUT_MS / 1000} s, pas d'interaction). L'hôte valide chaque commande.`,
+      description:
+        `Exécute une commande shell dans un dossier du projet et renvoie sa sortie (délai max ${COMMAND_TIMEOUT_MS / 1000} s, pas d'interaction). ` +
+        'Par défaut, la commande tourne dans un bac à sable : seul le projet est visible et modifiable, sans réseau. ' +
+        "Mets outsideProject à true si elle a besoin du réseau ou d'éléments hors du projet : seul l'hôte peut alors la valider.",
       inputSchema: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'Commande à exécuter.' },
           cwd: { type: 'string', description: 'Dossier de travail relatif (défaut : racine).' },
+          outsideProject: {
+            type: 'boolean',
+            description: "true si la commande doit accéder au réseau ou à des fichiers hors du projet (validation par l'hôte uniquement).",
+          },
         },
         required: ['command'],
       },
@@ -562,26 +793,198 @@ function runCommandTool(output: vscode.OutputChannel): AgentTool {
       if (!command) {
         throw new Error('Paramètre « command » manquant.');
       }
-      const cwd = resolvePath(input.cwd);
-      const short = command.length > 60 ? `${command.slice(0, 59)}…` : command;
+      const { uri: cwd, rel } = await resolveSafe(input.cwd);
+      const sandboxed = input.outsideProject !== true && sandboxAvailable();
+      const where = sandboxed
+        ? 'bac à sable : projet seul, sans réseau'
+        : sandboxAvailable()
+          ? 'HORS bac à sable : accès au réseau et à toute la machine'
+          : process.platform === 'win32'
+            ? 'Windows, sans bac à sable : accès à toute la machine'
+            : 'HORS bac à sable (bubblewrap indisponible) : accès à toute la machine';
       return {
-        title: `Commande : ${short}`,
-        approval: { detail: `Dossier : ${display(cwd) || '.'}\n\n${command}` },
-        execute: (signal) => runShell(command, cwd.fsPath, signal, output),
+        title: sandboxed ? 'Exécuter dans le terminal' : 'Exécuter hors du projet',
+        approval: {
+          kind: 'command',
+          hostOnly: !sandboxed,
+          canShowDiff: false,
+          preview: `$ ${command}\n# dossier : ${rel || '.'} — ${where}`,
+        },
+        execute: (signal) => runShell(command, cwd.fsPath, sandboxed, signal, output),
       };
     },
   };
 }
 
+// ---- Exécution des commandes ----
+
+let bwrapPath: string | null | undefined;
+
+/** bubblewrap (Linux) permet de confiner les commandes au projet. */
+export function sandboxAvailable(): boolean {
+  if (bwrapPath === undefined) {
+    bwrapPath =
+      process.platform === 'linux'
+        ? (['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap'].find((p) => fs.existsSync(p)) ?? null)
+        : null;
+  }
+  return bwrapPath !== null;
+}
+
+/** Arguments bubblewrap : système en lecture seule, projet en écriture, rien d'autre (ni $HOME, ni réseau). */
+function sandboxArgs(cwd: string): { args: string[]; path: string } {
+  const args = ['--die-with-parent', '--new-session', '--unshare-all', '--clearenv'];
+  for (const dir of ['/bin', '/sbin', '/lib', '/lib32', '/lib64']) {
+    try {
+      const st = fs.lstatSync(dir);
+      if (st.isSymbolicLink()) {
+        args.push('--symlink', fs.readlinkSync(dir), dir);
+      } else if (st.isDirectory()) {
+        args.push('--ro-bind', dir, dir);
+      }
+    } catch {
+      // Absent sur cette distribution.
+    }
+  }
+  args.push('--ro-bind', '/usr', '/usr');
+  for (const etc of ['/etc/alternatives', '/etc/ssl', '/etc/ca-certificates', '/etc/localtime']) {
+    args.push('--ro-bind-try', etc, etc);
+  }
+  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/tmp/home');
+
+  // Outils installés hors de /usr (ex. Node dans le dossier personnel) : visibles en lecture seule.
+  const home = os.homedir();
+  const pathDirs: string[] = [];
+  const readOnly = new Set<string>(config().get<string[]>('sandboxReadOnlyPaths', []));
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (!dir || !path.isAbsolute(dir) || dir.startsWith('/usr') || ['/bin', '/sbin'].includes(dir) || dir === home) {
+      continue;
+    }
+    try {
+      if (fs.statSync(dir).isDirectory()) {
+        readOnly.add(dir);
+        pathDirs.push(dir);
+      }
+    } catch {
+      // Entrée du PATH inexistante.
+    }
+  }
+  // Installation de Node hors de /usr : npm a besoin de <racine>/lib.
+  for (const dir of pathDirs) {
+    if (path.basename(dir) === 'bin' && fs.existsSync(path.join(dir, 'node'))) {
+      readOnly.add(path.dirname(dir));
+    }
+  }
+  for (const dir of readOnly) {
+    args.push('--ro-bind-try', dir, dir);
+  }
+
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    args.push('--bind', folder.uri.fsPath, folder.uri.fsPath);
+    // Les fichiers protégés restent invisibles dans le bac à sable : recouverts par un fichier ou un dossier vide.
+    for (const hidden of protectedEntries(folder.uri.fsPath)) {
+      args.push(...(hidden.dir ? ['--tmpfs', hidden.path] : ['--ro-bind', '/dev/null', hidden.path]));
+    }
+  }
+  const envPath = [...pathDirs, '/usr/local/bin', '/usr/bin', '/bin'].join(':');
+  args.push(
+    '--setenv', 'PATH', envPath,
+    '--setenv', 'HOME', '/tmp/home',
+    '--setenv', 'TERM', 'dumb',
+    '--setenv', 'LANG', process.env.LANG ?? 'C.UTF-8',
+    '--chdir', cwd,
+  );
+  return { args, path: envPath };
+}
+
+/** Arrête un processus et ses descendants (taskkill sous Windows, groupe de processus ailleurs). */
+function killTree(pid: number | undefined, fallback: () => void): void {
+  if (pid === undefined) {
+    fallback();
+    return;
+  }
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }).on('error', fallback);
+    } else {
+      process.kill(-pid, 'SIGTERM');
+    }
+  } catch {
+    fallback();
+  }
+}
+
+/** Shell utilisé pour les commandes, décrit au modèle pour qu'il en respecte la syntaxe. */
+function shellDescription(): string {
+  if (process.platform === 'win32') {
+    return 'Windows, PowerShell';
+  }
+  return `${process.platform === 'darwin' ? 'macOS' : 'Linux'}, /bin/sh`;
+}
+
+/**
+ * Fichiers et dossiers protégés présents dans un dossier du projet (parcours borné,
+ * sans suivre les liens ni descendre dans node_modules). Dans .git, seul config
+ * est masqué pour que git reste utilisable.
+ */
+function protectedEntries(root: string): { path: string; dir: boolean }[] {
+  const found: { path: string; dir: boolean }[] = [];
+  let budget = 20_000;
+  const walk = (dir: string, depth: number) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (--budget < 0) {
+        return;
+      }
+      const full = path.join(dir, entry.name);
+      const rel = toPosix(path.relative(root, full));
+      if (entry.isSymbolicLink()) {
+        continue;
+      }
+      if (entry.isDirectory() && entry.name === '.git') {
+        const config = path.join(full, 'config');
+        if (fs.existsSync(config)) {
+          found.push({ path: config, dir: false });
+        }
+        continue;
+      }
+      if (isProtected(rel)) {
+        found.push({ path: full, dir: entry.isDirectory() });
+        continue;
+      }
+      if (entry.isDirectory() && entry.name !== 'node_modules' && depth < 8) {
+        walk(full, depth + 1);
+      }
+    }
+  };
+  walk(root, 0);
+  return found;
+}
+
 function runShell(
   command: string,
   cwd: string,
+  sandboxed: boolean,
   signal: AbortSignal,
   output: vscode.OutputChannel,
 ): Promise<{ result: string; summary: string }> {
   return new Promise((resolve) => {
-    output.appendLine(`\n$ ${command}   (dans ${cwd})`);
-    const child = spawn(command, { cwd, shell: true, env: process.env });
+    output.appendLine(`\n$ ${command}   (dans ${cwd}${sandboxed ? ', bac à sable' : ', HORS bac à sable'})`);
+    const child = sandboxed
+      ? spawn(bwrapPath!, [...sandboxArgs(cwd).args, '/bin/sh', '-c', command], { cwd })
+      : process.platform === 'win32'
+        ? spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+            cwd,
+            env: process.env,
+            windowsHide: true,
+          })
+        : // Groupe de processus dédié, pour pouvoir arrêter la commande et tous ses sous-processus.
+          spawn(command, { cwd, shell: true, env: process.env, detached: true });
     let out = '';
     const collect = (d: Buffer) => {
       const text = d.toString();
@@ -593,7 +996,7 @@ function runShell(
     };
     child.stdout.on('data', collect);
     child.stderr.on('data', collect);
-    const kill = () => child.kill();
+    const kill = () => killTree(child.pid, () => child.kill());
     const timer = setTimeout(kill, COMMAND_TIMEOUT_MS);
     signal.addEventListener('abort', kill, { once: true });
     const finish = (code: number | null, error?: string) => {
@@ -607,10 +1010,6 @@ function runShell(
     child.on('error', (err) => finish(null, `échec : ${err.message}`));
     child.on('close', (code) => finish(code));
   });
-}
-
-function countLines(text: string): number {
-  return text ? text.split(/\r?\n/).length : 0;
 }
 
 // ---- Recherche de texte ----
@@ -650,6 +1049,7 @@ function searchWithRipgrep(
     if (acc.length >= max || signal.aborted) {
       return acc;
     }
+    // Pas de --follow : ripgrep ne suit pas les liens symboliques, donc ne sort pas du dossier.
     const args = ['--line-number', '--no-heading', '--color', 'never', '--max-columns', '300', '--max-count', '20', '--hidden', '-g', '!.git'];
     if (!isRegex) {
       args.push('--fixed-strings');
@@ -669,8 +1069,12 @@ function searchWithRipgrep(
         const parts = buf.split('\n');
         buf = parts.pop() ?? '';
         for (const line of parts) {
+          const clean = line.replace(/^\.[\\/]/, '');
+          const file = clean.slice(0, clean.indexOf(':'));
+          if (isProtected(toPosix(file))) {
+            continue;
+          }
           if (found.length + acc.length < max) {
-            const clean = line.replace(/^\.[\\/]/, '');
             found.push(multi ? `${folder.name}/${clean}` : clean);
           } else {
             child.kill();
@@ -690,11 +1094,12 @@ function searchWithRipgrep(
 /** Repli sans ripgrep : parcours des fichiers texte de taille raisonnable. */
 async function searchWithScan(query: string, isRegex: boolean, include: string | undefined, max: number): Promise<string[]> {
   const matcher = isRegex ? new RegExp(query) : undefined;
-  const uris = await vscode.workspace.findFiles(include ?? '**/*', EXCLUDE_GLOB, 3000);
+  const uris = (await vscode.workspace.findFiles(include ?? '**/*', SEARCH_EXCLUDE_GLOB, 3000)).filter(visible);
   const hits: string[] = [];
   for (const uri of uris) {
     let text: string;
     try {
+      await resolveSafe(uri.fsPath);
       text = await readText(uri);
     } catch {
       continue;

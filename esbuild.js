@@ -42,6 +42,15 @@ const targets = test
         // ws charge ces modules optionnels dans un try/catch.
         external: ['bufferutil', 'utf-8-validate'],
       },
+      {
+        ...common,
+        entryPoints: ['test/vscode/confine.ts'],
+        outfile: 'dist/test/vscode/confine.js',
+        platform: 'node',
+        format: 'cjs',
+        target: 'node18',
+        external: ['vscode'],
+      },
     ]
   : [
       {
@@ -63,7 +72,23 @@ const targets = test
       },
     ];
 
+/** Copie les codicons dans dist/web avec la police intégrée (les requêtes sans token sont refusées par le serveur). */
+function buildCodicons() {
+  const fs = require('fs');
+  const path = require('path');
+  const dir = path.join(__dirname, 'node_modules', '@vscode', 'codicons', 'dist');
+  const font = fs.readFileSync(path.join(dir, 'codicon.ttf')).toString('base64');
+  const css = fs
+    .readFileSync(path.join(dir, 'codicon.css'), 'utf8')
+    .replace(/url\(["']?\.\/codicon\.ttf[^"')]*["']?\)/, `url("data:font/truetype;base64,${font}")`);
+  fs.mkdirSync(path.join(__dirname, 'dist', 'web'), { recursive: true });
+  fs.writeFileSync(path.join(__dirname, 'dist', 'web', 'codicon.css'), css);
+}
+
 async function main() {
+  if (!test) {
+    buildCodicons();
+  }
   const contexts = await Promise.all(targets.map((t) => esbuild.context(t)));
   if (watch) {
     await Promise.all(contexts.map((c) => c.watch()));

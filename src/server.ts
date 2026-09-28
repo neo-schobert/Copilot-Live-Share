@@ -162,7 +162,7 @@ export class ChatServer {
       const html = this.options.indexHtml.replace(/__TOKEN__/g, () => encodeURIComponent(token));
       send(res, 200, 'text/html; charset=utf-8', html, {
         'Content-Security-Policy':
-          "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'",
+          "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'",
       });
       return;
     }

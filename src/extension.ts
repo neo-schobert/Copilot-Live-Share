@@ -3,7 +3,8 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
 import { PROPOSAL_SCHEME, ProposalContentProvider, WorkspaceTools } from './agentTools';
-import { ChatRoom } from './chatRoom';
+import type { ApprovalDecision } from './protocol';
+import { ChatRoom, LOCAL_HOST_CLIENT_ID, PendingApproval, PendingQuestion } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
 import { NativeChatBridge } from './nativeChat';
 import { ChatServer } from './server';
@@ -104,6 +105,23 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
     vscode.commands.registerCommand('sharedCopilotChat.cancelResponse', withSession(cancelResponse)),
     vscode.commands.registerCommand('sharedCopilotChat.stopSession', withSession(stopSession)),
     vscode.commands.registerCommand('sharedCopilotChat.selectModel', selectDefaultModel),
+    // Commandes internes, utilisées par les boutons du chat natif.
+    vscode.commands.registerCommand('sharedCopilotChat.resolveApproval', (entryId: string, toolId: string, decision: ApprovalDecision) => {
+      if (!session?.room.resolveApproval(entryId, toolId, decision, hostName())) {
+        void vscode.window.showInformationMessage("Shared Copilot : cette action n'attend plus de validation.");
+      }
+    }),
+    vscode.commands.registerCommand('sharedCopilotChat.showDiff', async (toolId: string) => {
+      if (!(await tools.showDiff(toolId))) {
+        void vscode.window.showInformationMessage("Shared Copilot : cette modification n'est plus en attente.");
+      }
+    }),
+    vscode.commands.registerCommand('sharedCopilotChat.answerQuestion', async (entryId: string, toolId: string, text?: string) => {
+      const answer = text ?? (await vscode.window.showInputBox({ title: "Réponse à l'agent", ignoreFocusOut: true }));
+      if (answer && !session?.room.answerQuestion(entryId, toolId, answer, hostName())) {
+        void vscode.window.showInformationMessage("Shared Copilot : cette question n'attend plus de réponse.");
+      }
+    }),
     vscode.lm.onDidChangeChatModels(() => void refreshModels()),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration(`${CONFIG}.modelFamily`) || e.affectsConfiguration(`${CONFIG}.allowGuestModelChoice`)) {
@@ -143,12 +161,14 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   let indexHtml: string;
   let clientJs: Buffer;
   let styleCss: Buffer;
+  let codiconCss: Buffer;
   try {
     const file = (...p: string[]) => vscode.Uri.joinPath(context.extensionUri, ...p).fsPath;
-    [indexHtml, clientJs, styleCss] = await Promise.all([
+    [indexHtml, clientJs, styleCss, codiconCss] = await Promise.all([
       fs.readFile(file('media', 'index.html'), 'utf8'),
       fs.readFile(file('dist', 'web', 'client.js')),
       fs.readFile(file('media', 'style.css')),
+      fs.readFile(file('dist', 'web', 'codicon.css')),
     ]);
   } catch (err) {
     void vscode.window.showErrorMessage(`Shared Copilot : fichiers de la page introuvables (${String(err)}). Lancez « npm run compile ».`);
@@ -159,8 +179,12 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   const hostToken = crypto.randomBytes(24).toString('base64url');
   const room = new ChatRoom(new CopilotBackend(tools), {
     historyLength: () => vscode.workspace.getConfiguration(CONFIG).get<number>('historyLength', 20),
+    hostName: hostName(),
     onParticipantsChanged: (p) => updateStatusBar(p.length),
     extraInstructions: () => tools.instructions(),
+    onApprovalRequested: (pending) => void notifyApproval(pending),
+    onQuestionAsked: (pending) => void askLocalHost(pending),
+    onShowDiff: (_entryId, toolId) => void tools.showDiff(toolId),
   });
   const server = new ChatServer(
     {
@@ -171,6 +195,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
       assets: {
         '/client.js': { contentType: 'text/javascript; charset=utf-8', body: clientJs },
         '/style.css': { contentType: 'text/css; charset=utf-8', body: styleCss },
+        '/codicon.css': { contentType: 'text/css; charset=utf-8', body: codiconCss },
       },
     },
     room,
@@ -188,6 +213,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
+  tools.resetSession();
   session = new Session(server, room, guestToken, hostToken);
   if (config.get<boolean>('nativeChat', true)) {
     session.nativeChat = NativeChatBridge.tryCreate(room, hostName, (m) => output.appendLine(m));
@@ -196,6 +222,65 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   updateStatusBar(0);
   void refreshModels();
   void showSessionNotification(session, 'Session démarrée');
+}
+
+/**
+ * Notifie l'hôte d'une action à valider. La notification n'est pas modale : la
+ * décision peut aussi venir de la page web ou du chat natif, la première l'emporte.
+ */
+async function notifyApproval(pending: PendingApproval): Promise<void> {
+  const room = session?.room;
+  const { tool, entryId, author } = pending;
+  const allow = 'Autoriser';
+  const allowSession = 'Autoriser pour la session';
+  const diff = 'Voir les modifications';
+  const deny = 'Refuser';
+  const buttons = [allow, ...(tool.approval.hostOnly ? [] : [allowSession]), ...(tool.approval.canShowDiff ? [diff] : []), deny];
+  const scope = tool.approval.hostOnly ? ' (hors du projet — vous seul pouvez décider)' : '';
+  for (;;) {
+    const choice = await vscode.window.showWarningMessage(
+      `Shared Copilot — ${author} : ${tool.title}${scope}\n${tool.approval.preview.split('\n').slice(0, 6).join('\n')}`,
+      ...buttons,
+    );
+    if (!room || !room.pendingApproval(entryId, tool.id)) {
+      return; // Déjà décidé ailleurs ou session terminée.
+    }
+    if (choice === diff) {
+      await tools.showDiff(tool.id);
+      continue;
+    }
+    const decision: ApprovalDecision | undefined =
+      choice === allow ? 'once' : choice === allowSession ? 'session' : choice === deny ? 'deny' : undefined;
+    if (decision) {
+      room.resolveApproval(entryId, tool.id, decision, hostName());
+    }
+    return;
+  }
+}
+
+/** Question de l'agent posée à l'hôte depuis le chat natif : réponse dans VS Code. */
+async function askLocalHost(pending: PendingQuestion): Promise<void> {
+  const { tool, entryId } = pending;
+  if (tool.question.requesterClientId !== LOCAL_HOST_CLIENT_ID) {
+    return; // Question née d'une demande web : les participants répondent depuis la page.
+  }
+  const free = '$(edit) Autre réponse…';
+  let answer: string | undefined;
+  if (tool.question.options.length) {
+    const picked = await vscode.window.showQuickPick([...tool.question.options, free], {
+      title: `Shared Copilot — question de l'agent`,
+      placeHolder: tool.question.text,
+      ignoreFocusOut: true,
+    });
+    answer = picked === free ? undefined : picked;
+    if (picked === undefined) {
+      return;
+    }
+  }
+  answer ??= await vscode.window.showInputBox({ title: "Shared Copilot — question de l'agent", prompt: tool.question.text, ignoreFocusOut: true });
+  if (answer) {
+    session?.room.answerQuestion(entryId, tool.id, answer, hostName());
+  }
 }
 
 /** Envoie aux participants la liste des modèles Copilot et le modèle par défaut. */
@@ -362,7 +447,7 @@ async function stopSession(): Promise<void> {
     return;
   }
   session = undefined;
-  proposals.clear();
+  tools.resetSession();
   statusBar?.hide();
   await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', false);
   await s.stop();
@@ -416,13 +501,35 @@ function parseHttpUrl(value: string): URL | undefined {
 
 function webviewHtml(src: URL): string {
   const attr = (v: string) => v.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const nonce = crypto.randomBytes(16).toString('base64');
+  // La page du chat est dans une iframe (autre origine) : on lui transmet les variables de thème de VS Code.
+  const script = `
+    const frame = document.querySelector('iframe');
+    const target = ${JSON.stringify(src.origin)};
+    function sendTheme() {
+      // VS Code place les variables du thème dans l'attribut style de <html>.
+      const style = document.documentElement.style;
+      const vars = {};
+      for (let i = 0; i < style.length; i++) {
+        const name = style[i];
+        if (name.startsWith('--vscode-')) vars[name] = style.getPropertyValue(name).trim();
+      }
+      const kind = document.body.classList.contains('vscode-light') || document.body.classList.contains('vscode-high-contrast-light') ? 'light' : 'dark';
+      frame.contentWindow.postMessage({ type: 'scc-theme', kind, vars }, target);
+    }
+    frame.addEventListener('load', sendTheme);
+    new MutationObserver(sendTheme).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    new MutationObserver(sendTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
+  `;
   return `<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src ${attr(src.origin)}; style-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src ${attr(src.origin)}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>html, body, iframe { margin: 0; padding: 0; border: 0; width: 100%; height: 100%; overflow: hidden; }</style>
 </head>
-<body><iframe src="${attr(src.toString())}" allow="clipboard-write; clipboard-read" title="Shared Copilot Chat"></iframe></body>
+<body><iframe src="${attr(src.toString())}" allow="clipboard-write; clipboard-read" title="Shared Copilot Chat"></iframe>
+<script nonce="${nonce}">${script}</script>
+</body>
 </html>`;
 }

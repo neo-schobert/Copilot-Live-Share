@@ -53,6 +53,21 @@
         "command": "sharedCopilotChat.selectModel",
         "title": "Select Default Model",
         "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.resolveApproval",
+        "title": "Resolve Approval",
+        "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.showDiff",
+        "title": "Show Proposed Diff",
+        "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.answerQuestion",
+        "title": "Answer Agent Question",
+        "category": "Shared Copilot"
       }
     ],
     "menus": {
@@ -76,6 +91,18 @@
         {
           "command": "sharedCopilotChat.stopSession",
           "when": "sharedCopilotChat.active"
+        },
+        {
+          "command": "sharedCopilotChat.resolveApproval",
+          "when": "false"
+        },
+        {
+          "command": "sharedCopilotChat.showDiff",
+          "when": "false"
+        },
+        {
+          "command": "sharedCopilotChat.answerQuestion",
+          "when": "false"
         }
       ],
       "editor/context": [
@@ -126,7 +153,7 @@
             "off"
           ],
           "enumDescriptions": [
-            "Lecture, modification de fichiers et commandes terminal ; chaque modification ou commande est soumise à la validation de l'hôte.",
+            "Lecture, modification de fichiers et commandes ; chaque modification ou commande est validée par l'auteur de la demande ou l'hôte (l'hôte seul pour les commandes hors du projet).",
             "Lecture, recherche et diagnostics uniquement.",
             "Aucun accès à l'espace de travail."
           ],
@@ -137,6 +164,22 @@
           "type": "boolean",
           "default": true,
           "description": "Affiche les discussions de la session dans le panneau Chat natif de VS Code (API proposée : nécessite F5 ou --enable-proposed-api local.shared-copilot-chat)."
+        },
+        "sharedCopilotChat.protectedFiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Motifs glob supplémentaires de fichiers invisibles pour l'agent (s'ajoutent à la liste par défaut : .git, .env, clés, .npmrc, .ssh…)."
+        },
+        "sharedCopilotChat.sandboxReadOnlyPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Dossiers supplémentaires visibles en lecture seule dans le bac à sable des commandes (ex. une chaîne d'outils installée hors de /usr). Les dossiers du PATH y sont déjà."
         }
       }
     },
@@ -156,9 +199,11 @@
     "package": "npm run check-types && node esbuild.js --production",
     "check-types": "tsc -p . --noEmit && tsc -p src/web --noEmit",
     "test": "node esbuild.js --test && node dist/test/smoke.js",
-    "vscode:prepublish": "npm run package"
+    "vscode:prepublish": "npm run package",
+    "test:vscode": "node esbuild.js && node esbuild.js --test && node test/vscode/run.js"
   },
   "dependencies": {
+    "@vscode/codicons": "^0.0.46-24",
     "ws": "^8.18.0"
   },
   "devDependencies": {

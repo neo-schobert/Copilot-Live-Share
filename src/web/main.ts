@@ -31,17 +31,20 @@ const newConvBtn = $<HTMLButtonElement>('new-conv');
 const convsToggle = $<HTMLButtonElement>('toggle-convs');
 const unreadTotal = $<HTMLElement>('unread-total');
 const messagesEl = $<HTMLElement>('messages');
-const peopleEl = $<HTMLElement>('people');
+const peopleToggle = $<HTMLButtonElement>('toggle-people');
+const peoplePopover = $<HTMLElement>('people');
 const peopleList = $<HTMLUListElement>('people-list');
 const peopleCount = $<HTMLElement>('people-count');
-const peopleToggle = $<HTMLButtonElement>('toggle-people');
+const avatarStack = $<HTMLElement>('avatar-stack');
 const bannerEl = $<HTMLElement>('banner');
+const activityEl = $<HTMLElement>('activity');
 const activityText = $<HTMLElement>('activity-text');
 const cancelBtn = $<HTMLButtonElement>('cancel');
 const askForm = $<HTMLFormElement>('ask-form');
 const askInput = $<HTMLTextAreaElement>('ask-input');
 const askSend = $<HTMLButtonElement>('ask-send');
 const modelSelect = $<HTMLSelectElement>('model-select');
+const presenceEl = $<HTMLElement>('presence');
 const toastEl = $<HTMLElement>('toast');
 
 // ---- État ----
@@ -69,9 +72,19 @@ let queue: QueueState = { current: null, pending: [] };
 let models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
 /** Modèle choisi par ce participant ; '' = modèle par défaut de la session. */
 let chosenModel = storage('local', 'scc.model') ?? '';
+/** Participants en train d'écrire : clientId -> discussion et échéance de l'indicateur. */
+const typing = new Map<string, { name: string; conversationId: string; until: number }>();
+const TYPING_TTL_MS = 4000;
+let lastTypingSent = 0;
 /** Entrées dont le rendu doit être rafraîchi à la prochaine frame (streaming). */
 const dirty = new Set<string>();
 let frameRequested = false;
+
+const SUGGESTIONS = [
+  'Explique la structure de ce projet',
+  'Trouve les TODO et résume-les',
+  'Y a-t-il des erreurs à corriger ?',
+];
 
 // ---- Démarrage ----
 
@@ -102,6 +115,22 @@ function join(name: string): void {
   connect();
   askInput.focus();
 }
+
+// Thème de VS Code transmis par la webview de l'hôte (la page est dans une iframe).
+window.addEventListener('message', (event) => {
+  const data = event.data as { type?: string; kind?: string; vars?: Record<string, string> } | null;
+  if (event.source !== window.parent || window.parent === window || data?.type !== 'scc-theme' || !data.vars) {
+    return;
+  }
+  const root = document.documentElement;
+  for (const [name, value] of Object.entries(data.vars)) {
+    if (/^--vscode-[\w-]+$/.test(name) && typeof value === 'string' && value.length < 300) {
+      root.style.setProperty(name, value);
+    }
+  }
+  root.classList.add('vscode-theme');
+  root.classList.toggle('vscode-light', data.kind === 'light');
+});
 
 // ---- WebSocket ----
 
@@ -182,6 +211,7 @@ function endSession(reason: string): void {
   renderConversations();
   updateComposer();
   updateActivity();
+  rerenderActive();
 }
 
 // ---- Messages serveur ----
@@ -246,8 +276,12 @@ function handle(msg: ServerMessage): void {
     }
     case 'entry':
       entries.set(msg.entry.id, msg.entry);
+      if (msg.entry.kind === 'user' && typing.delete(msg.entry.clientId)) {
+        renderPresence();
+        renderConversations();
+      }
       if (msg.entry.conversationId === activeId) {
-        messagesEl.querySelector('.empty')?.remove();
+        messagesEl.querySelector('.welcome')?.remove();
         withAutoScroll(() => appendEntry(msg.entry));
       } else if (msg.entry.kind !== 'system') {
         unread.set(msg.entry.conversationId, (unread.get(msg.entry.conversationId) ?? 0) + 1);
@@ -278,6 +312,10 @@ function handle(msg: ServerMessage): void {
           entry.parts.push({ type: 'tool', tool: msg.tool });
         }
         markDirty(entry.id);
+        // Une décision attend ce participant dans une autre discussion : on le signale.
+        if (entry.conversationId !== activeId && needsMe(entry, msg.tool)) {
+          toast('Une action de l’agent attend votre décision dans une autre discussion.');
+        }
       }
       break;
     }
@@ -293,7 +331,22 @@ function handle(msg: ServerMessage): void {
     }
     case 'participants':
       participants = msg.participants;
+      for (const id of typing.keys()) {
+        if (!participants.some((p) => p.clientId === id)) {
+          typing.delete(id);
+        }
+      }
       renderParticipants();
+      renderConversations();
+      renderPresence();
+      break;
+    case 'typing':
+      if (msg.clientId !== me?.clientId) {
+        typing.set(msg.clientId, { name: msg.name, conversationId: msg.conversationId, until: Date.now() + TYPING_TTL_MS });
+        renderPresence();
+        renderConversations();
+        setTimeout(expireTyping, TYPING_TTL_MS + 50);
+      }
       break;
     case 'queue':
       queue = msg.queue;
@@ -329,31 +382,102 @@ function openConversation(id: string, force = false): void {
   store('session', 'scc.conv', id);
   send({ type: 'view', conversationId: id });
   cancelRename();
-
-  entryEls.clear();
-  dirty.clear();
-  messagesEl.replaceChildren();
-  const list = [...entries.values()].filter((e) => e.conversationId === id);
-  for (const entry of list) {
-    appendEntry(entry);
-  }
-  if (!list.length) {
-    messagesEl.append(emptyState());
-  }
+  rerenderActive();
   renderConversations();
   renderTitle();
   renderParticipants();
+  renderPresence();
   updateActivity();
   updateComposer();
   closeDrawers();
   scrollToBottom(true);
 }
 
+// ---- Présence en temps réel ----
+
+/** Participants (autres que moi) actuellement dans une discussion. */
+function presentIn(conversationId: string): Participant[] {
+  return participants.filter((p) => p.viewing === conversationId && p.clientId !== me?.clientId);
+}
+
+function typingIn(conversationId: string): string[] {
+  const now = Date.now();
+  return [...typing.values()].filter((t) => t.conversationId === conversationId && t.until > now).map((t) => t.name);
+}
+
+function expireTyping(): void {
+  const now = Date.now();
+  let changed = false;
+  for (const [id, t] of typing) {
+    if (t.until <= now) {
+      typing.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) {
+    renderPresence();
+    renderConversations();
+  }
+}
+
+/** « Camille », « Camille et Léo », « Camille, Léo et 2 autres ». */
+function nameList(names: string[]): string {
+  if (names.length <= 2) {
+    return names.join(' et ');
+  }
+  return `${names[0]}, ${names[1]} et ${names.length - 2} autre${names.length > 3 ? 's' : ''}`;
+}
+
+/** Au-dessus de la saisie : qui est dans la discussion, et qui écrit. */
+function renderPresence(): void {
+  if (!activeId || ended) {
+    presenceEl.replaceChildren();
+    return;
+  }
+  const here = presentIn(activeId);
+  const writers = typingIn(activeId);
+  const stack = document.createElement('span');
+  stack.className = 'avatar-stack';
+  stack.append(...here.slice(0, 5).map((p) => avatar(p.name)));
+  const text = document.createElement('span');
+  text.className = 'presence-text';
+  if (writers.length) {
+    text.classList.add('typing-text');
+    text.textContent = `${nameList(writers)} ${writers.length > 1 ? 'écrivent' : 'écrit'}…`;
+  } else if (here.length) {
+    text.textContent = `${nameList(here.map((p) => p.name))} ${here.length > 1 ? 'sont' : 'est'} dans cette discussion`;
+  } else {
+    text.textContent = 'Personne d’autre dans cette discussion pour l’instant';
+  }
+  presenceEl.replaceChildren(stack, text);
+}
+
+askInput.addEventListener('input', () => {
+  const now = Date.now();
+  if (activeId && askInput.value.trim() && now - lastTypingSent > 2000) {
+    lastTypingSent = now;
+    send({ type: 'typing', conversationId: activeId });
+  }
+});
+
+function rerenderActive(): void {
+  entryEls.clear();
+  dirty.clear();
+  messagesEl.replaceChildren();
+  const list = [...entries.values()].filter((e) => e.conversationId === activeId);
+  for (const entry of list) {
+    appendEntry(entry);
+  }
+  if (!list.length && !ended) {
+    messagesEl.append(welcome());
+  }
+}
+
 function renderTitle(): void {
   const conv = conversations.find((c) => c.id === activeId);
   convTitle.textContent = conv?.title ?? '';
   convTitle.title = conv ? `Créée par ${conv.createdBy} à ${formatTime(conv.createdAt)}` : '';
-  document.title = conv ? `${conv.title} — Shared Copilot Chat` : 'Shared Copilot Chat';
+  document.title = conv ? `${conv.title} — Shared Copilot` : 'Shared Copilot';
 }
 
 function renderConversations(): void {
@@ -361,22 +485,40 @@ function renderConversations(): void {
   const waiting = new Set(queue.pending.map((q) => q.conversationId));
   convList.replaceChildren(
     ...[...conversations].reverse().map((conv) => {
+      const busy = conv.id === answering || waiting.has(conv.id);
       const li = document.createElement('li');
       li.className = 'conv';
       li.classList.toggle('active', conv.id === activeId);
+      li.classList.toggle('busy', busy);
       li.dataset.id = conv.id;
+      li.tabIndex = 0;
+      li.append(icon(busy ? 'loading codicon-modifier-spin' : 'comment-discussion'));
 
-      const open = document.createElement('button');
-      open.type = 'button';
-      open.className = 'conv-open';
+      const text = document.createElement('div');
+      text.className = 'conv-text';
       const title = document.createElement('span');
       title.className = 'conv-name';
       title.textContent = conv.title;
       const meta = document.createElement('span');
       meta.className = 'conv-meta';
-      meta.textContent = conv.id === answering ? 'Le modèle répond…' : waiting.has(conv.id) ? 'En attente…' : formatTime(conv.createdAt);
-      open.append(title, meta);
-      li.append(open);
+      meta.textContent =
+        conv.id === answering ? 'Copilot répond…' : waiting.has(conv.id) ? 'En attente…' : `${conv.createdBy} · ${formatTime(conv.createdAt)}`;
+      const writers = typingIn(conv.id);
+      if (writers.length && conv.id !== answering) {
+        meta.textContent = `${nameList(writers)} ${writers.length > 1 ? 'écrivent' : 'écrit'}…`;
+        meta.classList.add('typing-text');
+      }
+      text.append(title, meta);
+      li.append(text);
+      // Avatars des participants présents dans cette discussion.
+      const here = presentIn(conv.id);
+      if (here.length) {
+        const stack = document.createElement('span');
+        stack.className = 'avatar-stack small';
+        stack.title = here.map((p) => p.name).join(', ');
+        stack.append(...here.slice(0, 3).map((p) => avatar(p.name)));
+        li.append(stack);
+      }
 
       const count = unread.get(conv.id);
       if (count) {
@@ -388,9 +530,9 @@ function renderConversations(): void {
       if (me?.isHost && !ended) {
         const del = document.createElement('button');
         del.type = 'button';
-        del.className = 'conv-delete ghost icon';
+        del.className = 'icon-btn conv-delete';
         del.title = 'Supprimer la discussion';
-        del.textContent = '🗑';
+        del.append(icon('trash'));
         li.append(del);
       }
       return li;
@@ -423,10 +565,18 @@ convList.addEventListener('click', (e) => {
   setTimeout(() => {
     if (del.isConnected) {
       delete del.dataset.confirm;
-      del.textContent = '🗑';
+      del.replaceChildren(icon('trash'));
       del.classList.remove('confirm');
     }
   }, 3000);
+});
+
+convList.addEventListener('keydown', (e) => {
+  const li = (e.target as HTMLElement).closest<HTMLLIElement>('li.conv');
+  if (li?.dataset.id && (e.key === 'Enter' || e.key === ' ') && e.target === li) {
+    e.preventDefault();
+    openConversation(li.dataset.id);
+  }
 });
 
 newConvBtn.addEventListener('click', () => {
@@ -488,15 +638,17 @@ function appendEntry(entry: ChatEntry): void {
 }
 
 function renderEntry(entry: ChatEntry, el: HTMLElement): void {
-  el.className = `msg msg-${entry.kind}`;
+  el.className = `turn turn-${entry.kind}`;
   el.replaceChildren();
 
   switch (entry.kind) {
     case 'user': {
-      if (entry.clientId === me?.clientId) {
-        el.classList.add('mine');
-      }
-      el.append(header(entry.author, entry.timestamp, entry.isHost ? 'hôte' : undefined), body(renderMarkdown(entry.text)));
+      el.classList.toggle('mine', entry.clientId === me?.clientId);
+      el.append(turnHead(avatar(entry.author), entry.author, entry.timestamp, entry.isHost ? 'hôte' : undefined));
+      const request = document.createElement('div');
+      request.className = 'request body';
+      request.append(renderMarkdown(entry.text));
+      el.append(request);
       break;
     }
     case 'assistant':
@@ -504,7 +656,8 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
       break;
     case 'context': {
       const where = entry.range ? `${entry.fileName} — ${entry.range}` : entry.fileName;
-      el.append(header(`Contexte partagé par ${entry.author}`, entry.timestamp), codeBlock(entry.code, entry.languageId, where));
+      el.append(turnHead(avatar(entry.author), `${entry.author} a partagé du contexte`, entry.timestamp));
+      el.append(codeBlock(entry.code, entry.languageId, where));
       break;
     }
     case 'system': {
@@ -516,65 +669,219 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
 }
 
 function renderAssistant(entry: AssistantEntry, el: HTMLElement): void {
-  el.classList.toggle('streaming', entry.status === 'streaming');
-  const name = entry.model ? `Copilot · ${entry.model}` : 'Copilot';
-  const h = header(name, entry.timestamp);
-  const replyTo = document.createElement('span');
-  replyTo.className = 'reply-to';
-  replyTo.textContent = `répond à ${entry.replyToAuthor}`;
-  h.append(replyTo);
-  el.append(h);
+  const head = turnHead(copilotAvatar(), 'Copilot', entry.timestamp);
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  meta.textContent = `${entry.model ? `${entry.model} · ` : ''}pour ${entry.replyToAuthor}`;
+  head.append(meta);
+  el.append(head);
 
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'response';
   for (const part of entry.parts) {
-    el.append(part.type === 'text' ? body(renderMarkdown(part.text)) : toolRow(part.tool));
+    if (part.type === 'text') {
+      const div = document.createElement('div');
+      div.className = 'body';
+      div.append(renderMarkdown(part.text));
+      bodyEl.append(div);
+    } else {
+      bodyEl.append(renderTool(entry, part.tool));
+    }
   }
   const last = entry.parts[entry.parts.length - 1];
-  if (entry.status === 'streaming' && (!last || (last.type === 'tool' && last.tool.status === 'done'))) {
+  if (entry.status === 'streaming' && (!last || (last.type === 'tool' && (last.tool.status === 'done' || last.tool.status === 'running')))) {
     const typing = document.createElement('div');
     typing.className = 'typing';
     typing.innerHTML = '<span></span><span></span><span></span>';
-    el.append(typing);
+    bodyEl.append(typing);
   }
-
   if (entry.status === 'cancelled') {
-    el.append(note('Réponse annulée par l’hôte.'));
+    bodyEl.append(note('Réponse arrêtée.'));
   } else if (entry.status === 'error') {
-    el.append(note(entry.error ?? 'Erreur inconnue.', true));
+    bodyEl.append(note(entry.error ?? 'Erreur inconnue.', true));
   }
+  el.append(bodyEl);
 }
 
 const TOOL_ICONS: Record<ToolActivity['status'], string> = {
-  running: '⏳',
-  awaitingApproval: '✋',
-  done: '✓',
-  rejected: '⛔',
-  error: '⚠',
+  running: 'loading codicon-modifier-spin',
+  awaitingApproval: 'shield',
+  awaitingAnswer: 'question',
+  done: 'check',
+  rejected: 'circle-slash',
+  error: 'warning',
 };
 
-function toolRow(tool: ToolActivity): HTMLElement {
+function renderTool(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
+  if (tool.status === 'awaitingApproval' && tool.approval && entry.status === 'streaming') {
+    return approvalCard(entry, tool);
+  }
+  if (tool.status === 'awaitingAnswer' && tool.question && entry.status === 'streaming') {
+    return questionCard(entry, tool);
+  }
   const row = document.createElement('div');
   row.className = `tool tool-${tool.status}`;
-  const icon = document.createElement('span');
-  icon.className = 'tool-icon';
-  icon.textContent = TOOL_ICONS[tool.status];
+  row.append(icon(TOOL_ICONS[tool.status]));
+  const text = document.createElement('span');
+  text.className = 'tool-text';
   const title = document.createElement('span');
   title.className = 'tool-title';
-  title.textContent = tool.title;
-  row.append(icon, title);
+  title.textContent = tool.question ? tool.question.text : tool.title;
+  text.append(title);
+  if (tool.answer) {
+    const answer = document.createElement('span');
+    answer.className = 'tool-detail answered';
+    answer.textContent = `« ${tool.answer} »${tool.answeredBy ? ` — ${tool.answeredBy}` : ''}`;
+    text.append(answer);
+  }
   if (tool.detail) {
     const detail = document.createElement('span');
     detail.className = 'tool-detail';
     detail.textContent = tool.detail;
-    row.append(detail);
+    text.append(detail);
   }
+  row.append(text);
   return row;
 }
 
-function header(author: string, timestamp: number, badge?: string): HTMLElement {
+/** Participant qui a posé la question à laquelle répond cette entrée. */
+function requesterOf(entry: AssistantEntry): string | undefined {
+  const question = entries.get(entry.replyTo);
+  return question?.kind === 'user' ? question.clientId : undefined;
+}
+
+/** true si ce participant doit prendre une décision sur cette action. */
+function needsMe(entry: AssistantEntry, tool: ToolActivity): boolean {
+  if (tool.status === 'awaitingApproval' && tool.approval) {
+    return !!me && (me.isHost || (!tool.approval.hostOnly && requesterOf(entry) === me.clientId));
+  }
+  if (tool.status === 'awaitingAnswer' && tool.question) {
+    return !!me; // Tout participant peut répondre.
+  }
+  return false;
+}
+
+function approvalCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
+  const approval = tool.approval!;
+  const card = document.createElement('div');
+  card.className = 'card';
+  const canDecide = needsMe(entry, tool) && !ended;
+  card.classList.toggle('attention', canDecide);
+
+  const head = document.createElement('div');
+  head.className = 'card-head';
+  head.append(icon(approval.kind === 'command' ? 'terminal' : 'diff'));
+  const title = document.createElement('span');
+  title.textContent = `${tool.title} ?`;
+  head.append(title);
+  if (approval.hostOnly) {
+    const scope = document.createElement('span');
+    scope.className = 'scope';
+    scope.append(icon('warning'), document.createTextNode('Hors du projet'));
+    head.append(scope);
+  }
+  card.append(head);
+
+  const body = document.createElement('div');
+  body.className = 'card-body';
+  body.append(diffView(approval.preview));
+  card.append(body);
+
+  const foot = document.createElement('div');
+  foot.className = 'card-foot';
+  if (canDecide) {
+    const decide = (decision: 'once' | 'session' | 'deny') => () =>
+      send({ type: 'approve', entryId: entry.id, toolId: tool.id, decision });
+    foot.append(button('Autoriser', 'primary', decide('once')));
+    if (me?.isHost && !approval.hostOnly) {
+      foot.append(button('Autoriser pour la session', 'secondary', decide('session')));
+    }
+    foot.append(button('Refuser', 'secondary', decide('deny')));
+    if (me?.isHost && approval.canShowDiff) {
+      foot.append(button('Voir dans VS Code', 'link-btn', () => send({ type: 'showDiff', entryId: entry.id, toolId: tool.id })));
+    }
+  } else {
+    const waiting = document.createElement('span');
+    waiting.className = 'waiting';
+    const requester = entries.get(entry.replyTo);
+    waiting.textContent =
+      approval.hostOnly || requester?.kind !== 'user'
+        ? "En attente de la validation de l'hôte…"
+        : `En attente de la validation de ${requester.author} ou de l'hôte…`;
+    foot.append(icon('loading codicon-modifier-spin'), waiting);
+  }
+  card.append(foot);
+  return card;
+}
+
+function questionCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
+  const question = tool.question!;
+  const card = document.createElement('div');
+  card.className = 'card';
+  const canAnswer = needsMe(entry, tool) && !ended;
+  card.classList.toggle('attention', canAnswer);
+
+  const head = document.createElement('div');
+  head.className = 'card-head';
+  head.append(icon('question'));
+  const title = document.createElement('span');
+  title.textContent = question.text;
+  const scope = document.createElement('span');
+  scope.className = 'scope everyone';
+  scope.append(icon('organization'), document.createTextNode('Tout le monde peut répondre'));
+  head.append(title, scope);
+  card.append(head);
+
+  const foot = document.createElement('div');
+  foot.className = 'card-foot';
+  const reply = (text: string) => {
+    if (text.trim()) {
+      send({ type: 'answer', entryId: entry.id, toolId: tool.id, text });
+    }
+  };
+  if (canAnswer) {
+    for (const option of question.options) {
+      foot.append(button(option, 'secondary', () => reply(option)));
+    }
+    const row = document.createElement('form');
+    row.className = 'answer-row';
+    const input = document.createElement('input');
+    input.placeholder = question.options.length ? 'Ou répondez librement…' : 'Votre réponse…';
+    input.maxLength = LIMITS.maxAnswerLength;
+    row.append(input, button('Répondre', 'primary', () => undefined, 'submit'));
+    row.addEventListener('submit', (e) => {
+      e.preventDefault();
+      reply(input.value);
+    });
+    foot.append(row);
+  } else {
+    const waiting = document.createElement('span');
+    waiting.className = 'waiting';
+    waiting.textContent = 'En attente d’une réponse…';
+    foot.append(icon('loading codicon-modifier-spin'), waiting);
+  }
+  card.append(foot);
+  return card;
+}
+
+function diffView(preview: string): HTMLElement {
+  const pre = document.createElement('div');
+  pre.className = 'diff';
+  for (const line of preview.split('\n')) {
+    const div = document.createElement('div');
+    div.textContent = line;
+    div.className = line.startsWith('+ ') ? 'add' : line.startsWith('- ') ? 'del' : line.startsWith('@@') || line.startsWith('#') ? 'hunk' : '';
+    pre.append(div);
+  }
+  return pre;
+}
+
+function turnHead(avatarEl: HTMLElement, name: string, timestamp: number, badge?: string): HTMLElement {
   const h = document.createElement('header');
+  h.className = 'turn-head';
   const who = document.createElement('strong');
-  who.textContent = author;
-  h.append(who);
+  who.textContent = name;
+  h.append(avatarEl, who);
   if (badge) {
     const b = document.createElement('span');
     b.className = 'badge';
@@ -588,11 +895,42 @@ function header(author: string, timestamp: number, badge?: string): HTMLElement 
   return h;
 }
 
-function body(content: DocumentFragment): HTMLElement {
-  const div = document.createElement('div');
-  div.className = 'body';
-  div.append(content);
-  return div;
+function avatar(name: string): HTMLElement {
+  const span = document.createElement('span');
+  span.className = 'avatar';
+  span.textContent = name.trim().charAt(0) || '?';
+  let hash = 0;
+  for (const ch of name) {
+    hash = (hash * 31 + ch.charCodeAt(0)) | 0;
+  }
+  span.style.background = `hsl(${Math.abs(hash) % 360} 55% 42%)`;
+  span.title = name;
+  return span;
+}
+
+function copilotAvatar(): HTMLElement {
+  const span = document.createElement('span');
+  span.className = 'avatar copilot';
+  span.append(icon('copilot'));
+  return span;
+}
+
+function icon(name: string): HTMLElement {
+  const i = document.createElement('i');
+  i.className = `codicon codicon-${name}`;
+  i.setAttribute('aria-hidden', 'true');
+  return i;
+}
+
+function button(label: string, className: string, onClick: () => void, type: 'button' | 'submit' = 'button'): HTMLButtonElement {
+  const b = document.createElement('button');
+  b.type = type;
+  b.className = className;
+  b.textContent = label;
+  if (type === 'button') {
+    b.addEventListener('click', onClick);
+  }
+  return b;
 }
 
 function note(text: string, isError = false): HTMLElement {
@@ -602,10 +940,25 @@ function note(text: string, isError = false): HTMLElement {
   return p;
 }
 
-function emptyState(): HTMLElement {
+function welcome(): HTMLElement {
   const div = document.createElement('div');
-  div.className = 'empty';
-  div.textContent = 'Aucun message dans cette discussion. Posez la première question !';
+  div.className = 'welcome';
+  const title = document.createElement('h2');
+  title.textContent = 'Demandez à Copilot, ensemble';
+  const text = document.createElement('p');
+  text.textContent =
+    "L'agent explore le projet de l'hôte, propose des modifications et lance des commandes ; chaque action est soumise à validation.";
+  const suggestions = document.createElement('div');
+  suggestions.className = 'suggestions';
+  for (const s of SUGGESTIONS) {
+    suggestions.append(
+      button(s, '', () => {
+        askInput.value = s;
+        submitQuestion();
+      }),
+    );
+  }
+  div.append(icon('copilot'), title, text, suggestions);
   return div;
 }
 
@@ -649,13 +1002,16 @@ function scrollToBottom(instant = false): void {
 
 function renderParticipants(): void {
   peopleCount.textContent = String(participants.length);
+  avatarStack.replaceChildren(...participants.slice(0, 4).map((p) => avatar(p.name)));
   peopleList.replaceChildren(
     ...participants.map((p) => {
       const li = document.createElement('li');
+      li.className = 'person';
+      const text = document.createElement('div');
+      text.className = 'person-text';
       const name = document.createElement('span');
-      name.className = 'person';
+      name.className = 'person-name';
       name.textContent = p.name;
-      li.append(name);
       if (p.isHost) {
         const b = document.createElement('span');
         b.className = 'badge';
@@ -665,23 +1021,44 @@ function renderParticipants(): void {
       if (p.clientId === me?.clientId) {
         const you = document.createElement('span');
         you.className = 'you';
-        you.textContent = '(vous)';
+        you.textContent = 'vous';
         name.append(you);
       }
+      text.append(name);
       const where = conversations.find((c) => c.id === p.viewing);
       if (where) {
-        const w = document.createElement('button');
-        w.type = 'button';
-        w.className = 'where';
-        w.textContent = where.id === activeId ? 'ici' : `dans « ${where.title} »`;
-        w.disabled = where.id === activeId;
-        w.addEventListener('click', () => openConversation(where.id));
-        li.append(w);
+        const here = where.id === activeId;
+        const w = document.createElement(here ? 'span' : 'button');
+        w.className = 'person-where';
+        w.textContent = here ? 'dans cette discussion' : `dans « ${where.title} »`;
+        if (!here) {
+          w.addEventListener('click', () => {
+            openConversation(where.id);
+            togglePeople(false);
+          });
+        }
+        text.append(w);
       }
+      li.append(avatar(p.name), text);
       return li;
     }),
   );
 }
+
+function togglePeople(open = peoplePopover.hidden): void {
+  peoplePopover.hidden = !open;
+  peopleToggle.setAttribute('aria-expanded', String(open));
+}
+
+peopleToggle.addEventListener('click', (e) => {
+  e.stopPropagation();
+  togglePeople();
+});
+document.addEventListener('click', (e) => {
+  if (!peoplePopover.hidden && !peoplePopover.contains(e.target as Node)) {
+    togglePeople(false);
+  }
+});
 
 function renderModels(): void {
   const defaultModel = models.available.find((m) => m.id === models.defaultId);
@@ -694,7 +1071,7 @@ function renderModels(): void {
   if (!models.available.length) {
     options.push(new Option('Aucun modèle disponible', ''));
   } else {
-    options.push(new Option(defaultModel ? `${defaultModel.name} (par défaut)` : 'Modèle par défaut', ''));
+    options.push(new Option(defaultModel ? `${defaultModel.name} (défaut)` : 'Modèle par défaut', ''));
     if (canChoose) {
       for (const m of models.available) {
         if (m.id !== models.defaultId) {
@@ -706,7 +1083,7 @@ function renderModels(): void {
   modelSelect.replaceChildren(...options);
   modelSelect.value = canChoose ? chosenModel : '';
   modelSelect.disabled = ended || !canChoose || models.available.length < 2;
-  modelSelect.title = canChoose ? 'Modèle utilisé pour vos questions' : "L'hôte a fixé le modèle de la session";
+  modelSelect.parentElement!.title = canChoose ? 'Modèle utilisé pour vos questions' : "L'hôte a fixé le modèle de la session";
 }
 
 modelSelect.addEventListener('change', () => {
@@ -721,16 +1098,16 @@ function updateActivity(): void {
     const who = current.clientId === me?.clientId ? 'vous' : current.author;
     const conv = conversations.find((c) => c.id === current.conversationId);
     const where = current.conversationId === activeId || !conv ? '' : ` dans « ${conv.title} »`;
-    parts.push(`Le modèle répond à ${who}${where}…`);
+    parts.push(`Copilot répond à ${who}${where}`);
   }
   const mine = queue.pending.findIndex((q) => q.clientId === me?.clientId);
   if (mine >= 0) {
-    parts.push(`Votre question est en position ${mine + 1} dans la file.`);
+    parts.push(`votre question est en position ${mine + 1} dans la file`);
   } else if (queue.pending.length) {
-    parts.push(`${queue.pending.length} question(s) en attente.`);
+    parts.push(`${queue.pending.length} question(s) en attente`);
   }
-  activityText.textContent = parts.join(' ');
-  activityText.parentElement!.classList.toggle('busy', current !== null);
+  activityText.textContent = parts.join(' · ');
+  activityEl.hidden = parts.length === 0;
   cancelBtn.hidden = !(me?.isHost && current);
 }
 
@@ -774,27 +1151,19 @@ cancelBtn.addEventListener('click', () => {
   send({ type: 'cancel' });
 });
 
-// ---- Tiroirs (écrans étroits) ----
-
-function toggleDrawer(drawer: HTMLElement, button: HTMLButtonElement): void {
-  const open = !drawer.classList.contains('open');
-  closeDrawers();
-  drawer.classList.toggle('open', open);
-  button.setAttribute('aria-expanded', String(open));
-}
+// ---- Tiroir des discussions (écrans étroits) ----
 
 function closeDrawers(): void {
-  for (const [drawer, button] of [
-    [convsEl, convsToggle],
-    [peopleEl, peopleToggle],
-  ] as const) {
-    drawer.classList.remove('open');
-    button.setAttribute('aria-expanded', 'false');
-  }
+  convsEl.classList.remove('open');
+  convsToggle.setAttribute('aria-expanded', 'false');
 }
 
-convsToggle.addEventListener('click', () => toggleDrawer(convsEl, convsToggle));
-peopleToggle.addEventListener('click', () => toggleDrawer(peopleEl, peopleToggle));
+convsToggle.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const open = !convsEl.classList.contains('open');
+  convsEl.classList.toggle('open', open);
+  convsToggle.setAttribute('aria-expanded', String(open));
+});
 messagesEl.addEventListener('pointerdown', () => closeDrawers());
 
 // Boutons « copier » des blocs de code (délégation, car le contenu est re-rendu pendant le streaming).
@@ -804,9 +1173,12 @@ messagesEl.addEventListener('click', (e) => {
   if (!btn || code == null) {
     return;
   }
+  const label = btn.querySelector('span');
   void copyText(code).then((ok) => {
-    btn.textContent = ok ? 'Copié ✓' : 'Échec';
-    setTimeout(() => (btn.textContent = 'Copier'), 1500);
+    if (label) {
+      label.textContent = ok ? 'Copié' : 'Échec';
+      setTimeout(() => (label.textContent = 'Copier'), 1500);
+    }
   });
 });
 
@@ -832,7 +1204,7 @@ async function copyText(text: string): Promise<boolean> {
 
 function setConnection(state: 'connecting' | 'online' | 'offline', label: string): void {
   connectionEl.dataset.state = state;
-  connectionEl.textContent = label;
+  connectionEl.title = label;
   updateComposer();
 }
 

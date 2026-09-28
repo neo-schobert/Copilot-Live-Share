@@ -50,7 +50,8 @@ export function codeBlock(code: string, language: string, title?: string): HTMLE
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'copy';
-  btn.textContent = 'Copier';
+  btn.title = 'Copier';
+  btn.innerHTML = '<i class="codicon codicon-copy"></i><span>Copier</span>';
   bar.append(label, btn);
   const pre = document.createElement('pre');
   const codeEl = document.createElement('code');

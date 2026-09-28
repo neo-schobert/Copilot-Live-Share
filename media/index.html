@@ -4,63 +4,85 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Shared Copilot Chat</title>
+  <title>Shared Copilot</title>
   <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="codicon.css?token=__TOKEN__">
   <link rel="stylesheet" href="style.css?token=__TOKEN__">
 </head>
 <body>
   <section id="join" class="join">
     <form id="join-form" class="join-card" autocomplete="off">
-      <h1>Shared Copilot Chat</h1>
-      <p>Un chat partagé avec Copilot, hébergé par VS Code chez l'hôte. Tout le monde voit les questions et les réponses.</p>
+      <div class="join-logo"><i class="codicon codicon-copilot"></i></div>
+      <h1>Shared Copilot</h1>
+      <p>Un chat Copilot partagé : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte.</p>
       <label for="name-input">Votre pseudo</label>
       <input id="name-input" name="name" maxlength="32" required autofocus autocomplete="nickname" placeholder="ex. Camille">
-      <button type="submit">Rejoindre</button>
+      <button type="submit" class="primary">Rejoindre la session</button>
     </form>
   </section>
 
   <div id="app" class="app" hidden>
-    <header class="topbar">
-      <button id="toggle-convs" class="ghost icon drawer-toggle" type="button" aria-controls="convs" aria-expanded="false" title="Discussions">☰<span id="unread-total" class="dot" hidden></span></button>
-      <div class="title-wrap">
-        <h1 id="conv-title" class="conv-title"></h1>
-        <form id="rename-form" class="rename-form" hidden>
-          <input id="rename-input" maxlength="60" aria-label="Titre de la discussion">
-        </form>
-        <button id="rename" class="ghost icon" type="button" title="Renommer la discussion">✎</button>
+    <nav id="convs" class="sidebar" aria-label="Discussions">
+      <div class="sidebar-head">
+        <span class="section-title">Discussions</span>
+        <button id="new-conv" class="icon-btn" type="button" title="Nouvelle discussion"><i class="codicon codicon-add"></i></button>
       </div>
-      <span id="connection" class="connection" data-state="connecting">Connexion…</span>
-      <button id="toggle-people" class="ghost drawer-toggle" type="button" title="Participants" aria-controls="people" aria-expanded="false">
-        <span class="people-label">Participants</span> <span id="people-count" class="count">0</span>
-      </button>
-    </header>
-
-    <div class="layout">
-      <nav id="convs" class="convs drawer drawer-left" aria-label="Discussions">
-        <button id="new-conv" class="new-conv" type="button">+ Nouvelle discussion</button>
-        <ul id="conv-list"></ul>
-      </nav>
-      <main id="messages" class="messages" aria-live="polite"></main>
-      <aside id="people" class="people drawer drawer-right">
-        <h2>Participants</h2>
-        <ul id="people-list"></ul>
-      </aside>
-    </div>
-
-    <footer class="composer">
-      <div id="banner" class="banner" hidden></div>
-      <div class="activity">
-        <span id="activity-text"></span>
-        <button id="cancel" class="danger small" type="button" hidden>Annuler la réponse</button>
+      <ul id="conv-list" class="conv-list"></ul>
+      <div class="sidebar-foot">
+        <i class="codicon codicon-shield"></i>
+        <span>Agent limité au projet de l'hôte</span>
       </div>
-      <form id="ask-form" class="ask">
-        <textarea id="ask-input" rows="2" maxlength="8000" placeholder="Posez une question… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
-        <div class="ask-bar">
-          <select id="model-select" class="model-select" aria-label="Modèle"></select>
-          <button id="ask-send" type="submit">Envoyer</button>
+    </nav>
+
+    <div class="main">
+      <header class="topbar">
+        <button id="toggle-convs" class="icon-btn drawer-toggle" type="button" aria-controls="convs" aria-expanded="false" title="Discussions">
+          <i class="codicon codicon-layout-sidebar-left"></i><span id="unread-total" class="dot" hidden></span>
+        </button>
+        <div class="title-wrap">
+          <h1 id="conv-title" class="conv-title"></h1>
+          <form id="rename-form" class="rename-form" hidden>
+            <input id="rename-input" maxlength="60" aria-label="Titre de la discussion">
+          </form>
+          <button id="rename" class="icon-btn" type="button" title="Renommer"><i class="codicon codicon-edit"></i></button>
         </div>
-      </form>
-    </footer>
+        <span id="connection" class="connection" data-state="connecting" title="Connexion…"></span>
+        <div class="people-wrap">
+          <button id="toggle-people" class="people-btn" type="button" aria-expanded="false" aria-controls="people" title="Participants">
+            <span id="avatar-stack" class="avatar-stack"></span>
+            <span id="people-count" class="people-count">0</span>
+          </button>
+          <div id="people" class="popover" hidden>
+            <div class="section-title">Participants</div>
+            <ul id="people-list"></ul>
+          </div>
+        </div>
+      </header>
+
+      <main id="messages" class="messages" aria-live="polite"></main>
+
+      <footer class="composer">
+        <div id="banner" class="banner" hidden></div>
+        <div id="activity" class="activity" hidden>
+          <i class="codicon codicon-loading codicon-modifier-spin"></i>
+          <span id="activity-text"></span>
+        </div>
+        <div id="presence" class="presence" aria-live="polite"></div>
+        <form id="ask-form" class="input-box">
+          <textarea id="ask-input" rows="1" maxlength="8000" placeholder="Demandez à Copilot… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
+          <div class="input-toolbar">
+            <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation"><i class="codicon codicon-copilot"></i> Agent</span>
+            <label class="model-picker" title="Modèle utilisé pour vos questions">
+              <select id="model-select" aria-label="Modèle"></select>
+              <i class="codicon codicon-chevron-down"></i>
+            </label>
+            <span class="spacer"></span>
+            <button id="cancel" class="icon-btn stop" type="button" title="Arrêter la réponse" hidden><i class="codicon codicon-debug-stop"></i></button>
+            <button id="ask-send" class="icon-btn send" type="submit" title="Envoyer (Entrée)"><i class="codicon codicon-send"></i></button>
+          </div>
+        </form>
+      </footer>
+    </div>
   </div>
 
   <div id="toast" class="toast" role="status" hidden></div>

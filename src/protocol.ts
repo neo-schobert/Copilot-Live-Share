@@ -40,7 +40,36 @@ export interface UserEntry extends BaseEntry {
 
 export type AssistantStatus = 'streaming' | 'done' | 'cancelled' | 'error';
 
-export type ToolStatus = 'running' | 'awaitingApproval' | 'done' | 'rejected' | 'error';
+export type ToolStatus = 'running' | 'awaitingApproval' | 'awaitingAnswer' | 'done' | 'rejected' | 'error';
+
+/** Catégorie d'action sensible ; « Autoriser pour la session » vaut pour toute la catégorie. */
+export type ApprovalKind = 'write' | 'command';
+
+export type ApprovalDecision = 'once' | 'session' | 'deny';
+
+/** Demande de validation d'une action sensible, affichée à tous et décidée par l'hôte. */
+export interface ApprovalRequest {
+  kind: ApprovalKind;
+  /** Aperçu lisible : lignes « - »/« + » d'une modification, ou commande. */
+  preview: string;
+  /** L'hôte peut ouvrir le diff complet dans VS Code. */
+  canShowDiff: boolean;
+  /**
+   * true : action hors du projet, seul l'hôte peut décider. Sinon l'auteur de la
+   * demande peut aussi valider (« Autoriser pour la session » reste réservé à l'hôte).
+   */
+  hostOnly: boolean;
+}
+
+/** Question posée par l'agent pendant une réponse : visible par tous, tout participant peut répondre. */
+export interface AgentQuestion {
+  text: string;
+  /** Réponses proposées (peut être vide : réponse libre). */
+  options: string[];
+  /** Auteur de la demande qui a conduit à cette question (information). */
+  requesterClientId: string;
+  requesterName: string;
+}
 
 /** Action de l'agent dans l'espace de travail de l'hôte (lecture, recherche, modification…). */
 export interface ToolActivity {
@@ -50,6 +79,12 @@ export interface ToolActivity {
   status: ToolStatus;
   /** Complément affiché sous le titre (résumé du résultat, commande, erreur). */
   detail?: string;
+  approval?: ApprovalRequest;
+  question?: AgentQuestion;
+  /** Réponse donnée à `question`. */
+  answer?: string;
+  /** Participant qui a répondu. */
+  answeredBy?: string;
 }
 
 /** Morceau d'une réponse, dans l'ordre d'affichage : texte ou action d'outil. */
@@ -131,7 +166,15 @@ export type ClientMessage =
   | { type: 'createConversation' }
   | { type: 'renameConversation'; conversationId: string; title: string }
   /** Réservé à l'hôte. */
-  | { type: 'deleteConversation'; conversationId: string };
+  | { type: 'deleteConversation'; conversationId: string }
+  /** Réservé à l'hôte : décision sur une action en attente de validation. */
+  | { type: 'approve'; entryId: string; toolId: string; decision: ApprovalDecision }
+  /** Réservé à l'hôte : ouvre le diff complet dans VS Code. */
+  | { type: 'showDiff'; entryId: string; toolId: string }
+  /** Le participant est en train d'écrire dans cette discussion (envoyé au plus toutes les 2 s). */
+  | { type: 'typing'; conversationId: string }
+  /** Réponse à une question de l'agent (par n'importe quel participant). */
+  | { type: 'answer'; entryId: string; toolId: string; text: string };
 
 // ---- Serveur -> client ----
 
@@ -163,6 +206,8 @@ export type ServerMessage =
   | { type: 'participants'; participants: Participant[] }
   | { type: 'queue'; queue: QueueState }
   | { type: 'models'; models: ModelsState }
+  /** Un participant écrit dans une discussion (l'indicateur expire côté client). */
+  | { type: 'typing'; conversationId: string; clientId: string; name: string }
   | { type: 'error'; message: string }
   | { type: 'sessionEnded'; reason: string };
 
@@ -171,6 +216,7 @@ export const LIMITS = {
   maxTitleLength: 60,
   maxConversations: 50,
   maxQuestionLength: 8000,
+  maxAnswerLength: 2000,
   maxPendingPerClient: 5,
   /** Taille max d'une trame WebSocket entrante, en octets. */
   maxPayloadBytes: 64 * 1024,

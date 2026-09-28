@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { WorkspaceTools } from './agentTools';
+import type { PreparedCall, WorkspaceTools } from './agentTools';
 import type { ModelBackend, ModelEvent, ModelRequest, ModelResponse } from './chatRoom';
 import type { ModelInfo, ToolActivity } from './protocol';
 
@@ -12,6 +12,9 @@ const MAX_TOOL_ROUNDS = 25;
  * résultats lui sont renvoyés jusqu'à sa réponse finale.
  */
 export class CopilotBackend implements ModelBackend {
+  /** Ids d'actions uniques pour toute la session (ils servent aussi à retrouver les diffs). */
+  private toolCounter = 0;
+
   constructor(private readonly tools: WorkspaceTools) {}
 
   async ask(request: ModelRequest, signal: AbortSignal): Promise<ModelResponse> {
@@ -21,20 +24,19 @@ export class CopilotBackend implements ModelBackend {
         ? vscode.LanguageModelChatMessage.User(t.content)
         : vscode.LanguageModelChatMessage.Assistant(t.content),
     );
-    return { modelName: model.name, events: this.run(model, messages, request.author, signal) };
+    return { modelName: model.name, events: this.run(model, messages, request, signal) };
   }
 
   private async *run(
     model: vscode.LanguageModelChat,
     messages: vscode.LanguageModelChatMessage[],
-    author: string,
+    request: ModelRequest,
     signal: AbortSignal,
   ): AsyncGenerator<ModelEvent> {
     const cts = new vscode.CancellationTokenSource();
     const onAbort = () => cts.cancel();
     signal.addEventListener('abort', onAbort, { once: true });
     let tools = this.tools.definitions();
-    let toolCounter = 0;
 
     try {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -85,8 +87,8 @@ export class CopilotBackend implements ModelBackend {
         );
         const results: vscode.LanguageModelToolResultPart[] = [];
         for (const call of calls) {
-          const id = `t${++toolCounter}`;
-          const outcome = yield* this.runTool(id, call, author, signal);
+          const id = `t${++this.toolCounter}`;
+          const outcome = yield* this.runTool(id, call, request, signal);
           results.push(new vscode.LanguageModelToolResultPart(call.callId, [new vscode.LanguageModelTextPart(outcome)]));
           if (signal.aborted) {
             return;
@@ -105,11 +107,11 @@ export class CopilotBackend implements ModelBackend {
   private async *runTool(
     id: string,
     call: vscode.LanguageModelToolCallPart,
-    author: string,
+    request: ModelRequest,
     signal: AbortSignal,
   ): AsyncGenerator<ModelEvent, string> {
     const activity = (tool: ToolActivity): ModelEvent => ({ type: 'tool', tool });
-    let prepared;
+    let prepared: PreparedCall;
     try {
       prepared = await this.tools.prepare(call.name, call.input);
     } catch (err) {
@@ -117,21 +119,53 @@ export class CopilotBackend implements ModelBackend {
       yield activity({ id, title: call.name, status: 'error', detail: message });
       return `Erreur : ${message}`;
     }
-
     const title = prepared.title;
-    if (prepared.approval) {
-      yield activity({ id, title, status: 'awaitingApproval', detail: "En attente de validation par l'hôte" });
-      const approved = await this.tools.requestApproval(prepared, author);
-      if (!approved || signal.aborted) {
-        yield activity({ id, title, status: 'rejected', detail: "Refusé par l'hôte" });
-        return "L'hôte a refusé cette action. Ne la retente pas telle quelle ; explique ce que tu voulais faire ou propose une alternative.";
+
+    // Question de l'agent aux participants : visible par tous, le premier qui répond l'emporte.
+    if (prepared.question) {
+      const question = { ...prepared.question, requesterClientId: request.authorClientId, requesterName: request.author };
+      const tool = { id, title, status: 'awaitingAnswer' as const, question };
+      yield activity(tool);
+      const answer = await request.interaction.answer(tool);
+      if (!answer.text) {
+        yield activity({ ...tool, status: 'rejected', detail: 'Sans réponse' });
+        return 'Pas de réponse (demande annulée). Termine sans supposer la réponse.';
       }
+      yield activity({ ...tool, status: 'done', answer: answer.text, answeredBy: answer.by });
+      return `Réponse de ${answer.by} : ${answer.text}`;
     }
 
-    yield activity({ id, title, status: 'running' });
+    let detail: string | undefined;
+    const approval = prepared.approval;
+    if (approval && this.tools.isGranted(approval)) {
+      detail = 'autorisé pour la session';
+    } else if (approval) {
+      const request_ = { kind: approval.kind, preview: approval.preview, canShowDiff: approval.canShowDiff, hostOnly: approval.hostOnly };
+      const tool = { id, title, status: 'awaitingApproval' as const, approval: request_ };
+      if (approval.diff) {
+        this.tools.rememberDiff(id, approval.diff);
+      }
+      yield activity(tool);
+      const outcome = await request.interaction.approval(tool);
+      this.tools.forgetDiff(id);
+      if (outcome.decision === 'deny' || signal.aborted) {
+        yield activity({ ...tool, status: 'rejected', detail: outcome.by ? `Refusé par ${outcome.by}` : 'Annulé' });
+        return "L'action a été refusée. Ne la retente pas telle quelle ; explique ce que tu voulais faire ou propose une alternative.";
+      }
+      if (outcome.decision === 'session') {
+        this.tools.grant(approval.kind);
+      }
+      detail = outcome.decision === 'session' ? `autorisé pour la session par ${outcome.by}` : `autorisé par ${outcome.by}`;
+      yield activity({ ...tool, status: 'running', detail });
+    } else {
+      yield activity({ id, title, status: 'running' });
+    }
+
     try {
       const { result, summary } = await prepared.execute(signal);
-      yield activity({ id, title, status: 'done', detail: summary });
+      yield activity({ id, title, status: 'done', detail: [summary, detail].filter(Boolean).join(' · ') || undefined, approval: approval && {
+        kind: approval.kind, preview: approval.preview, canShowDiff: false, hostOnly: approval.hostOnly,
+      } });
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

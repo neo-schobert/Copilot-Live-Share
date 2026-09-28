@@ -218,10 +218,35 @@ export class NativeChatBridge implements vscode.Disposable {
       };
 
       const showTool = (tool: ToolActivity) => {
-        if (tool.status === 'running' || tool.status === 'awaitingApproval') {
-          stream.progress(tool.status === 'awaitingApproval' ? `${tool.title} — en attente de votre validation` : tool.title);
-        } else if (!reported.has(tool.id)) {
-          reported.add(tool.id);
+        const once = (suffix: string) => {
+          const k = `${tool.id}:${suffix}`;
+          const first = !reported.has(k);
+          reported.add(k);
+          return first;
+        };
+        if (tool.status === 'running') {
+          stream.progress(tool.title);
+        } else if (tool.status === 'awaitingApproval' && tool.approval && answerId && once('approval')) {
+          // Carte de validation façon Copilot, avec boutons.
+          const scope = tool.approval.hostOnly ? ' — hors du projet' : '';
+          stream.markdown(`\n\n**${tool.title}**${scope}\n\n\`\`\`diff\n${tool.approval.preview}\n\`\`\`\n`);
+          const args = (decision: string) => [answerId, tool.id, decision];
+          stream.button({ command: 'sharedCopilotChat.resolveApproval', title: 'Autoriser', arguments: args('once') });
+          if (!tool.approval.hostOnly) {
+            stream.button({ command: 'sharedCopilotChat.resolveApproval', title: 'Autoriser pour la session', arguments: args('session') });
+          }
+          if (tool.approval.canShowDiff) {
+            stream.button({ command: 'sharedCopilotChat.showDiff', title: 'Voir les modifications', arguments: [tool.id] });
+          }
+          stream.button({ command: 'sharedCopilotChat.resolveApproval', title: 'Refuser', arguments: args('deny') });
+        } else if (tool.status === 'awaitingAnswer' && tool.question && answerId && once('question')) {
+          stream.markdown(`\n\n❓ **${tool.question.text}**\n\n`);
+          // Tout participant peut répondre, l'hôte aussi depuis le chat natif.
+          for (const option of tool.question.options) {
+            stream.button({ command: 'sharedCopilotChat.answerQuestion', title: option, arguments: [answerId, tool.id, option] });
+          }
+          stream.button({ command: 'sharedCopilotChat.answerQuestion', title: 'Répondre…', arguments: [answerId, tool.id] });
+        } else if ((tool.status === 'done' || tool.status === 'rejected' || tool.status === 'error') && once('end')) {
           stream.markdown(`\n\n${toolLine(tool)}\n\n`);
         }
       };
@@ -322,8 +347,9 @@ function renderAnswer(answer: AssistantEntry): string {
 }
 
 function toolLine(tool: ToolActivity): string {
-  const icon = { done: '✅', error: '⚠️', rejected: '⛔', running: '⏳', awaitingApproval: '⏳' }[tool.status];
-  return `> ${icon} ${tool.title}${tool.detail ? ` — ${tool.detail}` : ''}`;
+  const icon = { done: '✓', error: '⚠️', rejected: '⛔', running: '⏳', awaitingApproval: '✋', awaitingAnswer: '❓' }[tool.status];
+  const answer = tool.answer ? ` — réponse de ${tool.answeredBy ?? '?'} : « ${tool.answer} »` : '';
+  return `> ${icon} ${tool.question ? tool.question.text : tool.title}${answer}${tool.detail ? ` — ${tool.detail}` : ''}`;
 }
 
 function resultFor(status: AssistantEntry['status'], error?: string): vscode.ChatResult {
