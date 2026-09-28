@@ -3,15 +3,15 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
 import { PROPOSAL_SCHEME, ProposalContentProvider, WorkspaceTools } from './agentTools';
-import type { ApprovalDecision } from './protocol';
-import { ChatRoom, InviteResult, LOCAL_HOST_CLIENT_ID, PendingApproval, PendingQuestion } from './chatRoom';
+import type { ApprovalDecision, SessionPolicy } from './protocol';
+import { ChatRoom, InviteResult, LOCAL_HOST_CLIENT_ID, PendingApproval, PendingQuestion, PendingReview } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
 import { ChatController, ChatViewProvider, ConnectionTarget, inviteTarget, ViewState } from './chatView';
 import { NativeChatBridge } from './nativeChat';
 import { consumePendingStart, prepareEnvironment } from './wslSetup';
 import { ChatServer } from './server';
 
-const CONFIG = 'sharedCopilotChat';
+const CONFIG = 'promptShare';
 /** Au-delà, le partage de contexte demande confirmation (le modèle a une fenêtre limitée). */
 const LARGE_CONTEXT_CHARS = 60_000;
 
@@ -60,7 +60,7 @@ let guest: { link: string; target: ConnectionTarget } | undefined;
 let viewStatus: { status?: string; error?: boolean } = {};
 
 /** API interne renvoyée par activate(), utilisée par les tests d'intégration. */
-export interface SharedCopilotApi {
+export interface PromptShareApi {
   readonly tools: WorkspaceTools;
   readonly nativeChatActive: () => boolean;
   /** Résolue quand la détection du bac à sable est terminée. */
@@ -73,13 +73,13 @@ export interface SharedCopilotApi {
   readonly viewEvents: () => string[];
 }
 
-export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
-  output = vscode.window.createOutputChannel('Shared Copilot');
+export function activate(context: vscode.ExtensionContext): PromptShareApi {
+  output = vscode.window.createOutputChannel('Prompt Share');
   proposals = new ProposalContentProvider();
   tools = new WorkspaceTools(proposals, output);
   sandboxReady = tools.initSandbox(log);
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.command = 'sharedCopilotChat.openChat';
+  statusBar.command = 'promptShare.openChat';
   lastTextEditor = vscode.window.activeTextEditor;
   chatView = new ChatViewProvider(context.extensionUri, viewController(context), (m) => {
     log(m);
@@ -101,37 +101,45 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
         lastTextEditor = e;
       }
     }),
-    vscode.commands.registerCommand('sharedCopilotChat.startSession', () => hostSession(context)),
-    vscode.commands.registerCommand('sharedCopilotChat.host', () => hostSession(context)),
-    vscode.commands.registerCommand('sharedCopilotChat.join', () => joinFromCommand()),
-    vscode.commands.registerCommand('sharedCopilotChat.leave', () => viewController(context).leave(false)),
-    vscode.commands.registerCommand('sharedCopilotChat.copyInviteLink', withSession(copyInviteLink)),
-    vscode.commands.registerCommand('sharedCopilotChat.openChat', () => chatView?.reveal()),
-    vscode.commands.registerCommand('sharedCopilotChat.shareSelection', withSession(shareSelection)),
-    vscode.commands.registerCommand('sharedCopilotChat.cancelResponse', withSession(cancelResponse)),
-    vscode.commands.registerCommand('sharedCopilotChat.stopSession', withSession(stopSession)),
-    vscode.commands.registerCommand('sharedCopilotChat.selectModel', selectDefaultModel),
+    vscode.commands.registerCommand('promptShare.startSession', () => hostSession(context)),
+    vscode.commands.registerCommand('promptShare.host', () => hostSession(context)),
+    vscode.commands.registerCommand('promptShare.join', () => joinFromCommand()),
+    vscode.commands.registerCommand('promptShare.leave', () => viewController(context).leave(false)),
+    vscode.commands.registerCommand('promptShare.copyInviteLink', withSession(copyInviteLink)),
+    vscode.commands.registerCommand('promptShare.openChat', () => chatView?.reveal()),
+    vscode.commands.registerCommand('promptShare.shareSelection', withSession(shareSelection)),
+    vscode.commands.registerCommand('promptShare.cancelResponse', withSession(cancelResponse)),
+    vscode.commands.registerCommand('promptShare.stopSession', withSession(stopSession)),
+    vscode.commands.registerCommand('promptShare.selectModel', selectDefaultModel),
     // Commandes internes, utilisées par les boutons du chat natif.
-    vscode.commands.registerCommand('sharedCopilotChat.resolveApproval', (entryId: string, toolId: string, decision: ApprovalDecision) => {
+    vscode.commands.registerCommand('promptShare.resolveApproval', (entryId: string, toolId: string, decision: ApprovalDecision) => {
       if (!session?.room.resolveApproval(entryId, toolId, decision, hostName())) {
-        void vscode.window.showInformationMessage("Shared Copilot : cette action n'attend plus de validation.");
+        void vscode.window.showInformationMessage("Prompt Share : cette action n'attend plus de validation.");
       }
     }),
-    vscode.commands.registerCommand('sharedCopilotChat.showDiff', async (toolId: string) => {
+    vscode.commands.registerCommand('promptShare.reviewQuestion', (entryId: string, accept: boolean) => {
+      if (!session?.room.reviewQuestion(entryId, accept, hostName())) {
+        void vscode.window.showInformationMessage("Prompt Share : cette question n'attend plus votre accord.");
+      }
+    }),
+    vscode.commands.registerCommand('promptShare.showDiff', async (toolId: string) => {
       if (!(await tools.showDiff(toolId))) {
-        void vscode.window.showInformationMessage("Shared Copilot : cette modification n'est plus en attente.");
+        void vscode.window.showInformationMessage("Prompt Share : cette modification n'est plus en attente.");
       }
     }),
-    vscode.commands.registerCommand('sharedCopilotChat.answerQuestion', async (entryId: string, toolId: string, text?: string) => {
+    vscode.commands.registerCommand('promptShare.answerQuestion', async (entryId: string, toolId: string, text?: string) => {
       const answer = text ?? (await vscode.window.showInputBox({ title: "Réponse à l'agent", ignoreFocusOut: true }));
       if (answer && !session?.room.answerQuestion(entryId, toolId, answer, hostName())) {
-        void vscode.window.showInformationMessage("Shared Copilot : cette question n'attend plus de réponse.");
+        void vscode.window.showInformationMessage("Prompt Share : cette question n'attend plus de réponse.");
       }
     }),
     vscode.lm.onDidChangeChatModels(() => void refreshModels()),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration(`${CONFIG}.modelFamily`) || e.affectsConfiguration(`${CONFIG}.allowGuestModelChoice`)) {
         void refreshModels();
+      }
+      if (e.affectsConfiguration(`${CONFIG}.reviewGuestQuestions`) || e.affectsConfiguration(`${CONFIG}.guestQuestionsPerHour`)) {
+        session?.room.broadcastPolicy();
       }
       if (['wslSandbox', 'wslDistro', 'sandboxReadOnlyPaths'].some((k) => e.affectsConfiguration(`${CONFIG}.${k}`))) {
         sandboxReady = tools.initSandbox(log, true);
@@ -175,7 +183,11 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
   if (starting) {
-    void vscode.window.showInformationMessage('Shared Copilot : démarrage de la session déjà en cours…');
+    void vscode.window.showInformationMessage('Prompt Share : démarrage de la session déjà en cours…');
+    return;
+  }
+  if (!(await acknowledgeHostNotice(context))) {
+    setViewStatus('Démarrage annulé.');
     return;
   }
   starting = true;
@@ -187,7 +199,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     log(`Préparation de l'environnement : ${setup.outcome}${setup.redetect ? ' (nouvelle détection du bac à sable)' : ''}`);
     if (setup.outcome === 'cancelled') {
       setViewStatus('Démarrage annulé.');
-      void vscode.window.showInformationMessage('Shared Copilot : démarrage de la session annulé.');
+      void vscode.window.showInformationMessage('Prompt Share : démarrage de la session annulé.');
       return;
     }
     if (setup.outcome === 'reopening') {
@@ -201,7 +213,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     await createSession(context);
     const started = session as Session | undefined; // modifiée par createSession
     log(started ? `Session démarrée sur ${started.localUrl}` : 'Session non démarrée.');
-    setViewStatus(started ? undefined : 'La session n’a pas pu démarrer (détails dans le canal de sortie « Shared Copilot »).', !started);
+    setViewStatus(started ? undefined : 'La session n’a pas pu démarrer (détails dans le canal de sortie « Prompt Share »).', !started);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Erreur au démarrage de la session : ${err instanceof Error && err.stack ? err.stack : message}`);
@@ -211,6 +223,70 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     starting = false;
     chatView?.postState();
   }
+}
+
+const HOST_NOTICE_KEY = 'promptShare.hostNoticeAccepted';
+const HOST_NOTICE_VERSION = 1;
+const GITHUB_TERMS = 'https://docs.github.com/en/site-policy/github-terms/github-terms-of-service';
+
+/**
+ * Avant la première session hébergée : ce que partager son accès implique (compte GitHub,
+ * quota, lecture du projet par les invités). Doit être accepté une fois.
+ */
+async function acknowledgeHostNotice(context: vscode.ExtensionContext): Promise<boolean> {
+  if (context.globalState.get<number>(HOST_NOTICE_KEY) === HOST_NOTICE_VERSION) {
+    return true;
+  }
+  if (context.extensionMode === vscode.ExtensionMode.Test) {
+    log("Avertissement de l'hôte ignoré (tests).");
+    return true;
+  }
+  const { reviewGuestQuestions, guestQuestionsPerHour } = sessionPolicy();
+  const safeguards = [
+    reviewGuestQuestions ? 'vous validez chaque question d’invité avant son envoi au modèle' : undefined,
+    guestQuestionsPerHour > 0 ? `les invités sont limités à ${guestQuestionsPerHour} questions par heure` : undefined,
+  ].filter(Boolean);
+  const accept = 'J’ai compris, héberger';
+  const terms = 'Conditions de GitHub';
+  for (;;) {
+    const choice = await vscode.window.showWarningMessage(
+      'Prompt Share : avant d’héberger une session',
+      {
+        modal: true,
+        detail: [
+          '• Les questions des invités sont envoyées aux modèles GitHub Copilot avec votre compte et comptent dans votre quota, requêtes premium comprises.',
+          '• Vous restez responsable de l’usage de votre compte. Les conditions de GitHub réservent un compte à une seule personne et interdisent d’exploiter ou de revendre l’accès au service. Hébergez des sessions de travail avec des personnes de confiance, en restant présent : Prompt Share n’est pas un moyen de partager un abonnement.',
+          safeguards.length
+            ? `• Protections actives : ${safeguards.join(' ; ')} (réglages « promptShare »).`
+            : '• Attention : vous avez désactivé la validation des questions et la limite horaire (réglages « promptShare »).',
+          '• Par l’agent, les invités peuvent lire le projet ouvert (sauf les fichiers protégés : .env, clés, .git…). Ne donnez le lien d’invitation qu’aux personnes concernées.',
+          '',
+          'Prompt Share est un projet indépendant, non affilié à GitHub ni à Microsoft.',
+        ].join('\n'),
+      },
+      accept,
+      terms,
+    );
+    if (choice === terms) {
+      await vscode.env.openExternal(vscode.Uri.parse(GITHUB_TERMS));
+      continue;
+    }
+    if (choice !== accept) {
+      log("Avertissement de l'hôte refusé : session non démarrée.");
+      return false;
+    }
+    await context.globalState.update(HOST_NOTICE_KEY, HOST_NOTICE_VERSION);
+    log("Avertissement de l'hôte accepté.");
+    return true;
+  }
+}
+
+function sessionPolicy(): SessionPolicy {
+  const config = vscode.workspace.getConfiguration(CONFIG);
+  return {
+    reviewGuestQuestions: config.get<boolean>('reviewGuestQuestions', true),
+    guestQuestionsPerHour: Math.max(0, Math.floor(config.get<number>('guestQuestionsPerHour', 60))),
+  };
 }
 
 // ---- Vue du chat : héberger, rejoindre, quitter ----
@@ -224,7 +300,7 @@ async function hostSession(context: vscode.ExtensionContext): Promise<void> {
 /** Rejoindre depuis la palette : demande le lien puis ouvre le chat. */
 async function joinFromCommand(): Promise<void> {
   const link = await vscode.window.showInputBox({
-    title: 'Rejoindre une session Shared Copilot',
+    title: 'Rejoindre une session Prompt Share',
     prompt: "Collez le lien d'invitation reçu de l'hôte.",
     placeHolder: 'https://xxxx.ngrok-free.app/?token=…',
     ignoreFocusOut: true,
@@ -304,7 +380,7 @@ function setViewStatus(status: string | undefined, error = false): void {
 /** Pseudo saisi dans la vue, utilisé tout de suite (l'enregistrement du paramètre est asynchrone). */
 let chosenName: string | undefined;
 
-/** Mémorise le pseudo saisi dans la vue (paramètre sharedCopilotChat.hostName). */
+/** Mémorise le pseudo saisi dans la vue (paramètre promptShare.hostName). */
 function saveName(name: string): void {
   const clean = name.trim().slice(0, 32);
   if (clean && clean !== hostName()) {
@@ -323,7 +399,7 @@ function describeEnvironment(context: vscode.ExtensionContext): string {
 /** Message d'erreur avec accès direct au journal. */
 async function showError(message: string): Promise<void> {
   const logs = 'Voir le journal';
-  if ((await vscode.window.showErrorMessage(`Shared Copilot : ${message}`, logs)) === logs) {
+  if ((await vscode.window.showErrorMessage(`Prompt Share : ${message}`, logs)) === logs) {
     output.show(true);
   }
 }
@@ -345,7 +421,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
       fs.readFile(file('dist', 'web', 'codicon.css')),
     ]);
   } catch (err) {
-    void vscode.window.showErrorMessage(`Shared Copilot : fichiers de la page introuvables (${String(err)}). Lancez « npm run compile ».`);
+    void vscode.window.showErrorMessage(`Prompt Share : fichiers de la page introuvables (${String(err)}). Lancez « npm run compile ».`);
     return;
   }
 
@@ -360,6 +436,8 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     onQuestionAsked: (pending) => void askLocalHost(pending),
     onShowDiff: (_entryId, toolId) => void tools.showDiff(toolId),
     onInviteRequested: inviteFromChat,
+    policy: sessionPolicy,
+    onReviewRequested: (pending) => void notifyReview(pending),
   });
   const server = new ChatServer(
     {
@@ -382,9 +460,9 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     const code = (err as NodeJS.ErrnoException).code;
     const detail =
       code === 'EADDRINUSE'
-        ? `le port ${port} est déjà utilisé. Changez le paramètre « sharedCopilotChat.port ».`
+        ? `le port ${port} est déjà utilisé. Changez le paramètre « promptShare.port ».`
         : String(err);
-    void vscode.window.showErrorMessage(`Shared Copilot : impossible de démarrer le serveur, ${detail}`);
+    void vscode.window.showErrorMessage(`Prompt Share : impossible de démarrer le serveur, ${detail}`);
     return;
   }
 
@@ -395,7 +473,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   if (config.get<boolean>('nativeChat', true)) {
     session.nativeChat = NativeChatBridge.tryCreate(room, hostName, (m) => output.appendLine(m));
   }
-  await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', true);
+  await vscode.commands.executeCommand('setContext', 'promptShare.active', true);
   updateStatusBar(0);
   chatView?.postState();
   void refreshModels();
@@ -417,7 +495,7 @@ async function notifyApproval(pending: PendingApproval): Promise<void> {
   const scope = tool.approval.hostOnly ? ' (hors du projet — vous seul pouvez décider)' : '';
   for (;;) {
     const choice = await vscode.window.showWarningMessage(
-      `Shared Copilot — ${author} : ${tool.title}${scope}\n${tool.approval.preview.split('\n').slice(0, 6).join('\n')}`,
+      `Prompt Share — ${author} : ${tool.title}${scope}\n${tool.approval.preview.split('\n').slice(0, 6).join('\n')}`,
       ...buttons,
     );
     if (!room || !room.pendingApproval(entryId, tool.id)) {
@@ -436,6 +514,38 @@ async function notifyApproval(pending: PendingApproval): Promise<void> {
   }
 }
 
+/**
+ * Question d'invité à accepter avant son envoi au modèle. Non modale : l'hôte peut aussi
+ * décider depuis le chat ; la première décision l'emporte.
+ */
+async function notifyReview(pending: PendingReview): Promise<void> {
+  const room = session?.room;
+  const { entryId, author, text, modelName } = pending;
+  const accept = 'Envoyer au modèle';
+  const reject = 'Refuser';
+  const open = 'Ouvrir le chat';
+  const excerpt = text.length > 200 ? `${text.slice(0, 199)}…` : text;
+  for (;;) {
+    const choice = await vscode.window.showInformationMessage(
+      `Prompt Share — question de ${author}${modelName ? ` (modèle ${modelName})` : ''} : « ${excerpt} »`,
+      accept,
+      reject,
+      open,
+    );
+    if (!room || !room.awaitingReviewOf(entryId)) {
+      return; // Déjà décidé ailleurs ou session terminée.
+    }
+    if (choice === open) {
+      await chatView?.reveal();
+      continue;
+    }
+    if (choice === accept || choice === reject) {
+      room.reviewQuestion(entryId, choice === accept, hostName());
+    }
+    return;
+  }
+}
+
 /** Question de l'agent posée à l'hôte depuis le chat natif : réponse dans VS Code. */
 async function askLocalHost(pending: PendingQuestion): Promise<void> {
   const { tool, entryId } = pending;
@@ -446,7 +556,7 @@ async function askLocalHost(pending: PendingQuestion): Promise<void> {
   let answer: string | undefined;
   if (tool.question.options.length) {
     const picked = await vscode.window.showQuickPick([...tool.question.options, free], {
-      title: `Shared Copilot — question de l'agent`,
+      title: `Prompt Share — question de l'agent`,
       placeHolder: tool.question.text,
       ignoreFocusOut: true,
     });
@@ -455,7 +565,7 @@ async function askLocalHost(pending: PendingQuestion): Promise<void> {
       return;
     }
   }
-  answer ??= await vscode.window.showInputBox({ title: "Shared Copilot — question de l'agent", prompt: tool.question.text, ignoreFocusOut: true });
+  answer ??= await vscode.window.showInputBox({ title: "Prompt Share — question de l'agent", prompt: tool.question.text, ignoreFocusOut: true });
   if (answer) {
     session?.room.answerQuestion(entryId, tool.id, answer, hostName());
   }
@@ -479,7 +589,7 @@ async function refreshModels(): Promise<void> {
   s.room.setModels({
     available,
     defaultId: defaultModelId(available),
-    guestsCanChoose: vscode.workspace.getConfiguration(CONFIG).get<boolean>('allowGuestModelChoice', true),
+    guestsCanChoose: vscode.workspace.getConfiguration(CONFIG).get<boolean>('allowGuestModelChoice', false),
   });
 }
 
@@ -487,7 +597,7 @@ async function selectDefaultModel(): Promise<void> {
   const models = await listCopilotModels();
   if (!models.length) {
     void vscode.window.showErrorMessage(
-      'Shared Copilot : aucun modèle Copilot disponible. Vérifiez que GitHub Copilot Chat est installé et connecté.',
+      'Prompt Share : aucun modèle Copilot disponible. Vérifiez que GitHub Copilot Chat est installé et connecté.',
     );
     return;
   }
@@ -510,14 +620,14 @@ async function selectDefaultModel(): Promise<void> {
       ? vscode.ConfigurationTarget.Workspace
       : vscode.ConfigurationTarget.Global;
   await config.update('modelFamily', picked.model.family, target);
-  vscode.window.setStatusBarMessage(`Shared Copilot : modèle par défaut → ${picked.model.name}`, 3000);
+  vscode.window.setStatusBarMessage(`Prompt Share : modèle par défaut → ${picked.model.name}`, 3000);
 }
 
 async function showSessionNotification(s: Session, title: string): Promise<void> {
   const copy = "Copier le lien d'invitation";
   const open = 'Ouvrir le chat';
   const choice = await vscode.window.showInformationMessage(
-    `Shared Copilot : ${title} sur ${s.localUrl}. Pour inviter, exposez ce port avec un tunnel puis utilisez « Inviter » dans le chat.`,
+    `Prompt Share : ${title} sur ${s.localUrl}. Pour inviter, exposez ce port avec un tunnel puis utilisez « Inviter » dans le chat.`,
     copy,
     open,
   );
@@ -545,7 +655,7 @@ async function copyInviteLink(s: Session): Promise<void> {
   }
   s.publicUrl = input.trim();
   await vscode.env.clipboard.writeText(link);
-  void vscode.window.showInformationMessage("Shared Copilot : lien d'invitation copié. Toute personne qui l'a peut rejoindre le chat.");
+  void vscode.window.showInformationMessage("Prompt Share : lien d'invitation copié. Toute personne qui l'a peut rejoindre le chat.");
 }
 
 /** Lien d'invitation pour une URL de base (tunnel ou locale), ou undefined si l'URL est invalide. */
@@ -594,7 +704,7 @@ async function inviteFromChat(publicUrl: string | undefined, copy: boolean): Pro
 async function shareSelection(s: Session): Promise<void> {
   const editor = vscode.window.activeTextEditor ?? lastTextEditor;
   if (!editor || editor.document.isClosed) {
-    void vscode.window.showWarningMessage('Shared Copilot : aucun éditeur actif à partager.');
+    void vscode.window.showWarningMessage('Prompt Share : aucun éditeur actif à partager.');
     return;
   }
   const doc = editor.document;
@@ -602,7 +712,7 @@ async function shareSelection(s: Session): Promise<void> {
   const hasSelection = !sel.isEmpty;
   const code = hasSelection ? doc.getText(sel) : doc.getText();
   if (!code.trim()) {
-    void vscode.window.showWarningMessage('Shared Copilot : rien à partager (sélection ou fichier vide).');
+    void vscode.window.showWarningMessage('Prompt Share : rien à partager (sélection ou fichier vide).');
     return;
   }
   if (code.length > LARGE_CONTEXT_CHARS) {
@@ -628,11 +738,11 @@ async function shareSelection(s: Session): Promise<void> {
     return;
   }
   if (!s.room.addContext(conversationId, context)) {
-    void vscode.window.showWarningMessage("Shared Copilot : cette discussion n'existe plus.");
+    void vscode.window.showWarningMessage("Prompt Share : cette discussion n'existe plus.");
     return;
   }
   const title = s.room.conversationList.find((c) => c.id === conversationId)?.title;
-  vscode.window.setStatusBarMessage(`Shared Copilot : contexte partagé dans « ${title} »`, 3000);
+  vscode.window.setStatusBarMessage(`Prompt Share : contexte partagé dans « ${title} »`, 3000);
 }
 
 /** Discussion ouverte dans la webview de l'hôte, la seule existante, ou choisie dans une liste. */
@@ -654,7 +764,7 @@ async function pickTargetConversation(s: Session): Promise<string | undefined> {
 
 function cancelResponse(s: Session): void {
   if (!s.room.cancelCurrent()) {
-    void vscode.window.showInformationMessage('Shared Copilot : aucune réponse en cours.');
+    void vscode.window.showInformationMessage('Prompt Share : aucune réponse en cours.');
   }
 }
 
@@ -665,7 +775,7 @@ async function stopSession(): Promise<void> {
   }
   session = undefined;
   tools.resetSession();
-  await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', false);
+  await vscode.commands.executeCommand('setContext', 'promptShare.active', false);
   await s.stop();
   updateStatusBar(0);
 }
@@ -676,9 +786,9 @@ function withSession(fn: (s: Session) => unknown): () => Promise<void> {
   return async () => {
     if (!session) {
       const start = 'Démarrer une session';
-      const choice = await vscode.window.showWarningMessage('Shared Copilot : aucune session en cours.', start);
+      const choice = await vscode.window.showWarningMessage('Prompt Share : aucune session en cours.', start);
       if (choice === start) {
-        await vscode.commands.executeCommand('sharedCopilotChat.startSession');
+        await vscode.commands.executeCommand('promptShare.startSession');
       }
       return;
     }
@@ -692,18 +802,18 @@ function updateStatusBar(participants: number): void {
     return;
   }
   if (session) {
-    statusBar.text = `$(broadcast) Shared Copilot · ${participants}`;
+    statusBar.text = `$(broadcast) Prompt Share · ${participants}`;
     statusBar.tooltip = `Vous hébergez une session (${participants} participant(s)). Cliquer pour ouvrir le chat.`;
   } else if (guest) {
-    statusBar.text = '$(plug) Shared Copilot';
+    statusBar.text = '$(plug) Prompt Share';
     statusBar.tooltip = `Connecté à la session de ${new URL(guest.link).host}. Cliquer pour ouvrir le chat.`;
   } else {
-    statusBar.text = '$(copilot) Shared Copilot';
-    statusBar.tooltip = 'Héberger ou rejoindre une session Shared Copilot';
+    statusBar.text = '$(copilot) Prompt Share';
+    statusBar.tooltip = 'Héberger ou rejoindre une session Prompt Share';
   }
   statusBar.show();
   // Utilisé par le menu de la vue (bouton « Quitter ») et la palette.
-  void vscode.commands.executeCommand('setContext', 'sharedCopilotChat.connected', !!session || !!guest);
+  void vscode.commands.executeCommand('setContext', 'promptShare.connected', !!session || !!guest);
 }
 
 function hostName(): string {

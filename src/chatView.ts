@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { WebSocket } from 'ws';
 
 /**
- * Le chat dans VS Code, sous forme de vue (barre latérale « Shared Copilot ») :
+ * Le chat dans VS Code, sous forme de vue (barre latérale « Prompt Share ») :
  * accueil (héberger / rejoindre), puis la même page de chat que dans un navigateur.
  * La page ne se connecte pas elle-même : l'extension tient le WebSocket (vers le
  * serveur local de l'hôte, ou vers la session d'un autre via son tunnel) et relaie
@@ -50,7 +50,7 @@ type PageMessage =
   | { type: 'scc-disconnect'; id: string };
 
 export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
-  static readonly viewId = 'sharedCopilotChat.view';
+  static readonly viewId = 'promptShare.view';
   private view: vscode.WebviewView | undefined;
   private readonly sockets = new Map<string, WebSocket>();
   private template: string | undefined;

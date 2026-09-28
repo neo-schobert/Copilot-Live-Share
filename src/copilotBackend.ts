@@ -49,7 +49,7 @@ export class CopilotBackend implements ModelBackend {
           response = await model.sendRequest(
             messages,
             {
-              justification: 'Shared Copilot Chat envoie les questions des participants de la session partagée.',
+              justification: 'Prompt Share envoie les questions des participants de la session partagée.',
               tools: tools.length ? tools : undefined,
             },
             cts.token,
@@ -218,7 +218,7 @@ export async function listCopilotModels(): Promise<ModelInfo[]> {
 
 /** Modèle par défaut : premier de la famille configurée, sinon premier disponible. */
 export function defaultModelId(models: ModelInfo[]): string | null {
-  const family = vscode.workspace.getConfiguration('sharedCopilotChat').get<string>('modelFamily', '').trim();
+  const family = vscode.workspace.getConfiguration('promptShare').get<string>('modelFamily', '').trim();
   const match = family ? models.find((m) => m.family === family) : undefined;
   return (match ?? models[0])?.id ?? null;
 }
@@ -232,7 +232,7 @@ async function selectById(id: string): Promise<vscode.LanguageModelChat> {
 }
 
 async function selectModel(): Promise<vscode.LanguageModelChat> {
-  const family = vscode.workspace.getConfiguration('sharedCopilotChat').get<string>('modelFamily', '').trim();
+  const family = vscode.workspace.getConfiguration('promptShare').get<string>('modelFamily', '').trim();
   const models = await vscode.lm.selectChatModels(family ? { vendor: 'copilot', family } : { vendor: 'copilot' });
   if (models.length > 0) {
     return models[0];
@@ -255,7 +255,7 @@ function toReadableError(err: unknown): Error {
     switch (err.code) {
       case vscode.LanguageModelError.NoPermissions().code:
         return new Error(
-          "L'hôte n'a pas autorisé Shared Copilot Chat à utiliser les modèles Copilot (consentement refusé ou en attente dans VS Code).",
+          "L'hôte n'a pas autorisé Prompt Share à utiliser les modèles Copilot (consentement refusé ou en attente dans VS Code).",
         );
       case vscode.LanguageModelError.Blocked().code:
         return new Error('Requête bloquée par Copilot (quota atteint ou limite de débit). Réessayez plus tard.');

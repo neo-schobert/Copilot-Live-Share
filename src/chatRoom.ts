@@ -16,6 +16,7 @@ import {
   QueueItem,
   QueueState,
   ServerMessage,
+  SessionPolicy,
   ToolActivity,
   UserEntry,
 } from './protocol';
@@ -89,6 +90,16 @@ export interface PendingApproval {
   author: string;
 }
 
+/** Question d'invité en attente de l'accord de l'hôte, transmise à l'extension pour le notifier. */
+export interface PendingReview {
+  entryId: string;
+  conversationId: string;
+  author: string;
+  text: string;
+  /** Nom du modèle demandé par l'invité, s'il en a choisi un. */
+  modelName?: string;
+}
+
 export interface PendingQuestion {
   entryId: string;
   conversationId: string;
@@ -117,7 +128,13 @@ export interface ChatRoomOptions {
   onInviteRequested?: (publicUrl: string | undefined, copy: boolean) => Promise<InviteResult>;
   /** L'hôte demande à voir le diff complet d'une action. */
   onShowDiff?: (entryId: string, toolId: string) => void;
+  /** Règles de la session (lues à chaque question). Absent : aucune validation, pas de limite. */
+  policy?: () => SessionPolicy;
+  /** Une question d'invité attend l'accord de l'hôte. */
+  onReviewRequested?: (pending: PendingReview) => void;
 }
+
+const HOUR_MS = 60 * 60_000;
 
 interface Waiter<T> {
   resolve: (value: T) => void;
@@ -151,6 +168,10 @@ export class ChatRoom implements ConnectionHandler {
   private readonly entries: ChatEntry[] = [];
   private readonly clients = new Map<Connection, ClientState>();
   private readonly queue: QueuedQuestion[] = [];
+  /** Questions d'invités en attente de l'accord de l'hôte. */
+  private readonly awaitingReview: QueuedQuestion[] = [];
+  /** Horodatages des questions d'invités envoyées au modèle (limite horaire). */
+  private readonly guestSent: number[] = [];
   private current: { item: QueuedQuestion; abort: AbortController } | undefined;
   private models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
   private disposed = false;
@@ -266,6 +287,13 @@ export class ChatRoom implements ConnectionHandler {
       case 'showDiff':
         if (state.isHost) {
           this.options.onShowDiff?.(msg.entryId, msg.toolId);
+        }
+        break;
+      case 'reviewQuestion':
+        if (!state.isHost) {
+          fail("Seul l'hôte peut accepter ou refuser une question.");
+        } else if (!this.reviewQuestion(msg.entryId, msg.accept, state.name)) {
+          fail("Cette question n'attend plus de validation.");
         }
         break;
       case 'answer': {
@@ -394,6 +422,45 @@ export class ChatRoom implements ConnectionHandler {
     return true;
   }
 
+  /**
+   * Accepte (envoi au modèle) ou refuse une question d'invité en attente.
+   * Renvoie false si elle n'attend plus.
+   */
+  reviewQuestion(entryId: string, accept: boolean, by: string): boolean {
+    const index = this.awaitingReview.findIndex((q) => q.entryId === entryId);
+    const entry = this.entries.find((e): e is UserEntry => e.kind === 'user' && e.id === entryId);
+    if (index < 0 || !entry) {
+      return false;
+    }
+    const [item] = this.awaitingReview.splice(index, 1);
+    entry.review = accept ? 'approved' : 'rejected';
+    entry.reviewedBy = by;
+    this.broadcast({ type: 'questionReview', entryId, review: entry.review, by });
+    if (accept) {
+      // L'accord explicite de l'hôte l'emporte sur la limite horaire.
+      this.guestSent.push(Date.now());
+      this.queue.push(item);
+      this.broadcastQueue();
+      this.pump();
+    }
+    return true;
+  }
+
+  /** Discussion d'une entrée, si elle existe encore. */
+  conversationOfEntry(entryId: string): string | undefined {
+    return this.entries.find((e) => e.id === entryId)?.conversationId;
+  }
+
+  /** Question d'invité en attente de l'accord de l'hôte (pour l'extension). */
+  awaitingReviewOf(entryId: string): boolean {
+    return this.awaitingReview.some((q) => q.entryId === entryId);
+  }
+
+  /** Diffuse les règles de la session (après un changement de réglage). */
+  broadcastPolicy(): void {
+    this.broadcast({ type: 'policy', policy: this.policy() });
+  }
+
   /** Actions en attente de validation (pour l'extension). */
   pendingApproval(entryId: string, toolId: string): ToolActivity | undefined {
     return this.approvals.get(key(entryId, toolId))?.info.tool;
@@ -453,6 +520,7 @@ export class ChatRoom implements ConnectionHandler {
     this.disposed = true;
     this.current?.abort.abort();
     this.queue.length = 0;
+    this.awaitingReview.length = 0;
     this.entries.length = 0;
     this.conversations.length = 0;
     this.clients.clear();
@@ -480,6 +548,7 @@ export class ChatRoom implements ConnectionHandler {
       participants: this.participantList,
       queue: this.queueState(),
       models: this.models,
+      policy: this.policy(),
     });
     this.broadcastParticipants();
   }
@@ -517,10 +586,19 @@ export class ChatRoom implements ConnectionHandler {
       }
       modelId = rawModelId;
     }
-    const pendingForClient = this.queue.filter((q) => q.clientId === state.clientId).length;
+    const pendingForClient = [...this.queue, ...this.awaitingReview].filter((q) => q.clientId === state.clientId).length;
     if (pendingForClient >= LIMITS.maxPendingPerClient) {
       fail(`Vous avez déjà ${pendingForClient} questions en attente.`);
       return undefined;
+    }
+    const policy = this.policy();
+    const review = !state.isHost && policy.reviewGuestQuestions;
+    if (!state.isHost) {
+      const refusal = this.guestLimitRefusal(policy);
+      if (refusal) {
+        fail(refusal);
+        return undefined;
+      }
     }
 
     const entry: UserEntry = {
@@ -532,6 +610,7 @@ export class ChatRoom implements ConnectionHandler {
       clientId: state.clientId,
       isHost: state.isHost,
       text,
+      ...(review ? { review: 'pending' as const } : {}),
     };
     this.pushEntry(entry);
     if (conv.autoTitle) {
@@ -539,10 +618,50 @@ export class ChatRoom implements ConnectionHandler {
       conv.autoTitle = false;
       this.broadcastConversation(conv);
     }
-    this.queue.push({ entryId: entry.id, conversationId, clientId: state.clientId, author: state.name, text, modelId });
+    const item: QueuedQuestion = { entryId: entry.id, conversationId, clientId: state.clientId, author: state.name, text, modelId };
+    if (review) {
+      this.awaitingReview.push(item);
+      this.options.onReviewRequested?.({
+        entryId: entry.id,
+        conversationId,
+        author: state.name,
+        text,
+        modelName: modelId ? this.models.available.find((m) => m.id === modelId)?.name : undefined,
+      });
+      return entry.id;
+    }
+    if (!state.isHost) {
+      this.guestSent.push(Date.now());
+    }
+    this.queue.push(item);
     this.broadcastQueue();
     this.pump();
     return entry.id;
+  }
+
+  private policy(): SessionPolicy {
+    return this.options.policy?.() ?? { reviewGuestQuestions: false, guestQuestionsPerHour: 0 };
+  }
+
+  /**
+   * Limite horaire des questions d'invités, pour toute la session (un invité peut changer
+   * d'identifiant client). Les questions en attente de l'hôte comptent déjà.
+   */
+  private guestLimitRefusal(policy: SessionPolicy): string | undefined {
+    const limit = Math.floor(policy.guestQuestionsPerHour);
+    if (limit <= 0) {
+      return undefined;
+    }
+    const now = Date.now();
+    removeWhere(this.guestSent, (t) => now - t >= HOUR_MS);
+    if (this.guestSent.length + this.awaitingReview.length < limit) {
+      return undefined;
+    }
+    const minutes = this.guestSent.length ? Math.max(1, Math.ceil((this.guestSent[0] + HOUR_MS - now) / 60_000)) : undefined;
+    return (
+      `L'hôte a limité les questions des invités à ${limit} par heure pour la session.` +
+      (minutes ? ` Prochaine question possible dans ${minutes} min.` : " Attendez que l'hôte traite les questions en attente.")
+    );
   }
 
   private addSystemMessage(nearEntryId: string, text: string): void {
@@ -580,6 +699,7 @@ export class ChatRoom implements ConnectionHandler {
     this.conversations.splice(index, 1);
     removeWhere(this.entries, (e) => e.conversationId === id);
     removeWhere(this.queue, (q) => q.conversationId === id);
+    removeWhere(this.awaitingReview, (q) => q.conversationId === id);
     if (this.current?.item.conversationId === id) {
       this.current.abort.abort();
     }
@@ -856,6 +976,8 @@ function parseClientMessage(data: string): ClientMessage | undefined {
         : undefined;
     case 'showDiff':
       return str(m.entryId) && str(m.toolId) ? { type: 'showDiff', entryId: m.entryId, toolId: m.toolId } : undefined;
+    case 'reviewQuestion':
+      return str(m.entryId) && typeof m.accept === 'boolean' ? { type: 'reviewQuestion', entryId: m.entryId, accept: m.accept } : undefined;
     case 'answer':
       return str(m.entryId) && str(m.toolId) && str(m.text)
         ? { type: 'answer', entryId: m.entryId, toolId: m.toolId, text: m.text }

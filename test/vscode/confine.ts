@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import type { SharedCopilotApi } from '../../src/extension';
+import type { PromptShareApi } from '../../src/extension';
 
 const OUT = process.env.SCC_TEST_OUT!;
 const OUTSIDE = process.env.SCC_TEST_OUTSIDE!;
@@ -19,7 +19,7 @@ function ok(message: string): void {
   fs.writeFileSync(OUT, log.join('\n'));
 }
 
-async function refused(api: SharedCopilotApi, name: string, input: object, expected: RegExp, label: string): Promise<void> {
+async function refused(api: PromptShareApi, name: string, input: object, expected: RegExp, label: string): Promise<void> {
   try {
     const result = await (await api.tools.prepare(name, input)).execute(ac.signal);
     throw new Error(`${label} : pas refusé -> ${result.result.slice(0, 80)}`);
@@ -34,7 +34,7 @@ async function refused(api: SharedCopilotApi, name: string, input: object, expec
 
 export async function run(): Promise<void> {
   try {
-    const api = (await vscode.extensions.getExtension('neo-schobert.shared-copilot-chat')!.activate()) as SharedCopilotApi;
+    const api = (await vscode.extensions.getExtension('neo-schobert.prompt-share')!.activate()) as PromptShareApi;
     await api.sandboxReady;
     const sandbox = api.tools.sandboxDescription();
     const wslMode = !!process.env.SCC_TEST_FAKE_WSL;
@@ -127,9 +127,9 @@ export async function run(): Promise<void> {
     if (fs.existsSync(marker)) throw new Error("un sous-processus a survécu à l'arrêt");
     ok(`arrêt d'une commande hors bac à sable : processus et sous-processus arrêtés (${stopped.summary})`);
     // Démarrage complet d'une session (préparation de l'environnement comprise), puis arrêt.
-    await vscode.commands.executeCommand('sharedCopilotChat.startSession');
+    await vscode.commands.executeCommand('promptShare.startSession');
     if (!api.nativeChatActive()) throw new Error("la session n'a pas démarré");
-    await vscode.commands.executeCommand('sharedCopilotChat.stopSession');
+    await vscode.commands.executeCommand('promptShare.stopSession');
     if (api.nativeChatActive()) throw new Error("la session ne s'est pas arrêtée");
     ok('Start Session / Stop Session : préparation de l’environnement puis démarrage et arrêt');
     log.push('RESULT: PASS');

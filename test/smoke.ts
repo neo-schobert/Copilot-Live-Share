@@ -5,8 +5,8 @@
 import * as assert from 'assert/strict';
 import * as http from 'http';
 import { WebSocket } from 'ws';
-import { ChatRoom, ModelBackend, ModelEvent, ModelRequest, ModelTurn } from '../src/chatRoom';
-import { CLOSE_CODES, ServerMessage } from '../src/protocol';
+import { ChatRoom, ModelBackend, ModelEvent, ModelRequest, ModelTurn, PendingReview } from '../src/chatRoom';
+import { CLOSE_CODES, ServerMessage, SessionPolicy } from '../src/protocol';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -158,8 +158,12 @@ function wsRejected(path: string): Promise<number> {
 
 async function main() {
   const backend = new FakeBackend();
+  const policy: SessionPolicy = { reviewGuestQuestions: false, guestQuestionsPerHour: 0 };
+  const reviews: PendingReview[] = [];
   const room = new ChatRoom(backend, {
     historyLength: () => 20,
+    policy: () => policy,
+    onReviewRequested: (pending) => reviews.push(pending),
     onInviteRequested: async (publicUrl, copy) => ({
       publicUrl: publicUrl ?? '',
       localUrl: `http://127.0.0.1:${PORT}`,
@@ -473,6 +477,66 @@ async function main() {
   assert.equal(welcome.you.clientId, 'bob-client-id');
   assert.ok(welcome.history.length >= 6);
   ok('Reconnexion : même identité et historique complet');
+
+  // 11 bis. Questions des invités soumises à l'hôte avant l'envoi au modèle
+  policy.reviewGuestQuestions = true;
+  policy.guestQuestionsPerHour = 1000;
+  await waitIdle();
+  const askAndGet = async (who: Client, text: string) => {
+    who.ask(text);
+    const m = await host.waitFor((x) => x.type === 'entry' && x.entry.kind === 'user' && x.entry.text === text);
+    return m.type === 'entry' && m.entry.kind === 'user' ? m.entry : assert.fail('entrée attendue');
+  };
+  const calls = backend.calls.length;
+  const toReview = await askAndGet(alice, 'Question à valider');
+  assert.equal(toReview.review, 'pending');
+  assert.deepEqual(
+    reviews.map((r) => [r.entryId, r.author, r.text]),
+    [[toReview.id, 'alice', 'Question à valider']],
+    "l'extension est prévenue pour notifier l'hôte",
+  );
+  await sleep(100);
+  assert.equal(backend.calls.length, calls, "rien n'est envoyé au modèle avant l'accord");
+  bob2.send({ type: 'reviewQuestion', entryId: toReview.id, accept: true });
+  await bob2.waitFor((m) => m.type === 'error' && m.message.includes("Seul l'hôte"));
+  alice.send({ type: 'reviewQuestion', entryId: toReview.id, accept: true });
+  await alice.waitFor((m) => m.type === 'error' && m.message.includes("Seul l'hôte"));
+  host.send({ type: 'reviewQuestion', entryId: toReview.id, accept: true });
+  await alice.waitFor((m) => m.type === 'questionReview' && m.entryId === toReview.id && m.review === 'approved' && m.by === 'hote');
+  await alice.waitFor((m) => m.type === 'entry' && m.entry.kind === 'assistant' && m.entry.replyTo === toReview.id);
+  await waitIdle();
+  assert.equal(backend.calls.length, calls + 1);
+
+  const refused = await askAndGet(alice, 'Question refusée');
+  assert.ok(room.awaitingReviewOf(refused.id));
+  assert.ok(room.reviewQuestion(refused.id, false, 'hote'));
+  await alice.waitFor((m) => m.type === 'questionReview' && m.entryId === refused.id && m.review === 'rejected');
+  assert.ok(!room.reviewQuestion(refused.id, true, 'hote'), 'une décision ne se prend qu’une fois');
+  await sleep(100);
+  assert.equal(backend.calls.length, calls + 1, 'question refusée : jamais envoyée au modèle');
+  assert.ok(!room.entriesOf(refused.conversationId).some((e) => e.kind === 'assistant' && e.replyTo === refused.id));
+
+  const own = await askAndGet(host, "Question de l'hôte");
+  assert.equal(own.review, undefined, "les questions de l'hôte partent directement");
+  await waitIdle();
+  assert.equal(backend.calls.length, calls + 2);
+  const welcomeAgain = (await Client.join('carol')).messages.find((m) => m.type === 'welcome');
+  assert.ok(welcomeAgain?.type === 'welcome' && welcomeAgain.policy.reviewGuestQuestions, 'règles transmises aux arrivants');
+  ok("Questions d'invités : envoyées au modèle seulement après l'accord de l'hôte, refus définitif, hôte non concerné");
+
+  // 11 ter. Limite horaire des questions d'invités (pour toute la session)
+  policy.guestQuestionsPerHour = 1;
+  alice.ask('Une de trop');
+  await alice.waitFor((m) => m.type === 'error' && m.message.includes('limité les questions des invités à 1 par heure') && m.message.includes('min'));
+  assert.ok(!host.messages.some((m) => m.type === 'entry' && m.entry.kind === 'user' && m.entry.text === 'Une de trop'));
+  policy.reviewGuestQuestions = false;
+  bob2.ask('Sans validation mais limitée');
+  await bob2.waitFor((m) => m.type === 'error' && m.message.includes('limité'));
+  await askAndGet(host, "L'hôte n'est pas limité");
+  await waitIdle();
+  assert.equal(backend.calls.length, calls + 3);
+  policy.guestQuestionsPerHour = 0;
+  ok("Limite horaire : questions d'invités refusées au-delà, avec le délai d'attente ; l'hôte n'est pas limité");
 
   // 12. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Shared Copilot</title>
+  <title>Prompt Share</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="codicon.css?token=__TOKEN__">
   <link rel="stylesheet" href="style.css?token=__TOKEN__">
@@ -12,9 +12,9 @@
 <body>
   <section id="home" class="join" hidden>
     <div class="join-card">
-      <div class="join-logo"><i class="codicon codicon-copilot"></i></div>
-      <h1>Shared Copilot</h1>
-      <p>Un chat Copilot partagé : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte.</p>
+      <div class="join-logo"><i class="codicon codicon-comment-discussion"></i></div>
+      <h1>Prompt Share</h1>
+      <p>Un chat IA à plusieurs : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte avec ses modèles GitHub Copilot.</p>
       <label for="home-name">Votre pseudo</label>
       <input id="home-name" maxlength="32" autocomplete="nickname" placeholder="ex. Camille">
       <button id="home-host" type="button" class="primary"><i class="codicon codicon-broadcast"></i>Héberger une session</button>
@@ -29,9 +29,9 @@
 
   <section id="join" class="join">
     <form id="join-form" class="join-card" autocomplete="off">
-      <div class="join-logo"><i class="codicon codicon-copilot"></i></div>
-      <h1>Shared Copilot</h1>
-      <p>Un chat Copilot partagé : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte.</p>
+      <div class="join-logo"><i class="codicon codicon-comment-discussion"></i></div>
+      <h1>Prompt Share</h1>
+      <p>Un chat IA à plusieurs : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte avec ses modèles GitHub Copilot.</p>
       <label for="name-input">Votre pseudo</label>
       <input id="name-input" name="name" maxlength="32" required autofocus autocomplete="nickname" placeholder="ex. Camille">
       <button type="submit" class="primary">Rejoindre la session</button>
@@ -102,9 +102,9 @@
         </div>
         <div id="presence" class="presence" aria-live="polite"></div>
         <form id="ask-form" class="input-box">
-          <textarea id="ask-input" rows="1" maxlength="8000" placeholder="Demandez à Copilot… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
+          <textarea id="ask-input" rows="1" maxlength="8000" placeholder="Posez votre question… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
           <div class="input-toolbar">
-            <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation"><i class="codicon codicon-copilot"></i><span class="mode-label">Agent</span></span>
+            <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation"><i class="codicon codicon-tools"></i><span class="mode-label">Agent</span></span>
             <label class="model-picker" title="Modèle utilisé pour vos questions">
               <select id="model-select" aria-label="Modèle"></select>
               <i class="codicon codicon-chevron-down"></i>
@@ -114,6 +114,7 @@
             <button id="ask-send" class="icon-btn send" type="submit" title="Envoyer (Entrée)"><i class="codicon codicon-send"></i></button>
           </div>
         </form>
+        <p id="policy-note" class="policy-note" hidden></p>
       </footer>
     </div>
   </div>

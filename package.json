@@ -1,7 +1,7 @@
 {
-  "name": "shared-copilot-chat",
-  "displayName": "Shared Copilot Chat",
-  "description": "Un chat Copilot à plusieurs dans VS Code : héberger ou rejoindre une session, agent confiné au projet de l'hôte avec validation des actions.",
+  "name": "prompt-share",
+  "displayName": "Prompt Share",
+  "description": "Chat IA à plusieurs dans VS Code, avec les modèles GitHub Copilot de l'hôte : héberger ou rejoindre une session, agent confiné au projet, l'hôte garde la main. Projet indépendant, non affilié à GitHub ni à Microsoft.",
   "version": "0.1.0",
   "publisher": "neo-schobert",
   "license": "MIT",
@@ -20,161 +20,182 @@
   "contributes": {
     "commands": [
       {
-        "command": "sharedCopilotChat.host",
+        "command": "promptShare.host",
         "title": "Host a Session",
-        "category": "Shared Copilot",
+        "category": "Prompt Share",
         "icon": "$(broadcast)"
       },
       {
-        "command": "sharedCopilotChat.join",
+        "command": "promptShare.join",
         "title": "Join a Session",
-        "category": "Shared Copilot",
+        "category": "Prompt Share",
         "icon": "$(plug)"
       },
       {
-        "command": "sharedCopilotChat.leave",
+        "command": "promptShare.leave",
         "title": "Leave Session",
-        "category": "Shared Copilot",
+        "category": "Prompt Share",
         "icon": "$(sign-out)"
       },
       {
-        "command": "sharedCopilotChat.startSession",
+        "command": "promptShare.startSession",
         "title": "Start Session",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.copyInviteLink",
+        "command": "promptShare.copyInviteLink",
         "title": "Copy Invite Link",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.openChat",
+        "command": "promptShare.openChat",
         "title": "Open Chat",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.shareSelection",
+        "command": "promptShare.shareSelection",
         "title": "Share Selection",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.cancelResponse",
+        "command": "promptShare.cancelResponse",
         "title": "Cancel Current Response",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.stopSession",
+        "command": "promptShare.stopSession",
         "title": "Stop Session",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.selectModel",
+        "command": "promptShare.selectModel",
         "title": "Select Default Model",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.resolveApproval",
+        "command": "promptShare.resolveApproval",
         "title": "Resolve Approval",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.showDiff",
+        "command": "promptShare.showDiff",
         "title": "Show Proposed Diff",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
       },
       {
-        "command": "sharedCopilotChat.answerQuestion",
+        "command": "promptShare.answerQuestion",
         "title": "Answer Agent Question",
-        "category": "Shared Copilot"
+        "category": "Prompt Share"
+      },
+      {
+        "command": "promptShare.reviewQuestion",
+        "title": "Review Guest Question",
+        "category": "Prompt Share"
       }
     ],
     "menus": {
       "commandPalette": [
         {
-          "command": "sharedCopilotChat.copyInviteLink",
-          "when": "sharedCopilotChat.active"
+          "command": "promptShare.copyInviteLink",
+          "when": "promptShare.active"
         },
         {
-          "command": "sharedCopilotChat.shareSelection",
-          "when": "sharedCopilotChat.active"
+          "command": "promptShare.shareSelection",
+          "when": "promptShare.active"
         },
         {
-          "command": "sharedCopilotChat.cancelResponse",
-          "when": "sharedCopilotChat.active"
+          "command": "promptShare.cancelResponse",
+          "when": "promptShare.active"
         },
         {
-          "command": "sharedCopilotChat.stopSession",
-          "when": "sharedCopilotChat.active"
+          "command": "promptShare.stopSession",
+          "when": "promptShare.active"
         },
         {
-          "command": "sharedCopilotChat.resolveApproval",
+          "command": "promptShare.resolveApproval",
           "when": "false"
         },
         {
-          "command": "sharedCopilotChat.showDiff",
+          "command": "promptShare.showDiff",
           "when": "false"
         },
         {
-          "command": "sharedCopilotChat.answerQuestion",
+          "command": "promptShare.answerQuestion",
           "when": "false"
         },
         {
-          "command": "sharedCopilotChat.startSession",
+          "command": "promptShare.reviewQuestion",
           "when": "false"
         },
         {
-          "command": "sharedCopilotChat.leave",
-          "when": "sharedCopilotChat.connected"
+          "command": "promptShare.startSession",
+          "when": "false"
+        },
+        {
+          "command": "promptShare.leave",
+          "when": "promptShare.connected"
         }
       ],
       "editor/context": [
         {
-          "command": "sharedCopilotChat.shareSelection",
-          "when": "sharedCopilotChat.active",
-          "group": "9_sharedCopilot"
+          "command": "promptShare.shareSelection",
+          "when": "promptShare.active",
+          "group": "9_promptShare"
         }
       ],
       "view/title": [
         {
-          "command": "sharedCopilotChat.leave",
-          "when": "view == sharedCopilotChat.view && sharedCopilotChat.connected",
+          "command": "promptShare.leave",
+          "when": "view == promptShare.view && promptShare.connected",
           "group": "navigation"
         }
       ]
     },
     "configuration": {
-      "title": "Shared Copilot Chat",
+      "title": "Prompt Share",
       "properties": {
-        "sharedCopilotChat.port": {
+        "promptShare.port": {
           "type": "integer",
           "default": 3717,
           "minimum": 1,
           "maximum": 65535,
           "description": "Port local (127.0.0.1) du serveur de chat partagé."
         },
-        "sharedCopilotChat.modelFamily": {
+        "promptShare.modelFamily": {
           "type": "string",
           "default": "",
-          "description": "Famille du modèle Copilot utilisé par défaut (ex. « gpt-4o », « claude-sonnet-4 »). Vide : premier modèle Copilot disponible. Modifiable avec « Shared Copilot: Select Default Model »."
+          "description": "Famille du modèle Copilot utilisé par défaut (ex. « gpt-4o », « claude-sonnet-4 »). Vide : premier modèle Copilot disponible. Modifiable avec « Prompt Share: Select Default Model »."
         },
-        "sharedCopilotChat.allowGuestModelChoice": {
+        "promptShare.reviewGuestQuestions": {
           "type": "boolean",
           "default": true,
-          "description": "Autorise les invités à choisir un autre modèle pour leurs questions. Toutes les requêtes utilisent le quota Copilot de l'hôte, y compris les modèles premium."
+          "description": "Chaque question d'un invité attend votre accord avant d'être envoyée au modèle (notification dans VS Code et boutons dans le chat). Les questions des invités utilisent votre compte GitHub Copilot."
         },
-        "sharedCopilotChat.historyLength": {
+        "promptShare.guestQuestionsPerHour": {
+          "type": "integer",
+          "default": 60,
+          "minimum": 0,
+          "maximum": 1000,
+          "description": "Nombre maximal de questions d'invités envoyées au modèle par heure, pour toute la session (0 : pas de limite). Une question que vous acceptez explicitement passe même au-delà."
+        },
+        "promptShare.allowGuestModelChoice": {
+          "type": "boolean",
+          "default": false,
+          "description": "Autorise les invités à choisir un autre modèle que le modèle par défaut. Toutes les requêtes utilisent votre quota Copilot, y compris les modèles premium."
+        },
+        "promptShare.historyLength": {
           "type": "integer",
           "default": 20,
           "minimum": 0,
           "maximum": 200,
           "description": "Nombre d'échanges précédents envoyés au modèle avec chaque question."
         },
-        "sharedCopilotChat.hostName": {
+        "promptShare.hostName": {
           "type": "string",
           "default": "",
           "description": "Votre pseudo dans les sessions, que vous hébergiez ou rejoigniez (vide : nom d'utilisateur système)."
         },
-        "sharedCopilotChat.agentMode": {
+        "promptShare.agentMode": {
           "type": "string",
           "enum": [
             "full",
@@ -189,12 +210,12 @@
           "default": "full",
           "description": "Accès du modèle à l'espace de travail de l'hôte. Dans un espace de travail non approuvé, l'accès est limité à la lecture."
         },
-        "sharedCopilotChat.nativeChat": {
+        "promptShare.nativeChat": {
           "type": "boolean",
           "default": true,
-          "description": "Affiche les discussions de la session dans le panneau Chat natif de VS Code (API proposée : nécessite F5 ou --enable-proposed-api local.shared-copilot-chat)."
+          "description": "Affiche les discussions de la session dans le panneau Chat natif de VS Code (API proposée : nécessite F5 ou --enable-proposed-api local.prompt-share)."
         },
-        "sharedCopilotChat.protectedFiles": {
+        "promptShare.protectedFiles": {
           "type": "array",
           "items": {
             "type": "string"
@@ -202,7 +223,7 @@
           "default": [],
           "description": "Motifs glob supplémentaires de fichiers invisibles pour l'agent (s'ajoutent à la liste par défaut : .git, .env, clés, .npmrc, .ssh…)."
         },
-        "sharedCopilotChat.sandboxReadOnlyPaths": {
+        "promptShare.sandboxReadOnlyPaths": {
           "type": "array",
           "items": {
             "type": "string"
@@ -210,17 +231,17 @@
           "default": [],
           "description": "Dossiers Linux supplémentaires visibles en lecture seule dans le bac à sable des commandes (ex. une chaîne d'outils installée hors de /usr ; sous WSL, chemins de la distribution). Les dossiers du PATH y sont déjà."
         },
-        "sharedCopilotChat.wslSandbox": {
+        "promptShare.wslSandbox": {
           "type": "boolean",
           "default": true,
           "description": "Sous Windows : isole les commandes de l'agent dans WSL avec bubblewrap (comme sous Linux) si WSL 2 et bubblewrap sont disponibles. Sinon, chaque commande doit être validée par l'hôte."
         },
-        "sharedCopilotChat.wslDistro": {
+        "promptShare.wslDistro": {
           "type": "string",
           "default": "",
           "description": "Distribution WSL utilisée pour le bac à sable (vide : distribution par défaut)."
         },
-        "sharedCopilotChat.wslMode": {
+        "promptShare.wslMode": {
           "type": "string",
           "enum": [
             "ask",
@@ -241,27 +262,27 @@
     },
     "chatSessions": [
       {
-        "type": "shared-copilot",
+        "type": "prompt-share",
         "name": "shared",
-        "displayName": "Shared Copilot",
-        "description": "Discussions de la session Shared Copilot partagée avec les invités",
-        "when": "sharedCopilotChat.active"
+        "displayName": "Prompt Share",
+        "description": "Discussions de la session Prompt Share partagée avec les invités",
+        "when": "promptShare.active"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "sharedCopilot",
-          "title": "Shared Copilot",
+          "id": "promptShare",
+          "title": "Prompt Share",
           "icon": "media/icon.svg"
         }
       ]
     },
     "views": {
-      "sharedCopilot": [
+      "promptShare": [
         {
           "type": "webview",
-          "id": "sharedCopilotChat.view",
+          "id": "promptShare.view",
           "name": "Chat",
           "icon": "media/icon.svg"
         }
@@ -306,18 +327,17 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/neo-schobert/Copilot-Live-Share.git"
+    "url": "https://github.com/neo-schobert/Prompt-Share.git"
   },
   "bugs": {
-    "url": "https://github.com/neo-schobert/Copilot-Live-Share/issues"
+    "url": "https://github.com/neo-schobert/Prompt-Share/issues"
   },
-  "homepage": "https://github.com/neo-schobert/Copilot-Live-Share#readme",
+  "homepage": "https://github.com/neo-schobert/Prompt-Share#readme",
   "keywords": [
     "copilot",
     "chat",
     "collaboration",
     "pair programming",
-    "live share",
     "agent"
   ]
 }

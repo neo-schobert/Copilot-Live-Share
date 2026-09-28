@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import type { ChatRoom } from './chatRoom';
-import type { AssistantEntry, ChatEntry, Conversation, QueueState, ServerMessage, ToolActivity } from './protocol';
+import type { AssistantEntry, ChatEntry, Conversation, QueueState, ServerMessage, ToolActivity, UserEntry } from './protocol';
 
 /**
  * Affiche les discussions de la session dans le panneau Chat natif de VS Code
@@ -8,8 +8,8 @@ import type { AssistantEntry, ChatEntry, Conversation, QueueState, ServerMessage
  * poser des questions ; les réponses sont les mêmes que sur la page web.
  */
 
-export const SESSION_TYPE = 'shared-copilot';
-const PARTICIPANT_ID = 'sharedCopilotChat.session';
+export const SESSION_TYPE = 'prompt-share';
+const PARTICIPANT_ID = 'promptShare.session';
 
 export class NativeChatBridge implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
@@ -17,6 +17,20 @@ export class NativeChatBridge implements vscode.Disposable {
   private queue: QueueState = { current: null, pending: [] };
   private refreshTimer: NodeJS.Timeout | undefined;
   private readonly unsubscribe: () => void;
+  /**
+   * Onglets d'éditeur affichant une discussion. VS Code charge le contenu d'une session une
+   * seule fois et l'API ne permet pas d'y ajouter des tours : pour montrer en direct l'activité
+   * des invités, on rouvre l'onglet. L'onglet de chat n'expose pas sa ressource ; on l'associe
+   * à la discussion à son ouverture, par son titre.
+   */
+  private readonly tabs = new Map<vscode.Tab, string>();
+  /** Discussions dont le contenu vient d'être fourni, en attente de leur onglet. */
+  private pendingTabs: { conversationId: string; title: string; at: number }[] = [];
+  /** Discussions dont l'onglet affiche un contenu dépassé (rouvert dès qu'il est visible). */
+  private readonly stale = new Set<string>();
+  /** Questions posées depuis le chat natif et suivies par leur propre requête. */
+  private readonly ownedQuestions = new Set<string>();
+  private askingFrom: string | undefined;
 
   /** Renvoie undefined si l'API proposée n'est pas disponible (extension installée sans --enable-proposed-api). */
   static tryCreate(room: ChatRoom, hostName: () => string, log: (message: string) => void): NativeChatBridge | undefined {
@@ -57,6 +71,7 @@ export class NativeChatBridge implements vscode.Disposable {
     );
 
     this.unsubscribe = room.subscribe((msg) => this.onRoomMessage(msg));
+    this.disposables.push(vscode.window.tabGroups.onDidChangeTabs((e) => this.onTabsChanged(e)));
     this.refresh();
   }
 
@@ -72,6 +87,10 @@ export class NativeChatBridge implements vscode.Disposable {
   // ---- Liste des sessions ----
 
   private onRoomMessage(msg: ServerMessage): void {
+    const active = this.conversationActivity(msg);
+    if (active) {
+      this.markStale(active);
+    }
     if (msg.type === 'queue') {
       this.queue = msg.queue;
     }
@@ -80,6 +99,95 @@ export class NativeChatBridge implements vscode.Disposable {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = setTimeout(() => this.refresh(), 150);
     }
+  }
+
+  // ---- Mise à jour des onglets ouverts ----
+
+  /** Activité d'un autre participant dans une discussion : son onglet doit être rechargé. */
+  private conversationActivity(msg: ServerMessage): string | undefined {
+    if (msg.type === 'conversationDeleted') {
+      return msg.conversationId;
+    }
+    if (msg.type === 'questionReview') {
+      return this.room.conversationOfEntry(msg.entryId);
+    }
+    if (msg.type !== 'entry' || msg.entry.conversationId === this.askingFrom) {
+      return undefined;
+    }
+    const e = msg.entry;
+    if (e.kind === 'user' || e.kind === 'context' || (e.kind === 'assistant' && !this.ownedQuestions.has(e.replyTo))) {
+      return e.conversationId;
+    }
+    return undefined;
+  }
+
+  private onTabsChanged(e: vscode.TabChangeEvent): void {
+    for (const tab of e.closed) {
+      this.tabs.delete(tab);
+    }
+    // Le titre d'un onglet de chat peut n'arriver qu'après son ouverture.
+    this.matchTabs([...e.opened, ...e.changed]);
+    for (const tab of e.changed) {
+      const conversationId = this.tabs.get(tab);
+      if (conversationId && tab.isActive && this.stale.has(conversationId)) {
+        void this.reload(conversationId);
+      }
+    }
+  }
+
+  /** Associe les onglets de chat récemment ouverts aux discussions dont le contenu vient d'être fourni. */
+  private matchTabs(candidates: readonly vscode.Tab[]): void {
+    const now = Date.now();
+    this.pendingTabs = this.pendingTabs.filter((p) => now - p.at < 10_000);
+    for (const tab of candidates) {
+      if (!isChatTab(tab) || this.tabs.has(tab)) {
+        continue;
+      }
+      const i = this.pendingTabs.findIndex((p) => p.title === tab.label);
+      if (i >= 0) {
+        this.tabs.set(tab, this.pendingTabs[i].conversationId);
+        this.pendingTabs.splice(i, 1);
+      }
+    }
+  }
+
+  private markStale(conversationId: string): void {
+    for (const [tab, id] of this.tabs) {
+      if (id === conversationId) {
+        this.stale.add(conversationId);
+        if (tab.isActive) {
+          void this.reload(conversationId);
+        }
+      }
+    }
+  }
+
+  /** Rouvre l'onglet d'une discussion à la même place, sauf si l'hôte y attend une réponse. */
+  private async reload(conversationId: string): Promise<void> {
+    const entry = [...this.tabs].find(([, id]) => id === conversationId);
+    if (!entry || this.hasOwnedRequest(conversationId)) {
+      return;
+    }
+    const [tab] = entry;
+    this.stale.delete(conversationId);
+    this.tabs.delete(tab);
+    const group = tab.group;
+    const focused = group.isActive;
+    await vscode.window.tabGroups.close(tab, true);
+    if (this.room.getConversation(conversationId)) {
+      await vscode.commands.executeCommand('vscode.open', resourceFor(conversationId), {
+        viewColumn: group.viewColumn,
+        preserveFocus: !focused,
+        preview: false,
+      });
+    }
+  }
+
+  private hasOwnedRequest(conversationId: string): boolean {
+    return [...this.ownedQuestions].some((q) => {
+      const answer = this.room.answerTo(q);
+      return this.room.entriesOf(conversationId).some((e) => e.id === q) && (!answer || answer.status === 'streaming');
+    });
   }
 
   private refresh(): void {
@@ -115,6 +223,11 @@ export class NativeChatBridge implements vscode.Disposable {
       };
     }
 
+    this.pendingTabs.push({ conversationId, title: conv.title, at: Date.now() });
+    // L'onglet peut déjà exister (réouverture) ou apparaître juste après.
+    this.matchTabs(vscode.window.tabGroups.all.flatMap((g) => g.tabs));
+    this.stale.delete(conversationId);
+
     const entries = this.room.entriesOf(conversationId);
     const answers = new Map<string, AssistantEntry>();
     for (const e of entries) {
@@ -134,7 +247,7 @@ export class NativeChatBridge implements vscode.Disposable {
       } else if (e.kind === 'user' && e.id !== streamingQuestion) {
         pushQuestion(e);
         const answer = answers.get(e.id);
-        history.push(responseTurn(answer ? renderAnswer(answer) : "_En attente dans la file d'attente…_"));
+        history.push(answer ? responseTurn(renderAnswer(answer)) : pendingTurn(e));
       }
     }
 
@@ -184,12 +297,24 @@ export class NativeChatBridge implements vscode.Disposable {
     }
     const modelId = request.model?.vendor === 'copilot' ? request.model.id : undefined;
     let questionId: string;
+    this.askingFrom = conversationId;
     try {
       questionId = this.room.askAsHost(conversationId, request.prompt, this.hostName(), modelId);
     } catch (err) {
       return { errorDetails: { message: err instanceof Error ? err.message : String(err) } };
+    } finally {
+      this.askingFrom = undefined;
     }
-    return this.followAnswer(questionId, stream, token, true);
+    this.ownedQuestions.add(questionId);
+    try {
+      return await this.followAnswer(questionId, stream, token, true);
+    } finally {
+      this.ownedQuestions.delete(questionId);
+      // Activité des invités pendant la réponse : l'onglet est rechargé maintenant.
+      if (this.stale.has(conversationId)) {
+        setTimeout(() => this.markStale(conversationId), 500);
+      }
+    }
   }
 
   /**
@@ -231,21 +356,21 @@ export class NativeChatBridge implements vscode.Disposable {
           const scope = tool.approval.hostOnly ? ' — hors du projet' : '';
           stream.markdown(`\n\n**${tool.title}**${scope}\n\n\`\`\`diff\n${tool.approval.preview}\n\`\`\`\n`);
           const args = (decision: string) => [answerId, tool.id, decision];
-          stream.button({ command: 'sharedCopilotChat.resolveApproval', title: 'Autoriser', arguments: args('once') });
+          stream.button({ command: 'promptShare.resolveApproval', title: 'Autoriser', arguments: args('once') });
           if (!tool.approval.hostOnly) {
-            stream.button({ command: 'sharedCopilotChat.resolveApproval', title: 'Autoriser pour la session', arguments: args('session') });
+            stream.button({ command: 'promptShare.resolveApproval', title: 'Autoriser pour la session', arguments: args('session') });
           }
           if (tool.approval.canShowDiff) {
-            stream.button({ command: 'sharedCopilotChat.showDiff', title: 'Voir les modifications', arguments: [tool.id] });
+            stream.button({ command: 'promptShare.showDiff', title: 'Voir les modifications', arguments: [tool.id] });
           }
-          stream.button({ command: 'sharedCopilotChat.resolveApproval', title: 'Refuser', arguments: args('deny') });
+          stream.button({ command: 'promptShare.resolveApproval', title: 'Refuser', arguments: args('deny') });
         } else if (tool.status === 'awaitingAnswer' && tool.question && answerId && once('question')) {
           stream.markdown(`\n\n❓ **${tool.question.text}**\n\n`);
           // Tout participant peut répondre, l'hôte aussi depuis le chat natif.
           for (const option of tool.question.options) {
-            stream.button({ command: 'sharedCopilotChat.answerQuestion', title: option, arguments: [answerId, tool.id, option] });
+            stream.button({ command: 'promptShare.answerQuestion', title: option, arguments: [answerId, tool.id, option] });
           }
-          stream.button({ command: 'sharedCopilotChat.answerQuestion', title: 'Répondre…', arguments: [answerId, tool.id] });
+          stream.button({ command: 'promptShare.answerQuestion', title: 'Répondre…', arguments: [answerId, tool.id] });
         } else if ((tool.status === 'done' || tool.status === 'rejected' || tool.status === 'error') && once('end')) {
           stream.markdown(`\n\n${toolLine(tool)}\n\n`);
         }
@@ -322,6 +447,12 @@ export class NativeChatBridge implements vscode.Disposable {
   }
 }
 
+/** Onglet du chat natif (TabInputChat existe à l'exécution mais pas dans les types stables). */
+function isChatTab(tab: vscode.Tab): boolean {
+  const TabInputChat = (vscode as unknown as { TabInputChat?: new () => unknown }).TabInputChat;
+  return TabInputChat ? tab.input instanceof TabInputChat : false;
+}
+
 function resourceFor(conversationId: string): vscode.Uri {
   return vscode.Uri.from({ scheme: SESSION_TYPE, path: `/${conversationId}` });
 }
@@ -336,6 +467,27 @@ function requestTurn(prompt: string): vscode.ChatRequestTurn {
 
 function responseTurn(markdown: string): vscode.ChatResponseTurn2 {
   return new vscode.ChatResponseTurn2([new vscode.ChatResponseMarkdownPart(markdown)], {}, SESSION_TYPE);
+}
+
+/** Question sans réponse : en attente de l'hôte (avec ses boutons), refusée, ou dans la file. */
+function pendingTurn(question: UserEntry): vscode.ChatResponseTurn2 {
+  if (question.review === 'rejected') {
+    return responseTurn(`_Non envoyée au modèle : refusée par ${question.reviewedBy ?? "l'hôte"}._`);
+  }
+  if (question.review !== 'pending') {
+    return responseTurn("_En attente dans la file d'attente…_");
+  }
+  const decide = (title: string, accept: boolean) =>
+    new vscode.ChatResponseCommandButtonPart({ command: 'promptShare.reviewQuestion', title, arguments: [question.id, accept] });
+  return new vscode.ChatResponseTurn2(
+    [
+      new vscode.ChatResponseMarkdownPart(`_Question de ${question.author} : l'envoyer au modèle avec votre compte ?_`),
+      decide('Envoyer au modèle', true),
+      decide('Refuser', false),
+    ],
+    {},
+    SESSION_TYPE,
+  );
 }
 
 function renderAnswer(answer: AssistantEntry): string {

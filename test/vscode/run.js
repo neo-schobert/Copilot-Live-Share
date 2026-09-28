@@ -20,6 +20,9 @@ fs.writeFileSync(path.join(ws, 'src', 'a.ts'), 'export const a = 1; // hello\n')
 fs.writeFileSync(path.join(ws, '.env'), 'API_KEY=SECRET123\n');
 fs.writeFileSync(path.join(ws, '.git', 'config'), '[remote]\nurl=https://token@github.com/x\n');
 fs.writeFileSync(path.join(tmp, 'outside.txt'), 'hors du projet\n');
+// Sous Windows, « Start Session » demanderait de rouvrir le projet dans WSL (fenêtre modale).
+fs.mkdirSync(path.join(ws, '.vscode'));
+fs.writeFileSync(path.join(ws, '.vscode', 'settings.json'), '{ "promptShare.wslMode": "off" }\n');
 // Liens symboliques : sous Windows, leur création peut exiger des droits (mode développeur) ; le test s'adapte.
 const systemDir = process.platform === 'win32' ? process.env.SystemRoot ?? 'C:\\Windows' : '/etc';
 for (const [target, name] of [
@@ -36,6 +39,11 @@ for (const [target, name] of [
 
 // --wsl : simule Windows + WSL avec un faux wsl.exe qui exécute ses arguments sous Linux.
 const env = { ...process.env };
+if (process.argv.includes('--wsl') && process.platform === 'win32') {
+  // Sous Windows, le premier passage utilise déjà le vrai wsl.exe ; le faux est un script sh.
+  console.log('Mode WSL simulé ignoré sous Windows (le vrai WSL est testé par le premier passage).');
+  process.exit(0);
+}
 if (process.argv.includes('--wsl')) {
   const fake = path.join(tmp, 'fake-wsl.sh');
   fs.writeFileSync(fake, '#!/bin/sh\n[ "$1" = "-d" ] && shift 2\n[ "$1" = "-u" ] && shift 2\n[ "$1" = "-e" ] && shift\nexec "$@"\n', { mode: 0o755 });
@@ -79,7 +87,7 @@ function launch(name, { workspace, devPath, testFile, extraEnv = {} }) {
 async function main() {
   let results;
   if (process.argv.includes('--view')) {
-    // Vue « Shared Copilot » : deux VS Code, l'un héberge, l'autre rejoint. On teste le VSIX
+    // Vue « Prompt Share » : deux VS Code, l'un héberge, l'autre rejoint. On teste le VSIX
     // du Marketplace (sans API proposées), extrait et chargé comme extension de développement.
     const vsix = fs.readdirSync(root).find((f) => f.endsWith('.vsix'));
     if (!vsix) {
@@ -99,7 +107,14 @@ async function main() {
       launch('invite', { workspace: guestWs, devPath, testFile: 'view.js', extraEnv: { SCC_VIEW_ROLE: 'guest', SCC_TEST_SYNC: sync } }),
     ]);
   } else {
-    results = [await launch('confine', { workspace: ws, devPath: root, testFile: 'confine.js' })];
+    results = [];
+    if (!process.argv.includes('--native')) {
+      results.push(await launch('confine', { workspace: ws, devPath: root, testFile: 'confine.js' }));
+    }
+    // Chat natif (API proposées) : une seule fois, le mode WSL simulé n'y change rien.
+    if (!process.argv.includes('--wsl')) {
+      results.push(await launch('native', { workspace: ws, devPath: root, testFile: 'native.js' }));
+    }
   }
   console.log(results.join('\n'));
   process.exit(results.every((r) => r.includes('RESULT: PASS')) ? 0 : 1);

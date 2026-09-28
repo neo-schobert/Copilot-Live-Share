@@ -36,6 +36,23 @@ export interface UserEntry extends BaseEntry {
   clientId: string;
   isHost: boolean;
   text: string;
+  /**
+   * Question d'invité soumise à l'hôte avant d'être envoyée au modèle (absent : pas de validation).
+   * pending : en attente de l'hôte ; approved : envoyée au modèle ; rejected : refusée.
+   */
+  review?: QuestionReview;
+  /** Qui a accepté ou refusé la question. */
+  reviewedBy?: string;
+}
+
+export type QuestionReview = 'pending' | 'approved' | 'rejected';
+
+/** Règles de la session fixées par l'hôte, affichées aux participants. */
+export interface SessionPolicy {
+  /** Les questions des invités attendent l'accord de l'hôte avant d'être envoyées au modèle. */
+  reviewGuestQuestions: boolean;
+  /** Nombre maximal de questions d'invités envoyées au modèle par heure (0 : pas de limite). */
+  guestQuestionsPerHour: number;
 }
 
 export type AssistantStatus = 'streaming' | 'done' | 'cancelled' | 'error';
@@ -179,7 +196,9 @@ export type ClientMessage =
   /** Le participant est en train d'écrire dans cette discussion (envoyé au plus toutes les 2 s). */
   | { type: 'typing'; conversationId: string }
   /** Réponse à une question de l'agent (par n'importe quel participant). */
-  | { type: 'answer'; entryId: string; toolId: string; text: string };
+  | { type: 'answer'; entryId: string; toolId: string; text: string }
+  /** Réservé à l'hôte : accepte ou refuse une question d'invité en attente. */
+  | { type: 'reviewQuestion'; entryId: string; accept: boolean };
 
 // ---- Serveur -> client ----
 
@@ -193,6 +212,7 @@ export type ServerMessage =
       participants: Participant[];
       queue: QueueState;
       models: ModelsState;
+      policy: SessionPolicy;
     }
   /** Discussion créée ou renommée. */
   | { type: 'conversation'; conversation: Conversation }
@@ -208,6 +228,9 @@ export type ServerMessage =
       model?: string;
       error?: string;
     }
+  /** Décision de l'hôte sur une question d'invité. */
+  | { type: 'questionReview'; entryId: string; review: QuestionReview; by: string }
+  | { type: 'policy'; policy: SessionPolicy }
   | { type: 'participants'; participants: Participant[] }
   | { type: 'queue'; queue: QueueState }
   | { type: 'models'; models: ModelsState }

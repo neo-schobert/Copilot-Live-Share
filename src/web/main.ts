@@ -8,7 +8,9 @@ import {
   Participant,
   QueueState,
   ServerMessage,
+  SessionPolicy,
   ToolActivity,
+  UserEntry,
   WS_PATH,
 } from '../protocol';
 import { codeBlock, renderMarkdown } from './markdown';
@@ -61,6 +63,8 @@ const homeJoinForm = $<HTMLFormElement>('home-join-form');
 const homeLink = $<HTMLInputElement>('home-link');
 const homeStatus = $<HTMLElement>('home-status');
 const leaveBtn = $<HTMLButtonElement>('leave');
+const policyNote = $<HTMLElement>('policy-note');
+const inviteWarn = Object.assign(document.createElement('p'), { className: 'hint warn' });
 
 // ---- État ----
 
@@ -83,6 +87,7 @@ const unread = new Map<string, number>();
 const entries = new Map<string, ChatEntry>();
 const entryEls = new Map<string, HTMLElement>();
 let participants: Participant[] = [];
+let policy: SessionPolicy = { reviewGuestQuestions: false, guestQuestionsPerHour: 0 };
 let queue: QueueState = { current: null, pending: [] };
 let models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
 /** Modèle choisi par ce participant ; '' = modèle par défaut de la session. */
@@ -300,12 +305,14 @@ function handle(msg: ServerMessage): void {
       participants = msg.participants;
       queue = msg.queue;
       models = msg.models;
+      policy = msg.policy;
       const remembered = activeId ?? storage('session', 'scc.conv');
       const known = conversations.some((c) => c.id === remembered);
       openConversation(known ? remembered! : lastConversationId(), true);
       renderParticipants();
       renderModels();
       updateActivity();
+      renderPolicy();
       inviteBtn.hidden = !me.isHost;
       break;
     }
@@ -350,6 +357,12 @@ function handle(msg: ServerMessage): void {
       if (msg.entry.kind === 'user' && typing.delete(msg.entry.clientId)) {
         renderPresence();
         renderConversations();
+      }
+      if (msg.entry.kind === 'user' && msg.entry.review === 'pending') {
+        updateActivity();
+        if (me?.isHost && msg.entry.conversationId !== activeId) {
+          toast(`${msg.entry.author} attend votre accord dans une autre discussion.`);
+        }
       }
       if (msg.entry.conversationId === activeId) {
         messagesEl.querySelector('.welcome')?.remove();
@@ -400,6 +413,23 @@ function handle(msg: ServerMessage): void {
       }
       break;
     }
+    case 'questionReview': {
+      const entry = entries.get(msg.entryId);
+      if (entry?.kind === 'user') {
+        entry.review = msg.review;
+        entry.reviewedBy = msg.by;
+        markDirty(entry.id);
+        if (msg.review === 'rejected' && entry.clientId === me?.clientId) {
+          toast(`${msg.by} n’a pas envoyé votre question au modèle.`);
+        }
+      }
+      updateActivity();
+      break;
+    }
+    case 'policy':
+      policy = msg.policy;
+      renderPolicy();
+      break;
     case 'participants':
       participants = msg.participants;
       for (const id of typing.keys()) {
@@ -551,7 +581,7 @@ function renderTitle(): void {
   const conv = conversations.find((c) => c.id === activeId);
   convTitle.textContent = conv?.title ?? '';
   convTitle.title = conv ? `Créée par ${conv.createdBy} à ${formatTime(conv.createdAt)}` : '';
-  document.title = conv ? `${conv.title} — Shared Copilot` : 'Shared Copilot';
+  document.title = conv ? `${conv.title} — Prompt Share` : 'Prompt Share';
 }
 
 function renderConversations(): void {
@@ -576,7 +606,7 @@ function renderConversations(): void {
       const meta = document.createElement('span');
       meta.className = 'conv-meta';
       meta.textContent =
-        conv.id === answering ? 'Copilot répond…' : waiting.has(conv.id) ? 'En attente…' : `${conv.createdBy} · ${formatTime(conv.createdAt)}`;
+        conv.id === answering ? 'L’assistant répond…' : waiting.has(conv.id) ? 'En attente…' : `${conv.createdBy} · ${formatTime(conv.createdAt)}`;
       const writers = typingIn(conv.id);
       if (writers.length && conv.id !== answering) {
         meta.textContent = `${nameList(writers)} ${writers.length > 1 ? 'écrivent' : 'écrit'}…`;
@@ -723,6 +753,11 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
       request.className = 'request body';
       request.append(renderMarkdown(entry.text));
       el.append(request);
+      if (entry.review === 'pending') {
+        el.append(reviewBar(entry));
+      } else if (entry.review === 'rejected') {
+        el.append(note(`Non envoyée au modèle : refusée par ${entry.reviewedBy ?? 'l’hôte'}.`));
+      }
       break;
     }
     case 'assistant':
@@ -742,8 +777,28 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
   }
 }
 
+/** Question d'invité en attente : l'hôte l'envoie au modèle ou la refuse, les autres patientent. */
+function reviewBar(entry: UserEntry): HTMLElement {
+  const bar = document.createElement('div');
+  bar.className = 'review-bar';
+  if (me?.isHost && !ended) {
+    bar.classList.add('attention');
+    const label = document.createElement('span');
+    label.className = 'waiting';
+    label.textContent = `Question de ${entry.author} : l’envoyer au modèle avec votre compte ?`;
+    const decide = (accept: boolean) => () => send({ type: 'reviewQuestion', entryId: entry.id, accept });
+    bar.append(icon('shield'), label, button('Envoyer au modèle', 'primary', decide(true)), button('Refuser', 'secondary', decide(false)));
+  } else {
+    const waiting = document.createElement('span');
+    waiting.className = 'waiting';
+    waiting.textContent = ended ? 'Non envoyée au modèle.' : 'En attente de l’accord de l’hôte…';
+    bar.append(icon(ended ? 'circle-slash' : 'loading codicon-modifier-spin'), waiting);
+  }
+  return bar;
+}
+
 function renderAssistant(entry: AssistantEntry, el: HTMLElement): void {
-  const head = turnHead(copilotAvatar(), 'Copilot', entry.timestamp);
+  const head = turnHead(assistantAvatar(), 'Assistant', entry.timestamp);
   const meta = document.createElement('span');
   meta.className = 'meta';
   meta.textContent = `${entry.model ? `${entry.model} · ` : ''}pour ${entry.replyToAuthor}`;
@@ -982,10 +1037,10 @@ function avatar(name: string): HTMLElement {
   return span;
 }
 
-function copilotAvatar(): HTMLElement {
+function assistantAvatar(): HTMLElement {
   const span = document.createElement('span');
   span.className = 'avatar copilot';
-  span.append(icon('copilot'));
+  span.append(icon('sparkle'));
   return span;
 }
 
@@ -1018,7 +1073,7 @@ function welcome(): HTMLElement {
   const div = document.createElement('div');
   div.className = 'welcome';
   const title = document.createElement('h2');
-  title.textContent = 'Demandez à Copilot, ensemble';
+  title.textContent = 'Demandez à l’IA, ensemble';
   const text = document.createElement('p');
   text.textContent =
     "L'agent explore le projet de l'hôte, propose des modifications et lance des commandes ; chaque action est soumise à validation.";
@@ -1032,7 +1087,7 @@ function welcome(): HTMLElement {
       }),
     );
   }
-  div.append(icon('copilot'), title, text, suggestions);
+  div.append(icon('sparkle'), title, text, suggestions);
   return div;
 }
 
@@ -1170,6 +1225,12 @@ function renderInvite(msg: Extract<ServerMessage, { type: 'invite' }>): void {
     Object.assign(document.createElement('code'), { textContent: `ngrok http ${port}` }),
     document.createTextNode(' ou le panneau Ports de VS Code (visibilité Public), puis collez l’URL publique :'),
   );
+  inviteHint.after(
+    Object.assign(inviteWarn, {
+      textContent:
+        'Le lien donne accès à la session : les invités utilisent votre compte GitHub Copilot et, par l’agent, lisent le projet. Ne l’envoyez qu’aux personnes avec qui vous travaillez.',
+    }),
+  );
   if (!inviteUrl.value && msg.publicUrl) {
     inviteUrl.value = msg.publicUrl;
   }
@@ -1256,7 +1317,7 @@ function updateActivity(): void {
     const who = current.clientId === me?.clientId ? 'vous' : current.author;
     const conv = conversations.find((c) => c.id === current.conversationId);
     const where = current.conversationId === activeId || !conv ? '' : ` dans « ${conv.title} »`;
-    parts.push(`Copilot répond à ${who}${where}`);
+    parts.push(`L’assistant répond à ${who}${where}`);
   }
   const mine = queue.pending.findIndex((q) => q.clientId === me?.clientId);
   if (mine >= 0) {
@@ -1264,9 +1325,28 @@ function updateActivity(): void {
   } else if (queue.pending.length) {
     parts.push(`${queue.pending.length} question(s) en attente`);
   }
+  const awaiting = [...entries.values()].filter((e): e is UserEntry => e.kind === 'user' && e.review === 'pending');
+  if (me?.isHost && awaiting.length) {
+    parts.push(`${awaiting.length} question(s) d’invités attendent votre accord`);
+  } else if (awaiting.some((e) => e.clientId === me?.clientId)) {
+    parts.push('votre question attend l’accord de l’hôte');
+  }
   activityText.textContent = parts.join(' · ');
   activityEl.hidden = parts.length === 0;
   cancelBtn.hidden = !(me?.isHost && current);
+}
+
+/** Rappel permanent sous la saisie : quel compte répond, qui voit quoi, règles de l'hôte. */
+function renderPolicy(): void {
+  const rules = [
+    policy.reviewGuestQuestions ? 'questions des invités validées par l’hôte' : undefined,
+    policy.guestQuestionsPerHour > 0 ? `${policy.guestQuestionsPerHour} questions d’invités par heure au plus` : undefined,
+  ].filter(Boolean);
+  const text = me?.isHost
+    ? 'Les questions des invités utilisent votre compte GitHub Copilot.'
+    : 'Réponses générées avec le compte GitHub Copilot de l’hôte. Vos messages sont visibles par tous les participants.';
+  policyNote.textContent = rules.length ? `${text} Règles : ${rules.join(', ')}.` : text;
+  policyNote.hidden = !me;
 }
 
 function updateComposer(): void {

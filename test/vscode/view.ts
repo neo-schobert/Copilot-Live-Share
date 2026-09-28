@@ -1,12 +1,12 @@
 /**
- * Test d'intégration de la vue « Shared Copilot » avec deux VS Code (voir run.js --view) :
+ * Test d'intégration de la vue « Prompt Share » avec deux VS Code (voir run.js --view) :
  * l'un héberge une session, l'autre la rejoint depuis sa vue, sans navigateur.
  * La synchronisation entre les deux instances passe par des fichiers.
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import type { SharedCopilotApi } from '../../src/extension';
+import type { PromptShareApi } from '../../src/extension';
 
 const OUT = process.env.SCC_TEST_OUT!;
 const SYNC = process.env.SCC_TEST_SYNC!;
@@ -38,14 +38,14 @@ export async function run(): Promise<void> {
   const linkFile = path.join(SYNC, 'invite.txt');
   const doneFile = path.join(SYNC, 'done.txt');
   try {
-    const ext = vscode.extensions.getExtension('neo-schobert.shared-copilot-chat')!;
-    const api = (await ext.activate()) as SharedCopilotApi;
+    const ext = vscode.extensions.getExtension('neo-schobert.prompt-share')!;
+    const api = (await ext.activate()) as PromptShareApi;
     ok(`extension activée (API proposées : ${ext.packageJSON.enabledApiProposals ? 'oui' : 'non, version Marketplace'})`);
-    await vscode.commands.executeCommand('sharedCopilotChat.openChat');
-    ok('vue « Shared Copilot » ouverte');
+    await vscode.commands.executeCommand('promptShare.openChat');
+    ok('vue « Prompt Share » ouverte');
 
     if (ROLE === 'host') {
-      await vscode.commands.executeCommand('sharedCopilotChat.host');
+      await vscode.commands.executeCommand('promptShare.host');
       const hosted = await until('démarrage de la session', () => api.hostedSession());
       if (api.viewState().mode !== 'host') throw new Error(`vue en mode ${api.viewState().mode}`);
       ok(`session hébergée, vue en mode hôte ; lien ${hosted.inviteLink.replace(/token=.*/, 'token=…')}`);
@@ -66,7 +66,7 @@ export async function run(): Promise<void> {
     }
     log.push('RESULT: PASS');
   } catch (err) {
-    const api = vscode.extensions.getExtension('neo-schobert.shared-copilot-chat')?.exports as SharedCopilotApi | undefined;
+    const api = vscode.extensions.getExtension('neo-schobert.prompt-share')?.exports as PromptShareApi | undefined;
     log.push(`✗ [${ROLE}] ${(err as Error).message}`, `  · évènements de la vue : ${api?.viewEvents().join(' | ') || 'aucun'}`, 'RESULT: FAIL');
   }
   fs.writeFileSync(OUT, log.join('\n'));

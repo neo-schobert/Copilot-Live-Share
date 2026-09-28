@@ -46,7 +46,7 @@ const MAX_PREVIEW_LINES = 40;
 const COMMAND_TIMEOUT_MS = 120_000;
 const SEARCH_EXCLUDE_GLOB = '**/{node_modules,.git,dist,out,build,.venv,__pycache__}/**';
 
-export const PROPOSAL_SCHEME = 'shared-copilot-proposal';
+export const PROPOSAL_SCHEME = 'prompt-share-proposal';
 
 /** Fournit le contenu des fichiers « proposés » pour l'affichage des diffs. */
 export class ProposalContentProvider implements vscode.TextDocumentContentProvider {
@@ -200,7 +200,7 @@ export class WorkspaceTools {
     const name = path.basename(diff.uri.path);
     const left = this.proposals.register(diff.original, name);
     const right = this.proposals.register(diff.modified, name);
-    await vscode.commands.executeCommand('vscode.diff', left, right, `${name} : modification proposée (Shared Copilot)`, {
+    await vscode.commands.executeCommand('vscode.diff', left, right, `${name} : modification proposée (Prompt Share)`, {
       preview: true,
     });
     return true;
@@ -208,7 +208,7 @@ export class WorkspaceTools {
 }
 
 function config(): vscode.WorkspaceConfiguration {
-  return vscode.workspace.getConfiguration('sharedCopilotChat');
+  return vscode.workspace.getConfiguration('promptShare');
 }
 
 // ---- Confinement : chemins et fichiers protégés ----
