@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "compile",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$tsc"],
+      "presentation": { "reveal": "silent" }
+    },
+    {
+      "type": "npm",
+      "script": "watch",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "esbuild",
+        "pattern": { "regexp": "^✘ \\[ERROR\\] (.*)$", "message": 1 },
+        "background": {
+          "activeBegin": "^\\[watch\\] build started",
+          "activeEnd": "^\\[watch\\] build finished"
+        }
+      },
+      "presentation": { "reveal": "never" }
+    }
+  ]
+}

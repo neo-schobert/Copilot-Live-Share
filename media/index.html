@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Shared Copilot Chat</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css?token=__TOKEN__">
+</head>
+<body>
+  <section id="join" class="join">
+    <form id="join-form" class="join-card" autocomplete="off">
+      <h1>Shared Copilot Chat</h1>
+      <p>Un chat partagé avec Copilot, hébergé par VS Code chez l'hôte. Tout le monde voit les questions et les réponses.</p>
+      <label for="name-input">Votre pseudo</label>
+      <input id="name-input" name="name" maxlength="32" required autofocus autocomplete="nickname" placeholder="ex. Camille">
+      <button type="submit">Rejoindre</button>
+    </form>
+  </section>
+
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <h1>Shared Copilot Chat</h1>
+      <span id="connection" class="connection" data-state="connecting">Connexion…</span>
+      <button id="toggle-people" class="ghost people-toggle" type="button" aria-controls="people" aria-expanded="false">
+        Participants <span id="people-count" class="count">0</span>
+      </button>
+    </header>
+
+    <div class="layout">
+      <main id="messages" class="messages" aria-live="polite"></main>
+      <aside id="people" class="people">
+        <h2>Participants</h2>
+        <ul id="people-list"></ul>
+      </aside>
+    </div>
+
+    <footer class="composer">
+      <div id="banner" class="banner" hidden></div>
+      <div class="activity">
+        <span id="activity-text"></span>
+        <button id="cancel" class="danger small" type="button" hidden>Annuler la réponse</button>
+      </div>
+      <form id="ask-form" class="ask">
+        <textarea id="ask-input" rows="2" maxlength="8000" placeholder="Posez une question… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
+        <button id="ask-send" type="submit">Envoyer</button>
+      </form>
+    </footer>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="client.js?token=__TOKEN__"></script>
+</body>
+</html>

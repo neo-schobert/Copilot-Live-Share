@@ -1,0 +1,219 @@
+/**
+ * Test de bout en bout sans VS Code : vrai serveur HTTP/WebSocket et vraie file
+ * d'attente, avec un modèle simulé. Lancer avec « npm test ».
+ */
+import * as assert from 'assert/strict';
+import * as http from 'http';
+import { WebSocket } from 'ws';
+import { ChatRoom, ModelBackend, ModelTurn } from '../src/chatRoom';
+import { CLOSE_CODES, ServerMessage } from '../src/protocol';
+import { ChatServer } from '../src/server';
+
+const PORT = 37170;
+const GUEST = 'guest-token-123';
+const HOST = 'host-token-456';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Modèle factice : répond « Réponse à <question> » en plusieurs morceaux. */
+class FakeBackend implements ModelBackend {
+  readonly calls: ModelTurn[][] = [];
+
+  async ask(turns: ModelTurn[], signal: AbortSignal) {
+    this.calls.push(turns);
+    const question = turns[turns.length - 1].content.split('\n\n').pop() ?? '';
+    const slow = question.includes('lent');
+    async function* chunks() {
+      for (const word of `Réponse à « ${question} » terminée`.split(' ')) {
+        if (signal.aborted) {
+          return;
+        }
+        await sleep(slow ? 100 : 15);
+        yield `${word} `;
+      }
+    }
+    return { modelName: 'fake-model', chunks: chunks() };
+  }
+}
+
+class Client {
+  readonly messages: ServerMessage[] = [];
+  closeCode: number | undefined;
+  private constructor(readonly ws: WebSocket) {
+    ws.on('message', (d) => this.messages.push(JSON.parse(d.toString()) as ServerMessage));
+    ws.on('close', (code) => (this.closeCode = code));
+  }
+
+  static async join(name: string, token = GUEST): Promise<Client> {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=${token}`);
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve());
+      ws.once('error', reject);
+    });
+    const c = new Client(ws);
+    c.send({ type: 'hello', name, clientId: `${name}-client-id` });
+    await c.waitFor((m) => m.type === 'welcome');
+    return c;
+  }
+
+  send(msg: object) {
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  async waitFor(pred: (m: ServerMessage) => boolean, timeoutMs = 5000): Promise<ServerMessage> {
+    const start = Date.now();
+    for (;;) {
+      const found = this.messages.find(pred);
+      if (found) {
+        return found;
+      }
+      if (Date.now() - start > timeoutMs) {
+        throw new Error('timeout waiting for message');
+      }
+      await sleep(10);
+    }
+  }
+
+  /** Messages liés au contenu du chat (sans welcome/participants, propres à chaque client). */
+  chatStream(): string[] {
+    return this.messages
+      .filter((m) => m.type === 'entry' || m.type === 'chunk' || m.type === 'entryUpdate')
+      .map((m) => JSON.stringify(m));
+  }
+}
+
+function httpGet(path: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    http
+      .get(`http://127.0.0.1:${PORT}${path}`, (res) => {
+        let body = '';
+        res.on('data', (d) => (body += d));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+      })
+      .on('error', reject);
+  });
+}
+
+function wsRejected(path: string): Promise<number> {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}${path}`);
+    ws.on('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0));
+    ws.on('open', () => resolve(101));
+    ws.on('error', () => resolve(-1));
+  });
+}
+
+async function main() {
+  const backend = new FakeBackend();
+  const room = new ChatRoom(backend, { historyLength: () => 20 });
+  const server = new ChatServer(
+    {
+      port: PORT,
+      guestToken: GUEST,
+      hostToken: HOST,
+      indexHtml: '<html><script src="client.js?token=__TOKEN__"></script></html>',
+      assets: { '/client.js': { contentType: 'text/javascript', body: 'ok' } },
+    },
+    room,
+  );
+  await server.start();
+  const results: string[] = [];
+  const ok = (label: string) => {
+    results.push(label);
+    console.log(`  ✓ ${label}`);
+  };
+
+  // 1. Authentification HTTP
+  assert.equal((await httpGet('/')).status, 401);
+  assert.equal((await httpGet('/?token=wrong')).status, 401);
+  assert.equal((await httpGet('/client.js')).status, 401);
+  const page = await httpGet(`/?token=${GUEST}`);
+  assert.equal(page.status, 200);
+  assert.ok(page.body.includes(`client.js?token=${GUEST}`));
+  assert.equal((await httpGet(`/client.js?token=${GUEST}`)).status, 200);
+  ok('HTTP : 401 sans token ou avec un mauvais token, 200 avec le bon');
+
+  // 2. Authentification WebSocket
+  assert.equal(await wsRejected('/ws'), 401);
+  assert.equal(await wsRejected('/ws?token=wrong'), 401);
+  assert.equal(await wsRejected(`/other?token=${GUEST}`), 401);
+  ok('WebSocket : connexion refusée (401) sans token ou avec un mauvais token');
+
+  // 3. Deux clients, deux questions simultanées : FIFO et même flux pour tous
+  const alice = await Client.join('alice');
+  const bob = await Client.join('bob');
+  await alice.waitFor((m) => m.type === 'participants' && m.participants.length === 2);
+  alice.send({ type: 'ask', text: 'Question 1' });
+  bob.send({ type: 'ask', text: 'Question 2' });
+
+  const doneCount = (c: Client) => c.messages.filter((m) => m.type === 'entryUpdate' && m.status === 'done').length;
+  for (let i = 0; i < 300 && (doneCount(alice) < 2 || doneCount(bob) < 2); i++) {
+    await sleep(10);
+  }
+  assert.equal(doneCount(alice), 2);
+  assert.deepEqual(alice.chatStream(), bob.chatStream());
+  ok('Deux navigateurs reçoivent exactement les mêmes messages et chunks');
+
+  const events = alice.messages.filter((m) => m.type === 'entry' || m.type === 'entryUpdate');
+  const assistantIds = events.flatMap((m) => (m.type === 'entry' && m.entry.kind === 'assistant' ? [m.entry] : []));
+  assert.equal(assistantIds.length, 2);
+  const firstDone = events.findIndex((m) => m.type === 'entryUpdate' && m.entryId === assistantIds[0].id && m.status === 'done');
+  const secondStart = events.findIndex((m) => m.type === 'entry' && m.entry.id === assistantIds[1].id);
+  assert.ok(firstDone < secondStart, 'la 2e réponse démarre après la fin de la 1re');
+  assert.equal(assistantIds[0].replyToAuthor, 'alice');
+  assert.equal(assistantIds[1].replyToAuthor, 'bob');
+  const q = alice.messages.find((m) => m.type === 'queue' && m.queue.pending.length === 1);
+  assert.ok(q, 'la file a exposé une question en attente');
+  ok('Questions simultanées traitées une par une, dans l’ordre (FIFO)');
+
+  // 4. Historique envoyé au modèle, préfixé par le pseudo
+  const lastCall = backend.calls[1];
+  assert.ok(lastCall.some((t) => t.role === 'user' && t.content.includes('alice: Question 1')));
+  assert.ok(lastCall.some((t) => t.role === 'assistant' && t.content.includes('Question 1')));
+  assert.ok(lastCall[lastCall.length - 1].content.endsWith('bob: Question 2'));
+  ok('Historique envoyé au modèle avec le pseudo de chaque auteur');
+
+  // 5. Contexte partagé
+  room.addContext({ author: 'hôte', fileName: 'src/a.ts', languageId: 'typescript', range: 'lignes 1-2', code: 'const a = 1;' });
+  await bob.waitFor((m) => m.type === 'entry' && m.entry.kind === 'context');
+  ok('Contexte partagé diffusé à tous');
+
+  // 6. Annulation : refusée pour un invité, acceptée pour l'hôte
+  const host = await Client.join('hote', HOST);
+  bob.send({ type: 'ask', text: 'Question lente' });
+  await bob.waitFor((m) => m.type === 'chunk' && m.text.includes('Question'));
+  bob.send({ type: 'cancel' });
+  await bob.waitFor((m) => m.type === 'error' && m.message.includes("l'hôte"));
+  host.send({ type: 'cancel' });
+  await alice.waitFor((m) => m.type === 'entryUpdate' && m.status === 'cancelled');
+  assert.ok(backend.calls[2].some((t) => t.content.includes('src/a.ts')), 'le contexte est envoyé au modèle');
+  ok('Seul l’hôte peut annuler ; la réponse passe à « cancelled »');
+
+  // 7. Reconnexion avec le même pseudo : historique complet renvoyé
+  bob.ws.close();
+  await host.waitFor((m) => m.type === 'participants' && m.participants.length === 2);
+  const bob2 = await Client.join('bob');
+  const welcome = bob2.messages.find((m) => m.type === 'welcome');
+  assert.ok(welcome && welcome.type === 'welcome');
+  assert.equal(welcome.you.clientId, 'bob-client-id');
+  assert.ok(welcome.history.length >= 6);
+  ok('Reconnexion : même identité et historique complet');
+
+  // 8. Arrêt : tous les clients sont prévenus et déconnectés
+  room.dispose("L'hôte a arrêté la session.");
+  await server.stop('Session ended');
+  await sleep(50);
+  for (const c of [alice, host, bob2]) {
+    assert.ok(c.messages.some((m) => m.type === 'sessionEnded'));
+    assert.equal(c.closeCode, CLOSE_CODES.sessionEnded);
+  }
+  assert.equal(await wsRejected(`/ws?token=${GUEST}`), -1);
+  ok('Arrêt de session : clients notifiés, sockets fermées (code 4000), port libéré');
+
+  console.log(`\n${results.length} vérifications réussies.`);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

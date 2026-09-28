@@ -1,0 +1,132 @@
+{
+  "name": "shared-copilot-chat",
+  "displayName": "Shared Copilot Chat",
+  "description": "Partagez un chat avec les modèles Copilot entre plusieurs personnes, via la machine de l'hôte.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "sharedCopilotChat.startSession",
+        "title": "Start Session",
+        "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.copyInviteLink",
+        "title": "Copy Invite Link",
+        "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.openChat",
+        "title": "Open Chat",
+        "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.shareSelection",
+        "title": "Share Selection",
+        "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.cancelResponse",
+        "title": "Cancel Current Response",
+        "category": "Shared Copilot"
+      },
+      {
+        "command": "sharedCopilotChat.stopSession",
+        "title": "Stop Session",
+        "category": "Shared Copilot"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "sharedCopilotChat.copyInviteLink",
+          "when": "sharedCopilotChat.active"
+        },
+        {
+          "command": "sharedCopilotChat.openChat",
+          "when": "sharedCopilotChat.active"
+        },
+        {
+          "command": "sharedCopilotChat.shareSelection",
+          "when": "sharedCopilotChat.active"
+        },
+        {
+          "command": "sharedCopilotChat.cancelResponse",
+          "when": "sharedCopilotChat.active"
+        },
+        {
+          "command": "sharedCopilotChat.stopSession",
+          "when": "sharedCopilotChat.active"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "sharedCopilotChat.shareSelection",
+          "when": "sharedCopilotChat.active",
+          "group": "9_sharedCopilot"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Shared Copilot Chat",
+      "properties": {
+        "sharedCopilotChat.port": {
+          "type": "integer",
+          "default": 3717,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Port local (127.0.0.1) du serveur de chat partagé."
+        },
+        "sharedCopilotChat.modelFamily": {
+          "type": "string",
+          "default": "",
+          "description": "Famille du modèle Copilot à utiliser (ex. « gpt-4o », « claude-sonnet-4 »). Vide : premier modèle Copilot disponible."
+        },
+        "sharedCopilotChat.historyLength": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 0,
+          "maximum": 200,
+          "description": "Nombre d'échanges précédents envoyés au modèle avec chaque question."
+        },
+        "sharedCopilotChat.hostName": {
+          "type": "string",
+          "default": "",
+          "description": "Pseudo de l'hôte dans le chat (vide : nom d'utilisateur système)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "npm run check-types && node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "npm run check-types && node esbuild.js --production",
+    "check-types": "tsc -p . --noEmit && tsc -p src/web --noEmit",
+    "test": "node esbuild.js --test && node dist/test/smoke.js",
+    "vscode:prepublish": "npm run package"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "~1.90.0",
+    "@types/ws": "^8.5.12",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
