@@ -7,6 +7,7 @@ import type { ApprovalDecision } from './protocol';
 import { ChatRoom, LOCAL_HOST_CLIENT_ID, PendingApproval, PendingQuestion } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
 import { NativeChatBridge } from './nativeChat';
+import { consumePendingStart, prepareEnvironment } from './wslSetup';
 import { ChatServer } from './server';
 
 const CONFIG = 'sharedCopilotChat';
@@ -74,17 +75,23 @@ let lastTextEditor: vscode.TextEditor | undefined;
 let output: vscode.OutputChannel;
 let proposals: ProposalContentProvider;
 let tools: WorkspaceTools;
+/** Détection du bac à sable des commandes (bubblewrap, ou WSL sous Windows). */
+let sandboxReady: Promise<unknown> = Promise.resolve();
+const log = (message: string) => output?.appendLine(message);
 
 /** API interne renvoyée par activate(), utilisée par les tests d'intégration. */
 export interface SharedCopilotApi {
   readonly tools: WorkspaceTools;
   readonly nativeChatActive: () => boolean;
+  /** Résolue quand la détection du bac à sable est terminée. */
+  readonly sandboxReady: Promise<unknown>;
 }
 
 export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
   output = vscode.window.createOutputChannel('Shared Copilot');
   proposals = new ProposalContentProvider();
   tools = new WorkspaceTools(proposals, output);
+  sandboxReady = tools.initSandbox(log);
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'sharedCopilotChat.copyInviteLink';
   lastTextEditor = vscode.window.activeTextEditor;
@@ -127,9 +134,27 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
       if (e.affectsConfiguration(`${CONFIG}.modelFamily`) || e.affectsConfiguration(`${CONFIG}.allowGuestModelChoice`)) {
         void refreshModels();
       }
+      if (['wslSandbox', 'wslDistro', 'sandboxReadOnlyPaths'].some((k) => e.affectsConfiguration(`${CONFIG}.${k}`))) {
+        sandboxReady = tools.initSandbox(log, true);
+      }
     }),
   );
-  return { tools, nativeChatActive: () => !!session?.nativeChat };
+  // Fenêtre rouverte dans WSL à la demande de « Start Session » : la session reprend d'elle-même.
+  if (consumePendingStart(context)) {
+    setTimeout(() => {
+      void vscode.commands.executeCommand('sharedCopilotChat.startSession').then(() =>
+        session ? vscode.commands.executeCommand('sharedCopilotChat.openChat') : undefined,
+      );
+    }, 1000);
+  }
+
+  return {
+    tools,
+    nativeChatActive: () => !!session?.nativeChat,
+    get sandboxReady() {
+      return sandboxReady;
+    },
+  };
 }
 
 export async function deactivate(): Promise<void> {
@@ -148,6 +173,15 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
   }
   starting = true;
   try {
+    // Windows + WSL : proposition de rouvrir dans WSL, installation de ce qui manque.
+    const setup = await prepareEnvironment(context, log);
+    if (setup.outcome !== 'continue') {
+      return;
+    }
+    // Bac à sable absent jusqu'ici (ex. bubblewrap installé entre-temps) : nouvelle détection.
+    if (setup.redetect || !tools.sandboxDescription()) {
+      sandboxReady = tools.initSandbox(log, true);
+    }
     await createSession(context);
   } finally {
     starting = false;
@@ -213,6 +247,8 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
+  // Les consignes du modèle et les validations dépendent du bac à sable : on attend sa détection.
+  await sandboxReady;
   tools.resetSession();
   session = new Session(server, room, guestToken, hostToken);
   if (config.get<boolean>('nativeChat', true)) {

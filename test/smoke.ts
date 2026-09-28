@@ -7,6 +7,10 @@ import * as http from 'http';
 import { WebSocket } from 'ws';
 import { ChatRoom, ModelBackend, ModelEvent, ModelRequest, ModelTurn } from '../src/chatRoom';
 import { CLOSE_CODES, ServerMessage } from '../src/protocol';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { installBubblewrapInWsl, parseWslProbe, sandboxCommand, SandboxRuntime, windowsToWsl } from '../src/sandbox';
 import { ChatServer } from '../src/server';
 
 const PORT = 37170;
@@ -171,6 +175,72 @@ async function main() {
     results.push(label);
     console.log(`  ✓ ${label}`);
   };
+
+  // 0. Bac à sable sous Windows + WSL : conversion des chemins et arguments bubblewrap
+  assert.equal(windowsToWsl('C:\\Users\\neo\\projet', '/mnt/', 'Ubuntu'), '/mnt/c/Users/neo/projet');
+  assert.equal(windowsToWsl('D:\\', '/mnt/', 'Ubuntu'), '/mnt/d');
+  assert.equal(windowsToWsl('e:/code/app', '/', ''), '/e/code/app');
+  assert.equal(windowsToWsl('\\\\wsl.localhost\\Ubuntu\\home\\neo\\app', '/mnt/', 'Ubuntu'), '/home/neo/app');
+  assert.equal(windowsToWsl('\\\\wsl$\\ubuntu\\srv', '/mnt/', 'Ubuntu'), '/srv');
+  assert.equal(windowsToWsl('\\\\wsl.localhost\\Debian\\home\\x', '/mnt/', 'Ubuntu'), undefined);
+  assert.equal(windowsToWsl('\\\\serveur\\partage\\x', '/mnt/', 'Ubuntu'), undefined);
+  const wsl: SandboxRuntime = {
+    kind: 'wsl',
+    description: 'Linux (WSL : Ubuntu)',
+    launcher: 'wsl.exe',
+    prefix: ['-d', 'Ubuntu', '-e', '/usr/bin/bwrap'],
+    rootEntries: [{ path: '/bin', link: 'usr/bin' }],
+    pathDirs: ['/home/neo/.nvm/versions/node/v22/bin'],
+    readOnly: ['/home/neo/.nvm/versions/node/v22'],
+    toSandbox: (p) => windowsToWsl(p, '/mnt/', 'Ubuntu'),
+  };
+  const args = sandboxCommand(
+    wsl,
+    { folders: ['C:\\dev\\app'], hidden: [{ path: 'C:\\dev\\app\\.env', dir: false }], cwd: 'C:\\dev\\app\\src' },
+    'npm test',
+  );
+  const at = (seq: string[]) => args.findIndex((_, i) => seq.every((v, j) => args[i + j] === v));
+  assert.deepEqual(args.slice(0, 4), ['-d', 'Ubuntu', '-e', '/usr/bin/bwrap']);
+  assert.ok(args.includes('--unshare-all') && args.includes('--clearenv'));
+  assert.ok(at(['--bind', '/mnt/c/dev/app', '/mnt/c/dev/app']) >= 0);
+  assert.ok(at(['--ro-bind', '/dev/null', '/mnt/c/dev/app/.env']) > at(['--bind', '/mnt/c/dev/app', '/mnt/c/dev/app']), 'masque après le montage du projet');
+  assert.ok(at(['--chdir', '/mnt/c/dev/app/src']) >= 0);
+  assert.ok(at(['--setenv', 'PATH', '/home/neo/.nvm/versions/node/v22/bin:/usr/local/bin:/usr/bin:/bin']) >= 0);
+  assert.deepEqual(args.slice(-3), ['/bin/sh', '-c', 'npm test']);
+  assert.ok(!args.some((a) => a.startsWith('/home/neo') && !a.includes('.nvm')), 'rien du dossier personnel hors chaîne d’outils');
+  assert.throws(() => sandboxCommand(wsl, { folders: ['\\\\serveur\\x'], hidden: [], cwd: '\\\\serveur\\x' }, 'ls'), /inaccessible/);
+  ok('Bac à sable WSL : chemins Windows convertis (C:, \\\\wsl.localhost), fichiers protégés masqués après le montage');
+
+  // 0 bis. Sonde WSL : diagnostic et environnement du bac à sable
+  const head = 'DISTRO Ubuntu\nHOME /home/neo\nMOUNT /mnt/c/\n';
+  assert.equal(parseWslProbe(`${head}NOBWRAP\n`, 'wsl.exe', '').status, 'noBubblewrap');
+  const wsl1 = parseWslProbe(`${head}BWRAPFAIL\n`, 'wsl.exe', '');
+  assert.equal(wsl1.status, 'bubblewrapFails');
+  assert.match(wsl1.detail, /wsl --set-version Ubuntu 2/);
+  const ready = parseWslProbe(
+    `${head}BWRAP /usr/bin/bwrap\nLINK /bin usr/bin\nDIR /etc\nPATHDIR /home/neo/.nvm/versions/node/v22/bin\nNODEROOT /home/neo/.nvm/versions/node/v22\n` +
+      'PATHDIR /usr/bin\nPATHDIR /mnt/c/Windows/system32\nPATHDIR /home/neo\n',
+    'wsl.exe',
+    'Ubuntu',
+  );
+  assert.equal(ready.status, 'ready');
+  assert.equal(ready.distro, 'Ubuntu');
+  assert.deepEqual(ready.runtime?.pathDirs, ['/home/neo/.nvm/versions/node/v22/bin'], 'ni /usr, ni lecteurs Windows, ni dossier personnel');
+  assert.deepEqual(ready.runtime?.readOnly, ['/home/neo/.nvm/versions/node/v22']);
+  assert.deepEqual(ready.runtime?.prefix, ['-d', 'Ubuntu', '-e', '/usr/bin/bwrap']);
+  assert.equal(ready.runtime?.toSandbox('C:\\dev\\app'), '/mnt/c/dev/app');
+  const customMount = parseWslProbe('DISTRO Debian\nHOME /home/x\nMOUNT /c/\nBWRAP /usr/bin/bwrap\n', 'wsl.exe', '');
+  assert.equal(customMount.mountRoot, '/');
+  assert.equal(customMount.runtime?.toSandbox('C:\\dev'), '/c/dev');
+  // Installation de bubblewrap : exécutée en root dans la distribution choisie.
+  const fakeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scc-fake-wsl-'));
+  const fake = path.join(fakeDir, 'wsl.sh');
+  fs.writeFileSync(fake, '#!/bin/sh\necho "ARGS $1 $2 $3 $4 $5 $6"\n', { mode: 0o755 });
+  const installLog: string[] = [];
+  assert.ok(await installBubblewrapInWsl('Ubuntu', (m) => installLog.push(m), fake));
+  assert.match(installLog.join('\n'), /ARGS -d Ubuntu -u root -e sh/);
+  fs.rmSync(fakeDir, { recursive: true, force: true });
+  ok('Sonde WSL : bubblewrap absent, WSL 1, prêt (PATH filtré, montage personnalisé) ; installation en root');
 
   // 1. Authentification HTTP
   assert.equal((await httpGet('/')).status, 401);

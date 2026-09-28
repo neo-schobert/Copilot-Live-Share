@@ -72,10 +72,30 @@ Comme l'agent Copilot, le modèle explore le projet de l'hôte, pose des questio
 - Tous les chemins sont vérifiés une fois les liens symboliques résolus : rien en dehors des dossiers ouverts n'est lisible, listable ou modifiable (y compris via un lien vers `/etc` ou un lien cassé pointant ailleurs).
 - Les fichiers sensibles du projet sont invisibles pour l'agent : `.git`, `.env*`, clés (`*.pem`, `*.key`, `id_rsa*`…), `.npmrc`, `.netrc`, `.ssh`, `.aws`. Ajoutez vos motifs avec `sharedCopilotChat.protectedFiles`.
 - Les commandes s'exécutent dans un bac à sable [bubblewrap](https://github.com/containers/bubblewrap) (Linux) : seul le projet est visible et modifiable, le dossier personnel est absent, le réseau coupé, les fichiers protégés masqués. Les outils du `PATH` (ex. Node installé dans le dossier personnel) y sont visibles en lecture seule ; `sharedCopilotChat.sandboxReadOnlyPaths` en ajoute d'autres.
-- Sans bubblewrap (Windows, macOS, ou Linux sans bubblewrap), toute commande est considérée comme hors du projet : seul l'hôte peut la valider.
-- Sous Windows, les commandes s'exécutent avec PowerShell ; le modèle est informé du système et du shell de l'hôte pour en respecter la syntaxe. Arrêter une réponse arrête la commande et tous ses sous-processus.
-- Les modifications passent par l'éditeur de VS Code : elles s'annulent avec Ctrl+Z. La sortie des commandes est copiée dans le canal de sortie « Shared Copilot ».
-- `sharedCopilotChat.agentMode` règle l'accès : `full` (défaut), `readOnly` ou `off`. Dans un espace de travail non approuvé (Workspace Trust), l'accès est limité à la lecture.
+- Sans bac à sable disponible (macOS, Windows sans WSL, Linux sans bubblewrap), toute commande est considérée comme hors du projet : seul l'hôte peut la valider.
+- Les commandes hors bac à sable s'exécutent sur la machine de l'hôte (PowerShell sous Windows, `/bin/sh` ailleurs) ; le modèle est informé du système et du shell pour en respecter la syntaxe. Arrêter une réponse arrête la commande et tous ses sous-processus.
+- Au démarrage, le canal de sortie « Shared Copilot » indique le bac à sable détecté, ou ce qu'il manque pour l'activer.
+
+### Windows et WSL
+
+Sous Windows, l'extension s'appuie sur WSL 2 pour fonctionner comme sous Linux. Au lancement de **Start Session** :
+
+1. Elle cherche WSL. S'il n'est pas installé, la session démarre normalement (chaque commande de l'agent devra être validée par l'hôte) et le canal de sortie « Shared Copilot » indique comment l'installer (`wsl --install`).
+2. Si WSL est présent, elle propose de **rouvrir le projet dans WSL** (recommandé) ou de **rester sous Windows**.
+3. Elle installe ce qui manque, en demandant votre accord à chaque fois :
+   - **bubblewrap** dans la distribution (en root via `wsl -u root`, avec apt, dnf, zypper, pacman ou apk) ;
+   - l'extension **WSL** de VS Code (Microsoft), si vous rouvrez dans WSL ;
+   - Shared Copilot elle-même dans WSL : elle est ajoutée au réglage `remote.defaultExtensionsIfInstalledLocally`, et VS Code l'y installe à la connexion.
+4. Si vous rouvrez dans WSL, la fenêtre se recharge sur le projet (`/mnt/c/…`) et **la session redémarre d'elle-même**, chat ouvert.
+
+Dans WSL, tout se passe exactement comme sous Linux. Si vous restez sous Windows, les commandes du bac à sable passent par `wsl.exe` (projet vu sous `/mnt/c/…`, mêmes protections), et les commandes hors du projet s'exécutent avec PowerShell, validées par l'hôte seul.
+
+- `sharedCopilotChat.wslMode` : `ask` (défaut), `reopen` (toujours rouvrir dans WSL), `windows` (toujours rester sous Windows), `off` (ne rien proposer).
+- `sharedCopilotChat.wslDistro` choisit la distribution (vide : celle par défaut) ; `sharedCopilotChat.wslSandbox: false` désactive le bac à sable via WSL quand on reste sous Windows.
+- WSL 1 ne permet pas bubblewrap : l'extension l'indique et donne la commande de conversion (`wsl --set-version <distribution> 2`).
+- En mode développement (F5), l'extension ne peut pas suivre le projet dans WSL : ouvrez le dossier avec *WSL: Connect to WSL* puis relancez F5 depuis cette fenêtre.
+- Les modules natifs compilés côté Windows (`node_modules`) peuvent ne pas fonctionner depuis WSL, et inversement : l'agent relance alors la commande hors du projet, avec votre validation.
+- Sous Linux (ou dans WSL), si bubblewrap manque, l'extension propose de l'installer dans un terminal (`sudo apt-get install bubblewrap`…) ; redémarrez ensuite la session.
 
 ## Panneau Chat natif
 
@@ -129,6 +149,9 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 | `sharedCopilotChat.agentMode` | `full` | Accès du modèle au projet : `full` (lecture, modifications et commandes validées), `readOnly`, `off`. |
 | `sharedCopilotChat.protectedFiles` | `[]` | Motifs glob de fichiers supplémentaires invisibles pour l'agent. |
 | `sharedCopilotChat.sandboxReadOnlyPaths` | `[]` | Dossiers supplémentaires visibles en lecture seule dans le bac à sable des commandes. |
+| `sharedCopilotChat.wslMode` | `ask` | Sous Windows avec WSL : `ask`, `reopen` (rouvrir dans WSL), `windows`, `off`. |
+| `sharedCopilotChat.wslSandbox` | `true` | Sous Windows, isole les commandes dans WSL avec bubblewrap si disponibles. |
+| `sharedCopilotChat.wslDistro` | `""` | Distribution WSL du bac à sable (vide : distribution par défaut). |
 | `sharedCopilotChat.nativeChat` | `true` | Affiche les discussions dans le panneau Chat natif (API expérimentale, voir plus haut). |
 | `sharedCopilotChat.allowGuestModelChoice` | `true` | Autorise les invités à choisir un autre modèle que celui par défaut. À désactiver pour éviter que des invités consomment les requêtes premium de l'hôte. L'hôte peut toujours choisir. |
 | `sharedCopilotChat.historyLength` | `20` | Nombre d'échanges précédents (question + réponse, ou contexte partagé) envoyés au modèle avec chaque question. |
@@ -143,7 +166,7 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 - Les modèles premium choisis par les invités sont décomptés sur le quota de l'hôte (voir `allowGuestModelChoice`).
 - Le token est la seule protection : quiconque obtient le lien peut poser des questions, et donc faire **lire tout le projet** par le modèle (hors fichiers protégés), et valider les modifications que l'agent propose en réponse à **ses propres** questions. N'invitez que des personnes de confiance, ou passez `agentMode` à `readOnly` ou `off`.
 - Une action en attente de validation ou une question de l'agent bloque la file d'attente jusqu'à la réponse.
-- Le bac à sable des commandes n'existe que sous Linux avec bubblewrap ; ailleurs, chaque commande doit être validée par l'hôte.
+- Le bac à sable des commandes nécessite bubblewrap sous Linux, ou WSL 2 + bubblewrap sous Windows ; sans lui (macOS notamment), chaque commande doit être validée par l'hôte.
 - Seul l'hôte peut annuler une réponse.
 - Le Markdown est volontairement simple (pas de tableaux ni de coloration syntaxique).
 
@@ -155,7 +178,9 @@ src/
   server.ts          Serveur HTTP + WebSocket, authentification par token
   chatRoom.ts        Historique, participants, file FIFO, construction du prompt
   copilotBackend.ts  Appels à vscode.lm : sélection du modèle, boucle agent (outils), erreurs, annulation
-  agentTools.ts      Outils de l'agent, confinement au projet, bac à sable des commandes
+  agentTools.ts      Outils de l'agent, confinement au projet, exécution des commandes
+  sandbox.ts         Bac à sable bubblewrap : Linux natif ou via WSL sous Windows
+  wslSetup.ts        Windows : détection de WSL, réouverture dans WSL, installation de ce qui manque
   nativeChat.ts      Intégration au panneau Chat natif (API proposée chatSessionsProvider)
   types/             Définitions des API proposées de VS Code utilisées
   extension.ts       Commandes, webview, barre d'état
@@ -168,4 +193,4 @@ test/vscode/         Test d'intégration du confinement dans un vrai VS Code
 - `npm run watch` : recompilation continue
 - `npm run check-types` : vérification TypeScript stricte (extension et client)
 - `npm test` : lance le vrai serveur avec un modèle simulé et vérifie l'authentification, la diffusion identique à plusieurs clients, l'ordre FIFO, l'annulation, les discussions (historiques séparés, renommage, suppression), le choix du modèle, les actions d'outils, les règles de validation (auteur / hôte / hors projet), les questions de l'agent, la reconnexion et l'arrêt de session.
-- `npm run test:vscode` : lance un VS Code isolé (profil temporaire) sur un projet piégé (`.env`, `.git`, liens vers `/etc` et hors du projet) et vérifie le confinement de l'agent et du bac à sable. Nécessite la commande `code` et un affichage.
+- `npm run test:vscode` : lance un VS Code isolé (profil temporaire) sur un projet piégé (`.env`, `.git`, liens vers `/etc` et hors du projet) et vérifie le confinement de l'agent et du bac à sable, en mode Linux puis en mode WSL simulé (faux `wsl.exe`). Nécessite la commande `code` et un affichage.

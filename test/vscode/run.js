@@ -34,6 +34,14 @@ for (const [target, name] of [
   }
 }
 
+// --wsl : simule Windows + WSL avec un faux wsl.exe qui exécute ses arguments sous Linux.
+const env = { ...process.env };
+if (process.argv.includes('--wsl')) {
+  const fake = path.join(tmp, 'fake-wsl.sh');
+  fs.writeFileSync(fake, '#!/bin/sh\n[ "$1" = "-d" ] && shift 2\n[ "$1" = "-u" ] && shift 2\n[ "$1" = "-e" ] && shift\nexec "$@"\n', { mode: 0o755 });
+  env.SCC_TEST_FAKE_WSL = fake;
+}
+
 const out = path.join(tmp, 'result.txt');
 const code = process.env.SCC_CODE_CLI ?? 'code';
 const child = spawn(
@@ -47,7 +55,7 @@ const child = spawn(
     `--extensionTestsPath=${path.join(root, 'dist', 'test', 'vscode', 'confine.js')}`,
   ],
   // Sous Windows, « code » est un script code.cmd : il faut passer par le shell.
-  { env: { ...process.env, SCC_TEST_OUT: out, SCC_TEST_OUTSIDE: outside }, stdio: 'ignore', shell: process.platform === 'win32' },
+  { env: { ...env, SCC_TEST_OUT: out, SCC_TEST_OUTSIDE: outside }, stdio: 'ignore', shell: process.platform === 'win32' },
 );
 child.on('error', (err) => {
   console.error(`Impossible de lancer « ${code} » : ${err.message}`);

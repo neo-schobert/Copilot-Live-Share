@@ -35,6 +35,11 @@ async function refused(api: SharedCopilotApi, name: string, input: object, expec
 export async function run(): Promise<void> {
   try {
     const api = (await vscode.extensions.getExtension('local.shared-copilot-chat')!.activate()) as SharedCopilotApi;
+    await api.sandboxReady;
+    const sandbox = api.tools.sandboxDescription();
+    const wslMode = !!process.env.SCC_TEST_FAKE_WSL;
+    log.push(`  · bac à sable : ${sandbox ?? 'aucun'}${wslMode ? ' (mode WSL simulé)' : ''}`);
+    if (wslMode && !sandbox?.includes('WSL')) throw new Error('mode WSL non détecté');
     const tools = api.tools;
     const exec = async (name: string, input: object) => (await tools.prepare(name, input)).execute(ac.signal);
     const root = vscode.workspace.workspaceFolders![0].uri.fsPath;
@@ -80,7 +85,7 @@ export async function run(): Promise<void> {
     if (tools.isGranted(outside.approval)) throw new Error('« pour la session » appliqué à une commande hors du projet');
     ok('validations : dans le projet, auteur ou hôte ; hors du projet, hôte seul, jamais couvert par « pour la session »');
 
-    if (!(await import('../../src/agentTools')).sandboxAvailable()) {
+    if (!sandbox) {
       log.push('  · bubblewrap indisponible : test du bac à sable ignoré');
     } else {
       const home = os.homedir();
@@ -121,6 +126,12 @@ export async function run(): Promise<void> {
     if (Date.now() - started > 20_000) throw new Error('commande non arrêtée');
     if (fs.existsSync(marker)) throw new Error("un sous-processus a survécu à l'arrêt");
     ok(`arrêt d'une commande hors bac à sable : processus et sous-processus arrêtés (${stopped.summary})`);
+    // Démarrage complet d'une session (préparation de l'environnement comprise), puis arrêt.
+    await vscode.commands.executeCommand('sharedCopilotChat.startSession');
+    if (!api.nativeChatActive()) throw new Error("la session n'a pas démarré");
+    await vscode.commands.executeCommand('sharedCopilotChat.stopSession');
+    if (api.nativeChatActive()) throw new Error("la session ne s'est pas arrêtée");
+    ok('Start Session / Stop Session : préparation de l’environnement puis démarrage et arrêt');
     log.push('RESULT: PASS');
   } catch (err) {
     log.push(`✗ ${(err as Error).message}`, 'RESULT: FAIL');

@@ -1,9 +1,9 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AgentQuestion, ApprovalKind, ApprovalRequest } from './protocol';
+import { detectSandbox, resetSandbox, sandboxCommand, sandboxRuntime } from './sandbox';
 
 /**
  * Outils donnés au modèle pour travailler dans l'espace de travail de l'hôte.
@@ -127,10 +127,10 @@ export class WorkspaceTools {
       lines.push(
         "Tu peux modifier ou créer des fichiers et lancer des commandes : chaque action est validée par l'auteur de la demande ou par l'hôte, qui peuvent refuser.",
         "Pour modifier un fichier, lis-le d'abord puis utilise edit_file avec un extrait exact et unique du contenu actuel.",
-        sandboxAvailable()
-          ? "Les commandes s'exécutent dans un bac à sable : projet seul, sans réseau ni dossier personnel. Si une commande a besoin du réseau ou de fichiers hors du projet (installation de dépendances, etc.), relance-la avec outsideProject: true ; seul l'hôte peut alors la valider."
-          : "Les commandes s'exécutent hors bac à sable : seul l'hôte peut les valider.",
-        `Système et shell des commandes : ${shellDescription()}. Utilise la syntaxe correspondante.`,
+        sandboxRuntime()
+          ? `Les commandes s'exécutent dans un bac à sable ${sandboxRuntime()!.description} avec /bin/sh (syntaxe Linux) : projet seul, sans réseau ni dossier personnel. ` +
+            `Si une commande a besoin du réseau ou de fichiers hors du projet (installation de dépendances, etc.), relance-la avec outsideProject: true : elle s'exécute alors sur la machine de l'hôte (${hostShellDescription()}) et seul l'hôte peut la valider.`
+          : `Les commandes s'exécutent sans bac à sable sur la machine de l'hôte (${hostShellDescription()}, utilise cette syntaxe) : seul l'hôte peut les valider.`,
         "N'effectue une modification ou une commande que si la demande le justifie clairement.",
       );
     } else {
@@ -147,6 +147,24 @@ export class WorkspaceTools {
     }
     const args = typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {};
     return tool.prepare(args);
+  }
+
+  /** Détecte le bac à sable (bubblewrap natif, ou via WSL sous Windows). */
+  initSandbox(log: (message: string) => void, force = false): Promise<unknown> {
+    if (force) {
+      resetSandbox();
+    }
+    return detectSandbox({
+      extraReadOnly: config().get<string[]>('sandboxReadOnlyPaths', []),
+      useWsl: config().get<boolean>('wslSandbox', true),
+      wslDistro: config().get<string>('wslDistro', '').trim(),
+      log,
+    });
+  }
+
+  /** Description du bac à sable des commandes, ou undefined s'il n'y en a pas. */
+  sandboxDescription(): string | undefined {
+    return sandboxRuntime()?.description;
   }
 
   /** true si l'hôte a déjà autorisé cette catégorie d'action pour la session (jamais pour une action hors du projet). */
@@ -794,14 +812,13 @@ function runCommandTool(output: vscode.OutputChannel): AgentTool {
         throw new Error('Paramètre « command » manquant.');
       }
       const { uri: cwd, rel } = await resolveSafe(input.cwd);
-      const sandboxed = input.outsideProject !== true && sandboxAvailable();
+      const rt = sandboxRuntime();
+      const sandboxed = input.outsideProject !== true && !!rt && rt.toSandbox(cwd.fsPath) !== undefined;
       const where = sandboxed
-        ? 'bac à sable : projet seul, sans réseau'
-        : sandboxAvailable()
-          ? 'HORS bac à sable : accès au réseau et à toute la machine'
-          : process.platform === 'win32'
-            ? 'Windows, sans bac à sable : accès à toute la machine'
-            : 'HORS bac à sable (bubblewrap indisponible) : accès à toute la machine';
+        ? `bac à sable ${rt!.description} : projet seul, sans réseau`
+        : rt
+          ? `HORS bac à sable (${hostShellDescription()}) : accès au réseau et à toute la machine`
+          : `sans bac à sable (${hostShellDescription()}) : accès à toute la machine`;
       return {
         title: sandboxed ? 'Exécuter dans le terminal' : 'Exécuter hors du projet',
         approval: {
@@ -817,85 +834,6 @@ function runCommandTool(output: vscode.OutputChannel): AgentTool {
 }
 
 // ---- Exécution des commandes ----
-
-let bwrapPath: string | null | undefined;
-
-/** bubblewrap (Linux) permet de confiner les commandes au projet. */
-export function sandboxAvailable(): boolean {
-  if (bwrapPath === undefined) {
-    bwrapPath =
-      process.platform === 'linux'
-        ? (['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap'].find((p) => fs.existsSync(p)) ?? null)
-        : null;
-  }
-  return bwrapPath !== null;
-}
-
-/** Arguments bubblewrap : système en lecture seule, projet en écriture, rien d'autre (ni $HOME, ni réseau). */
-function sandboxArgs(cwd: string): { args: string[]; path: string } {
-  const args = ['--die-with-parent', '--new-session', '--unshare-all', '--clearenv'];
-  for (const dir of ['/bin', '/sbin', '/lib', '/lib32', '/lib64']) {
-    try {
-      const st = fs.lstatSync(dir);
-      if (st.isSymbolicLink()) {
-        args.push('--symlink', fs.readlinkSync(dir), dir);
-      } else if (st.isDirectory()) {
-        args.push('--ro-bind', dir, dir);
-      }
-    } catch {
-      // Absent sur cette distribution.
-    }
-  }
-  args.push('--ro-bind', '/usr', '/usr');
-  for (const etc of ['/etc/alternatives', '/etc/ssl', '/etc/ca-certificates', '/etc/localtime']) {
-    args.push('--ro-bind-try', etc, etc);
-  }
-  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/tmp/home');
-
-  // Outils installés hors de /usr (ex. Node dans le dossier personnel) : visibles en lecture seule.
-  const home = os.homedir();
-  const pathDirs: string[] = [];
-  const readOnly = new Set<string>(config().get<string[]>('sandboxReadOnlyPaths', []));
-  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
-    if (!dir || !path.isAbsolute(dir) || dir.startsWith('/usr') || ['/bin', '/sbin'].includes(dir) || dir === home) {
-      continue;
-    }
-    try {
-      if (fs.statSync(dir).isDirectory()) {
-        readOnly.add(dir);
-        pathDirs.push(dir);
-      }
-    } catch {
-      // Entrée du PATH inexistante.
-    }
-  }
-  // Installation de Node hors de /usr : npm a besoin de <racine>/lib.
-  for (const dir of pathDirs) {
-    if (path.basename(dir) === 'bin' && fs.existsSync(path.join(dir, 'node'))) {
-      readOnly.add(path.dirname(dir));
-    }
-  }
-  for (const dir of readOnly) {
-    args.push('--ro-bind-try', dir, dir);
-  }
-
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    args.push('--bind', folder.uri.fsPath, folder.uri.fsPath);
-    // Les fichiers protégés restent invisibles dans le bac à sable : recouverts par un fichier ou un dossier vide.
-    for (const hidden of protectedEntries(folder.uri.fsPath)) {
-      args.push(...(hidden.dir ? ['--tmpfs', hidden.path] : ['--ro-bind', '/dev/null', hidden.path]));
-    }
-  }
-  const envPath = [...pathDirs, '/usr/local/bin', '/usr/bin', '/bin'].join(':');
-  args.push(
-    '--setenv', 'PATH', envPath,
-    '--setenv', 'HOME', '/tmp/home',
-    '--setenv', 'TERM', 'dumb',
-    '--setenv', 'LANG', process.env.LANG ?? 'C.UTF-8',
-    '--chdir', cwd,
-  );
-  return { args, path: envPath };
-}
 
 /** Arrête un processus et ses descendants (taskkill sous Windows, groupe de processus ailleurs). */
 function killTree(pid: number | undefined, fallback: () => void): void {
@@ -914,8 +852,13 @@ function killTree(pid: number | undefined, fallback: () => void): void {
   }
 }
 
-/** Shell utilisé pour les commandes, décrit au modèle pour qu'il en respecte la syntaxe. */
-function shellDescription(): string {
+/** true si les commandes peuvent être confinées au projet. */
+export function sandboxAvailable(): boolean {
+  return sandboxRuntime() !== undefined;
+}
+
+/** Shell des commandes hors bac à sable, décrit au modèle pour qu'il en respecte la syntaxe. */
+function hostShellDescription(): string {
   if (process.platform === 'win32') {
     return 'Windows, PowerShell';
   }
@@ -975,8 +918,19 @@ function runShell(
 ): Promise<{ result: string; summary: string }> {
   return new Promise((resolve) => {
     output.appendLine(`\n$ ${command}   (dans ${cwd}${sandboxed ? ', bac à sable' : ', HORS bac à sable'})`);
-    const child = sandboxed
-      ? spawn(bwrapPath!, [...sandboxArgs(cwd).args, '/bin/sh', '-c', command], { cwd })
+    const rt = sandboxRuntime();
+    let sandboxArgs: string[] | undefined;
+    if (sandboxed) {
+      try {
+        const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+        sandboxArgs = sandboxCommand(rt!, { folders, hidden: folders.flatMap(protectedEntries), cwd }, command);
+      } catch (err) {
+        resolve({ result: `échec : ${(err as Error).message}`, summary: 'échec' });
+        return;
+      }
+    }
+    const child = sandboxArgs
+      ? spawn(rt!.launcher, sandboxArgs, { cwd, env: rt!.env, windowsHide: true })
       : process.platform === 'win32'
         ? spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], {
             cwd,

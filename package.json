@@ -179,7 +179,34 @@
             "type": "string"
           },
           "default": [],
-          "description": "Dossiers supplémentaires visibles en lecture seule dans le bac à sable des commandes (ex. une chaîne d'outils installée hors de /usr). Les dossiers du PATH y sont déjà."
+          "description": "Dossiers Linux supplémentaires visibles en lecture seule dans le bac à sable des commandes (ex. une chaîne d'outils installée hors de /usr ; sous WSL, chemins de la distribution). Les dossiers du PATH y sont déjà."
+        },
+        "sharedCopilotChat.wslSandbox": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sous Windows : isole les commandes de l'agent dans WSL avec bubblewrap (comme sous Linux) si WSL 2 et bubblewrap sont disponibles. Sinon, chaque commande doit être validée par l'hôte."
+        },
+        "sharedCopilotChat.wslDistro": {
+          "type": "string",
+          "default": "",
+          "description": "Distribution WSL utilisée pour le bac à sable (vide : distribution par défaut)."
+        },
+        "sharedCopilotChat.wslMode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "reopen",
+            "windows",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Demander au démarrage d'une session s'il faut rouvrir le projet dans WSL.",
+            "Toujours rouvrir le projet dans WSL (fonctionnement identique à Linux).",
+            "Rester sous Windows (commandes isolées via WSL si possible).",
+            "Ne rien proposer."
+          ],
+          "default": "ask",
+          "description": "Sous Windows, si WSL est installé : que faire au démarrage d'une session. Ce qui manque (bubblewrap, extension WSL) est installé avec votre accord."
         }
       }
     },
@@ -200,7 +227,7 @@
     "check-types": "tsc -p . --noEmit && tsc -p src/web --noEmit",
     "test": "node esbuild.js --test && node dist/test/smoke.js",
     "vscode:prepublish": "npm run package",
-    "test:vscode": "node esbuild.js && node esbuild.js --test && node test/vscode/run.js"
+    "test:vscode": "node esbuild.js && node esbuild.js --test && node test/vscode/run.js && node test/vscode/run.js --wsl"
   },
   "dependencies": {
     "@vscode/codicons": "^0.0.46-24",
