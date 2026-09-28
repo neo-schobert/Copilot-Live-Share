@@ -13,6 +13,7 @@ import {
   QueueItem,
   QueueState,
   ServerMessage,
+  ToolActivity,
   UserEntry,
 } from './protocol';
 import type { Connection, ConnectionHandler } from './server';
@@ -28,23 +29,35 @@ export interface ModelTurn {
   content: string;
 }
 
+export type ModelEvent = { type: 'text'; text: string } | { type: 'tool'; tool: ToolActivity };
+
 export interface ModelResponse {
   modelName: string;
-  chunks: AsyncIterable<string>;
+  events: AsyncIterable<ModelEvent>;
+}
+
+export interface ModelRequest {
+  turns: ModelTurn[];
+  /** Modèle demandé ; absent : modèle par défaut. */
+  modelId?: string;
+  /** Auteur de la question (affiché dans les demandes de validation de l'hôte). */
+  author: string;
 }
 
 export interface ModelBackend {
-  /**
-   * Lance une requête sur le modèle `modelId` (ou le modèle par défaut s'il est absent).
-   * Doit lever une Error au message lisible par les participants en cas d'échec.
-   */
-  ask(turns: ModelTurn[], signal: AbortSignal, modelId?: string): Promise<ModelResponse>;
+  /** Lance une requête. Doit lever une Error au message lisible par les participants en cas d'échec. */
+  ask(request: ModelRequest, signal: AbortSignal): Promise<ModelResponse>;
 }
+
+/** Identité utilisée pour les questions posées depuis VS Code (panneau Chat natif). */
+export const LOCAL_HOST_CLIENT_ID = 'vscode-host-local';
 
 export interface ChatRoomOptions {
   /** Nombre d'échanges précédents envoyés au modèle (lu à chaque question). */
   historyLength: () => number;
   onParticipantsChanged?: (participants: Participant[]) => void;
+  /** Consignes ajoutées au prompt système (ex. description de l'espace de travail et des outils). */
+  extraInstructions?: () => string;
 }
 
 interface ClientState extends Participant {
@@ -77,6 +90,7 @@ export class ChatRoom implements ConnectionHandler {
   private current: { item: QueuedQuestion; abort: AbortController } | undefined;
   private models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
   private disposed = false;
+  private readonly listeners = new Set<(msg: ServerMessage) => void>();
 
   constructor(
     private readonly backend: ModelBackend,
@@ -123,7 +137,7 @@ export class ChatRoom implements ConnectionHandler {
 
     switch (msg.type) {
       case 'ask':
-        this.handleAsk(state, msg.conversationId, msg.text, msg.modelId, fail);
+        this.enqueueQuestion(state, msg.conversationId, msg.text, msg.modelId, fail);
         break;
       case 'cancel':
         if (!state.isHost) {
@@ -213,6 +227,60 @@ export class ChatRoom implements ConnectionHandler {
     return true;
   }
 
+  /** Reçoit tous les messages diffusés aux participants (intégration au chat natif). */
+  subscribe(listener: (msg: ServerMessage) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  getConversation(id: string): Conversation | undefined {
+    const conv = this.findConversation(id);
+    return conv && publicConversation(conv);
+  }
+
+  entriesOf(conversationId: string): ChatEntry[] {
+    return this.entries.filter((e) => e.conversationId === conversationId);
+  }
+
+  /** Réponse (terminée ou en cours) à une question, si elle a commencé. */
+  answerTo(questionId: string): AssistantEntry | undefined {
+    return this.entries.find((e): e is AssistantEntry => e.kind === 'assistant' && e.replyTo === questionId);
+  }
+
+  /** Crée une discussion au nom de l'hôte depuis VS Code. */
+  createConversationAsHost(author: string): Conversation {
+    return publicConversation(this.createConversation(author, LOCAL_HOST_CLIENT_ID));
+  }
+
+  /**
+   * Pose une question au nom de l'hôte depuis VS Code. Renvoie l'id de la question,
+   * ou lève une Error si elle est refusée.
+   */
+  askAsHost(conversationId: string, text: string, author: string, modelId?: string): string {
+    const state: ClientState = { clientId: LOCAL_HOST_CLIENT_ID, name: author, isHost: true, viewing: null, joined: true };
+    let error: string | undefined;
+    const knownModel = modelId && this.models.available.some((m) => m.id === modelId) ? modelId : undefined;
+    const id = this.enqueueQuestion(state, conversationId, text, knownModel, (m) => (error = m));
+    if (!id) {
+      throw new Error(error ?? 'Question vide.');
+    }
+    return id;
+  }
+
+  /** Annule une question : arrête la réponse si elle est en cours, la retire de la file sinon. */
+  cancelQuestion(entryId: string): void {
+    if (this.current?.item.entryId === entryId) {
+      this.cancelCurrent();
+      return;
+    }
+    const before = this.queue.length;
+    removeWhere(this.queue, (q) => q.entryId === entryId);
+    if (this.queue.length !== before) {
+      this.addSystemMessage(entryId, 'Question retirée de la file.');
+      this.broadcastQueue();
+    }
+  }
+
   /** Met à jour la liste des modèles proposés et la diffuse. */
   setModels(models: ModelsState): void {
     this.models = models;
@@ -231,6 +299,7 @@ export class ChatRoom implements ConnectionHandler {
     this.entries.length = 0;
     this.conversations.length = 0;
     this.clients.clear();
+    this.listeners.clear();
   }
 
   // ---- Gestion des messages ----
@@ -258,42 +327,43 @@ export class ChatRoom implements ConnectionHandler {
     this.broadcastParticipants();
   }
 
-  private handleAsk(
+  /** Valide et met en file une question. Renvoie l'id de la question, ou undefined si refusée. */
+  private enqueueQuestion(
     state: ClientState,
     conversationId: string,
     rawText: string,
     rawModelId: string | undefined,
     fail: (message: string) => void,
-  ): void {
+  ): string | undefined {
     const conv = this.findConversation(conversationId);
     if (!conv) {
       fail("Cette discussion n'existe plus.");
-      return;
+      return undefined;
     }
     const text = rawText.trim();
     if (!text) {
-      return;
+      return undefined;
     }
     if (text.length > LIMITS.maxQuestionLength) {
       fail(`Question trop longue (max ${LIMITS.maxQuestionLength} caractères).`);
-      return;
+      return undefined;
     }
     let modelId: string | undefined;
     if (rawModelId) {
       if (!state.isHost && !this.models.guestsCanChoose) {
         fail("L'hôte a fixé le modèle : choix de modèle non autorisé.");
-        return;
+        return undefined;
       }
       if (!this.models.available.some((m) => m.id === rawModelId)) {
         fail("Ce modèle n'est plus disponible. Choisissez-en un autre.");
-        return;
+        return undefined;
       }
       modelId = rawModelId;
     }
     const pendingForClient = this.queue.filter((q) => q.clientId === state.clientId).length;
     if (pendingForClient >= LIMITS.maxPendingPerClient) {
       fail(`Vous avez déjà ${pendingForClient} questions en attente.`);
-      return;
+      return undefined;
     }
 
     const entry: UserEntry = {
@@ -315,6 +385,14 @@ export class ChatRoom implements ConnectionHandler {
     this.queue.push({ entryId: entry.id, conversationId, clientId: state.clientId, author: state.name, text, modelId });
     this.broadcastQueue();
     this.pump();
+    return entry.id;
+  }
+
+  private addSystemMessage(nearEntryId: string, text: string): void {
+    const near = this.entries.find((e) => e.id === nearEntryId);
+    if (near) {
+      this.pushEntry({ kind: 'system', id: newId(), conversationId: near.conversationId, timestamp: Date.now(), level: 'info', text });
+    }
   }
 
   // ---- Discussions ----
@@ -394,21 +472,30 @@ export class ChatRoom implements ConnectionHandler {
       replyTo: item.entryId,
       replyToAuthor: item.author,
       text: '',
+      parts: [],
       status: 'streaming',
     };
     this.pushEntry(entry);
     this.broadcastQueue();
 
     try {
-      const response = await this.backend.ask(turns, signal, item.modelId ?? this.models.defaultId ?? undefined);
+      const response = await this.backend.ask(
+        { turns, modelId: item.modelId ?? this.models.defaultId ?? undefined, author: item.author },
+        signal,
+      );
       entry.model = response.modelName;
       this.broadcast({ type: 'entryUpdate', entryId: entry.id, status: 'streaming', model: entry.model });
-      for await (const chunk of response.chunks) {
+      for await (const event of response.events) {
         if (signal.aborted || this.disposed) {
           break;
         }
-        entry.text += chunk;
-        this.broadcast({ type: 'chunk', entryId: entry.id, text: chunk });
+        if (event.type === 'text') {
+          appendText(entry, event.text);
+          this.broadcast({ type: 'chunk', entryId: entry.id, text: event.text });
+        } else {
+          upsertTool(entry, event.tool);
+          this.broadcast({ type: 'tool', entryId: entry.id, tool: event.tool });
+        }
       }
       entry.status = signal.aborted ? 'cancelled' : 'done';
     } catch (err) {
@@ -464,8 +551,9 @@ export class ChatRoom implements ConnectionHandler {
 
     const limit = Math.max(0, Math.floor(this.options.historyLength()));
     const recent = limit === 0 ? [] : units.slice(-limit);
+    const extra = this.options.extraInstructions?.();
     const turns: ModelTurn[] = [
-      { role: 'user', content: SYSTEM_PROMPT },
+      { role: 'user', content: extra ? `${SYSTEM_PROMPT}\n\n${extra}` : SYSTEM_PROMPT },
       ...recent.flat(),
       { role: 'user', content: `${question.author}: ${question.text}` },
     ];
@@ -510,6 +598,13 @@ export class ChatRoom implements ConnectionHandler {
   }
 
   private broadcast(msg: ServerMessage): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(msg);
+      } catch {
+        // Un abonné local défaillant ne doit pas bloquer la diffusion.
+      }
+    }
     for (const [conn, state] of this.clients) {
       if (state.joined) {
         conn.send(msg);
@@ -585,6 +680,25 @@ function mergeConsecutive(turns: ModelTurn[]): ModelTurn[] {
     }
   }
   return out;
+}
+
+function appendText(entry: AssistantEntry, text: string): void {
+  entry.text += text;
+  const last = entry.parts[entry.parts.length - 1];
+  if (last?.type === 'text') {
+    last.text += text;
+  } else {
+    entry.parts.push({ type: 'text', text });
+  }
+}
+
+function upsertTool(entry: AssistantEntry, tool: ToolActivity): void {
+  const existing = entry.parts.find((p) => p.type === 'tool' && p.tool.id === tool.id);
+  if (existing && existing.type === 'tool') {
+    existing.tool = { ...tool };
+  } else {
+    entry.parts.push({ type: 'tool', tool: { ...tool } });
+  }
 }
 
 function removeWhere<T>(list: T[], pred: (item: T) => boolean): void {

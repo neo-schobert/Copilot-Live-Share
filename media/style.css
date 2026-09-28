@@ -346,6 +346,25 @@ button.icon:hover { background: var(--surface-2); }
   white-space: pre;
 }
 
+.tool {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 6px 0;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  font-size: 13px;
+}
+.tool-icon { width: 1.2em; text-align: center; flex: none; }
+.tool-title { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.tool-detail { color: var(--muted); }
+.tool-running .tool-icon { animation: blink 1.2s infinite ease-in-out; }
+.tool-awaitingApproval { background: var(--context); border: 1px solid var(--context-border); }
+.tool-rejected .tool-detail, .tool-error .tool-detail { color: var(--danger); }
+.tool-done .tool-icon { color: var(--ok); }
+
 .note { margin: 8px 0 0; font-size: 13px; color: var(--muted); font-style: italic; }
 .note.error { color: var(--danger); font-style: normal; }
 

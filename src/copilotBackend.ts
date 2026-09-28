@@ -1,51 +1,143 @@
 import * as vscode from 'vscode';
-import type { ModelBackend, ModelResponse, ModelTurn } from './chatRoom';
-import type { ModelInfo } from './protocol';
+import type { WorkspaceTools } from './agentTools';
+import type { ModelBackend, ModelEvent, ModelRequest, ModelResponse } from './chatRoom';
+import type { ModelInfo, ToolActivity } from './protocol';
 
-/** Accès aux modèles Copilot via l'API Language Model de VS Code. */
+/** Nombre maximal d'allers-retours modèle ↔ outils pour une question. */
+const MAX_TOOL_ROUNDS = 25;
+
+/**
+ * Accès aux modèles Copilot via l'API Language Model de VS Code, avec une boucle
+ * agent : le modèle peut appeler les outils de l'espace de travail, dont les
+ * résultats lui sont renvoyés jusqu'à sa réponse finale.
+ */
 export class CopilotBackend implements ModelBackend {
-  async ask(turns: ModelTurn[], signal: AbortSignal, modelId?: string): Promise<ModelResponse> {
-    const model = modelId ? await selectById(modelId) : await selectModel();
+  constructor(private readonly tools: WorkspaceTools) {}
 
-    const cts = new vscode.CancellationTokenSource();
-    const onAbort = () => cts.cancel();
-    signal.addEventListener('abort', onAbort, { once: true });
-    const cleanup = () => {
-      signal.removeEventListener('abort', onAbort);
-      cts.dispose();
-    };
-
-    const messages = turns.map((t) =>
+  async ask(request: ModelRequest, signal: AbortSignal): Promise<ModelResponse> {
+    const model = request.modelId ? await selectById(request.modelId) : await selectModel();
+    const messages = request.turns.map((t) =>
       t.role === 'user'
         ? vscode.LanguageModelChatMessage.User(t.content)
         : vscode.LanguageModelChatMessage.Assistant(t.content),
     );
+    return { modelName: model.name, events: this.run(model, messages, request.author, signal) };
+  }
 
-    let response: vscode.LanguageModelChatResponse;
+  private async *run(
+    model: vscode.LanguageModelChat,
+    messages: vscode.LanguageModelChatMessage[],
+    author: string,
+    signal: AbortSignal,
+  ): AsyncGenerator<ModelEvent> {
+    const cts = new vscode.CancellationTokenSource();
+    const onAbort = () => cts.cancel();
+    signal.addEventListener('abort', onAbort, { once: true });
+    let tools = this.tools.definitions();
+    let toolCounter = 0;
+
     try {
-      response = await model.sendRequest(
-        messages,
-        { justification: 'Shared Copilot Chat envoie les questions des participants de la session partagée.' },
-        cts.token,
-      );
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        let response: vscode.LanguageModelChatResponse;
+        try {
+          response = await model.sendRequest(
+            messages,
+            {
+              justification: 'Shared Copilot Chat envoie les questions des participants de la session partagée.',
+              tools: tools.length ? tools : undefined,
+            },
+            cts.token,
+          );
+        } catch (err) {
+          // Certains modèles n'acceptent pas les outils : on réessaie sans.
+          if (tools.length && round === 0 && /tool/i.test(String((err as Error)?.message))) {
+            tools = [];
+            yield { type: 'text', text: "_Ce modèle ne prend pas en charge les outils : réponse sans accès aux fichiers._\n\n" };
+            round--;
+            continue;
+          }
+          throw toReadableError(err);
+        }
+
+        let text = '';
+        const calls: vscode.LanguageModelToolCallPart[] = [];
+        try {
+          for await (const part of response.stream) {
+            if (part instanceof vscode.LanguageModelTextPart) {
+              text += part.value;
+              yield { type: 'text', text: part.value };
+            } else if (part instanceof vscode.LanguageModelToolCallPart) {
+              calls.push(part);
+            }
+          }
+        } catch (err) {
+          throw toReadableError(err);
+        }
+        if (!calls.length || signal.aborted) {
+          return;
+        }
+        if (text && !text.endsWith('\n')) {
+          yield { type: 'text', text: '\n\n' };
+        }
+
+        messages.push(
+          vscode.LanguageModelChatMessage.Assistant([...(text ? [new vscode.LanguageModelTextPart(text)] : []), ...calls]),
+        );
+        const results: vscode.LanguageModelToolResultPart[] = [];
+        for (const call of calls) {
+          const id = `t${++toolCounter}`;
+          const outcome = yield* this.runTool(id, call, author, signal);
+          results.push(new vscode.LanguageModelToolResultPart(call.callId, [new vscode.LanguageModelTextPart(outcome)]));
+          if (signal.aborted) {
+            return;
+          }
+        }
+        messages.push(vscode.LanguageModelChatMessage.User(results));
+      }
+      yield { type: 'text', text: `\n\n_Limite de ${MAX_TOOL_ROUNDS} étapes atteinte : reformulez ou découpez la demande._` };
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+      cts.dispose();
+    }
+  }
+
+  /** Exécute un appel d'outil en publiant son avancement ; renvoie le texte à transmettre au modèle. */
+  private async *runTool(
+    id: string,
+    call: vscode.LanguageModelToolCallPart,
+    author: string,
+    signal: AbortSignal,
+  ): AsyncGenerator<ModelEvent, string> {
+    const activity = (tool: ToolActivity): ModelEvent => ({ type: 'tool', tool });
+    let prepared;
+    try {
+      prepared = await this.tools.prepare(call.name, call.input);
     } catch (err) {
-      cleanup();
-      throw toReadableError(err);
+      const message = err instanceof Error ? err.message : String(err);
+      yield activity({ id, title: call.name, status: 'error', detail: message });
+      return `Erreur : ${message}`;
     }
 
-    async function* stream(): AsyncGenerator<string> {
-      try {
-        for await (const chunk of response.text) {
-          yield chunk;
-        }
-      } catch (err) {
-        throw toReadableError(err);
-      } finally {
-        cleanup();
+    const title = prepared.title;
+    if (prepared.approval) {
+      yield activity({ id, title, status: 'awaitingApproval', detail: "En attente de validation par l'hôte" });
+      const approved = await this.tools.requestApproval(prepared, author);
+      if (!approved || signal.aborted) {
+        yield activity({ id, title, status: 'rejected', detail: "Refusé par l'hôte" });
+        return "L'hôte a refusé cette action. Ne la retente pas telle quelle ; explique ce que tu voulais faire ou propose une alternative.";
       }
     }
 
-    return { modelName: model.name, chunks: stream() };
+    yield activity({ id, title, status: 'running' });
+    try {
+      const { result, summary } = await prepared.execute(signal);
+      yield activity({ id, title, status: 'done', detail: summary });
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      yield activity({ id, title, status: 'error', detail: message });
+      return `Erreur : ${message}`;
+    }
   }
 }
 

@@ -5,7 +5,7 @@
 import * as assert from 'assert/strict';
 import * as http from 'http';
 import { WebSocket } from 'ws';
-import { ChatRoom, ModelBackend, ModelTurn } from '../src/chatRoom';
+import { ChatRoom, ModelBackend, ModelEvent, ModelRequest, ModelTurn } from '../src/chatRoom';
 import { CLOSE_CODES, ServerMessage } from '../src/protocol';
 import { ChatServer } from '../src/server';
 
@@ -15,26 +15,35 @@ const HOST = 'host-token-456';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Modèle factice : répond « Réponse à <question> » en plusieurs morceaux. */
+/**
+ * Modèle factice : répond « Réponse à <question> » en plusieurs morceaux. Une
+ * question contenant « outil » simule en plus une action d'outil (lecture de fichier).
+ */
 class FakeBackend implements ModelBackend {
   readonly calls: ModelTurn[][] = [];
   readonly modelIds: (string | undefined)[] = [];
 
-  async ask(turns: ModelTurn[], signal: AbortSignal, modelId?: string) {
+  async ask({ turns, modelId }: ModelRequest, signal: AbortSignal) {
     this.calls.push(turns);
     this.modelIds.push(modelId);
     const question = turns[turns.length - 1].content.split('\n\n').pop() ?? '';
     const slow = question.includes('lent');
-    async function* chunks() {
+    async function* events(): AsyncGenerator<ModelEvent> {
+      if (question.includes('outil')) {
+        yield { type: 'text', text: 'Je regarde le fichier. ' };
+        yield { type: 'tool', tool: { id: 't1', title: 'Lecture de src/a.ts', status: 'running' } };
+        await sleep(20);
+        yield { type: 'tool', tool: { id: 't1', title: 'Lecture de src/a.ts', status: 'done', detail: '3 lignes' } };
+      }
       for (const word of `Réponse à « ${question} » terminée`.split(' ')) {
         if (signal.aborted) {
           return;
         }
         await sleep(slow ? 100 : 15);
-        yield `${word} `;
+        yield { type: 'text', text: `${word} ` };
       }
     }
-    return { modelName: modelId ?? 'fake-model', chunks: chunks() };
+    return { modelName: modelId ?? 'fake-model', events: events() };
   }
 }
 
@@ -254,7 +263,32 @@ async function main() {
   await host.waitFor((m) => m.type === 'entryUpdate' && m.status === 'done' && backend.modelIds.at(-1) === 'model-b');
   ok('Choix du modèle par question, modèle par défaut, restriction des invités');
 
-  // 9. Reconnexion avec le même pseudo : historique complet renvoyé
+  // 9. Actions d'outils et API hôte utilisée par le chat natif
+  const local: ServerMessage[] = [];
+  const unsubscribe = room.subscribe((m) => local.push(m));
+  const hostQuestion = room.askAsHost(alice.conv, 'Utilise un outil stp', 'neo');
+  await alice.waitFor((m) => m.type === 'tool' && m.tool.status === 'done');
+  const toolAnswer = await alice.waitFor((m) => m.type === 'entryUpdate' && m.status === 'done' && room.answerTo(hostQuestion)?.id === m.entryId);
+  assert.ok(toolAnswer);
+  const answer = room.answerTo(hostQuestion)!;
+  assert.deepEqual(answer.parts.map((p) => p.type), ['text', 'tool', 'text']);
+  assert.equal(answer.parts[1].type === 'tool' && answer.parts[1].tool.status, 'done');
+  assert.ok(!answer.text.includes('Lecture'), "le texte envoyé au modèle n'inclut pas les actions d'outils");
+  assert.ok(local.some((m) => m.type === 'chunk') && local.some((m) => m.type === 'tool'), 'les abonnés locaux reçoivent le flux');
+  assert.ok(alice.messages.some((m) => m.type === 'entry' && m.entry.kind === 'user' && m.entry.author === 'neo' && m.entry.isHost));
+  ok("Actions d'outils diffusées et entrelacées au texte ; question de l'hôte depuis VS Code");
+
+  const slowId = room.askAsHost(alice.conv, 'Encore une question lente', 'neo');
+  const queuedId = room.askAsHost(alice.conv, 'Question à retirer', 'neo');
+  room.cancelQuestion(queuedId);
+  await alice.waitFor((m) => m.type === 'entry' && m.entry.kind === 'system' && m.entry.text.includes('retirée'));
+  room.cancelQuestion(slowId);
+  await alice.waitFor((m) => m.type === 'entryUpdate' && m.status === 'cancelled' && room.answerTo(slowId)?.id === m.entryId);
+  assert.equal(room.answerTo(queuedId), undefined);
+  unsubscribe();
+  ok('Annulation depuis VS Code : réponse en cours arrêtée, question en attente retirée');
+
+  // 10. Reconnexion avec le même pseudo : historique complet renvoyé
   bob.ws.close();
   await host.waitFor((m) => m.type === 'participants' && m.participants.length === 2);
   const bob2 = await Client.join('bob');
@@ -264,7 +298,7 @@ async function main() {
   assert.ok(welcome.history.length >= 6);
   ok('Reconnexion : même identité et historique complet');
 
-  // 10. Arrêt : tous les clients sont prévenus et déconnectés
+  // 11. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");
   await server.stop('Session ended');
   await sleep(50);

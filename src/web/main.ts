@@ -8,6 +8,7 @@ import {
   Participant,
   QueueState,
   ServerMessage,
+  ToolActivity,
   WS_PATH,
 } from '../protocol';
 import { codeBlock, renderMarkdown } from './markdown';
@@ -257,6 +258,25 @@ function handle(msg: ServerMessage): void {
       const entry = entries.get(msg.entryId);
       if (entry?.kind === 'assistant') {
         entry.text += msg.text;
+        const last = entry.parts[entry.parts.length - 1];
+        if (last?.type === 'text') {
+          last.text += msg.text;
+        } else {
+          entry.parts.push({ type: 'text', text: msg.text });
+        }
+        markDirty(entry.id);
+      }
+      break;
+    }
+    case 'tool': {
+      const entry = entries.get(msg.entryId);
+      if (entry?.kind === 'assistant') {
+        const existing = entry.parts.find((p) => p.type === 'tool' && p.tool.id === msg.tool.id);
+        if (existing?.type === 'tool') {
+          existing.tool = msg.tool;
+        } else {
+          entry.parts.push({ type: 'tool', tool: msg.tool });
+        }
         markDirty(entry.id);
       }
       break;
@@ -505,9 +525,11 @@ function renderAssistant(entry: AssistantEntry, el: HTMLElement): void {
   h.append(replyTo);
   el.append(h);
 
-  if (entry.text) {
-    el.append(body(renderMarkdown(entry.text)));
-  } else if (entry.status === 'streaming') {
+  for (const part of entry.parts) {
+    el.append(part.type === 'text' ? body(renderMarkdown(part.text)) : toolRow(part.tool));
+  }
+  const last = entry.parts[entry.parts.length - 1];
+  if (entry.status === 'streaming' && (!last || (last.type === 'tool' && last.tool.status === 'done'))) {
     const typing = document.createElement('div');
     typing.className = 'typing';
     typing.innerHTML = '<span></span><span></span><span></span>';
@@ -519,6 +541,33 @@ function renderAssistant(entry: AssistantEntry, el: HTMLElement): void {
   } else if (entry.status === 'error') {
     el.append(note(entry.error ?? 'Erreur inconnue.', true));
   }
+}
+
+const TOOL_ICONS: Record<ToolActivity['status'], string> = {
+  running: '⏳',
+  awaitingApproval: '✋',
+  done: '✓',
+  rejected: '⛔',
+  error: '⚠',
+};
+
+function toolRow(tool: ToolActivity): HTMLElement {
+  const row = document.createElement('div');
+  row.className = `tool tool-${tool.status}`;
+  const icon = document.createElement('span');
+  icon.className = 'tool-icon';
+  icon.textContent = TOOL_ICONS[tool.status];
+  const title = document.createElement('span');
+  title.className = 'tool-title';
+  title.textContent = tool.title;
+  row.append(icon, title);
+  if (tool.detail) {
+    const detail = document.createElement('span');
+    detail.className = 'tool-detail';
+    detail.textContent = tool.detail;
+    row.append(detail);
+  }
+  return row;
 }
 
 function header(author: string, timestamp: number, badge?: string): HTMLElement {

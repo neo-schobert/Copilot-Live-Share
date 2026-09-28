@@ -2,8 +2,10 @@ import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
+import { PROPOSAL_SCHEME, ProposalContentProvider, WorkspaceTools } from './agentTools';
 import { ChatRoom } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
+import { NativeChatBridge } from './nativeChat';
 import { ChatServer } from './server';
 
 const CONFIG = 'sharedCopilotChat';
@@ -14,6 +16,8 @@ class Session {
   private panel: vscode.WebviewPanel | undefined;
   /** URL publique du tunnel saisie par l'hôte, gardée en mémoire seulement. */
   publicUrl: string | undefined;
+  /** Intégration au panneau Chat natif, si l'API proposée est disponible. */
+  nativeChat: NativeChatBridge | undefined;
 
   constructor(
     readonly server: ChatServer,
@@ -52,6 +56,8 @@ class Session {
   }
 
   async stop(): Promise<void> {
+    this.nativeChat?.dispose();
+    this.nativeChat = undefined;
     this.panel?.dispose();
     this.panel = undefined;
     this.room.dispose("L'hôte a arrêté la session.");
@@ -64,13 +70,27 @@ let starting = false;
 let statusBar: vscode.StatusBarItem | undefined;
 /** Dernier éditeur texte actif : activeTextEditor est vide quand la webview a le focus. */
 let lastTextEditor: vscode.TextEditor | undefined;
+let output: vscode.OutputChannel;
+let proposals: ProposalContentProvider;
+let tools: WorkspaceTools;
 
-export function activate(context: vscode.ExtensionContext): void {
+/** API interne renvoyée par activate(), utilisée par les tests d'intégration. */
+export interface SharedCopilotApi {
+  readonly tools: WorkspaceTools;
+  readonly nativeChatActive: () => boolean;
+}
+
+export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
+  output = vscode.window.createOutputChannel('Shared Copilot');
+  proposals = new ProposalContentProvider();
+  tools = new WorkspaceTools(proposals, output);
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'sharedCopilotChat.copyInviteLink';
   lastTextEditor = vscode.window.activeTextEditor;
 
   context.subscriptions.push(
+    output,
+    vscode.workspace.registerTextDocumentContentProvider(PROPOSAL_SCHEME, proposals),
     statusBar,
     vscode.window.onDidChangeActiveTextEditor((e) => {
       if (e) {
@@ -91,6 +111,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
   );
+  return { tools, nativeChatActive: () => !!session?.nativeChat };
 }
 
 export async function deactivate(): Promise<void> {
@@ -136,9 +157,10 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
 
   const guestToken = crypto.randomBytes(24).toString('base64url');
   const hostToken = crypto.randomBytes(24).toString('base64url');
-  const room = new ChatRoom(new CopilotBackend(), {
+  const room = new ChatRoom(new CopilotBackend(tools), {
     historyLength: () => vscode.workspace.getConfiguration(CONFIG).get<number>('historyLength', 20),
     onParticipantsChanged: (p) => updateStatusBar(p.length),
+    extraInstructions: () => tools.instructions(),
   });
   const server = new ChatServer(
     {
@@ -167,6 +189,9 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   }
 
   session = new Session(server, room, guestToken, hostToken);
+  if (config.get<boolean>('nativeChat', true)) {
+    session.nativeChat = NativeChatBridge.tryCreate(room, hostName, (m) => output.appendLine(m));
+  }
   await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', true);
   updateStatusBar(0);
   void refreshModels();
@@ -337,6 +362,7 @@ async function stopSession(): Promise<void> {
     return;
   }
   session = undefined;
+  proposals.clear();
   statusBar?.hide();
   await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', false);
   await s.stop();

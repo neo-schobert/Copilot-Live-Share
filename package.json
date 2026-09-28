@@ -6,7 +6,7 @@
   "publisher": "local",
   "license": "MIT",
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.136.0"
   },
   "categories": [
     "AI",
@@ -117,9 +117,38 @@
           "type": "string",
           "default": "",
           "description": "Pseudo de l'hôte dans le chat (vide : nom d'utilisateur système)."
+        },
+        "sharedCopilotChat.agentMode": {
+          "type": "string",
+          "enum": [
+            "full",
+            "readOnly",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Lecture, modification de fichiers et commandes terminal ; chaque modification ou commande est soumise à la validation de l'hôte.",
+            "Lecture, recherche et diagnostics uniquement.",
+            "Aucun accès à l'espace de travail."
+          ],
+          "default": "full",
+          "description": "Accès du modèle à l'espace de travail de l'hôte. Dans un espace de travail non approuvé, l'accès est limité à la lecture."
+        },
+        "sharedCopilotChat.nativeChat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Affiche les discussions de la session dans le panneau Chat natif de VS Code (API proposée : nécessite F5 ou --enable-proposed-api local.shared-copilot-chat)."
         }
       }
-    }
+    },
+    "chatSessions": [
+      {
+        "type": "shared-copilot",
+        "name": "shared",
+        "displayName": "Shared Copilot",
+        "description": "Discussions de la session Shared Copilot partagée avec les invités",
+        "when": "sharedCopilotChat.active"
+      }
+    ]
   },
   "scripts": {
     "compile": "npm run check-types && node esbuild.js",
@@ -134,9 +163,14 @@
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
-    "@types/vscode": "~1.90.0",
+    "@types/vscode": "^1.136.0",
     "@types/ws": "^8.5.12",
     "esbuild": "^0.24.0",
     "typescript": "^5.6.0"
-  }
+  },
+  "enabledApiProposals": [
+    "chatSessionsProvider",
+    "chatParticipantPrivate",
+    "chatParticipantAdditions"
+  ]
 }

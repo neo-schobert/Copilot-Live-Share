@@ -40,13 +40,31 @@ export interface UserEntry extends BaseEntry {
 
 export type AssistantStatus = 'streaming' | 'done' | 'cancelled' | 'error';
 
+export type ToolStatus = 'running' | 'awaitingApproval' | 'done' | 'rejected' | 'error';
+
+/** Action de l'agent dans l'espace de travail de l'hôte (lecture, recherche, modification…). */
+export interface ToolActivity {
+  id: string;
+  /** Description courte, ex. « Lecture de src/app.ts ». */
+  title: string;
+  status: ToolStatus;
+  /** Complément affiché sous le titre (résumé du résultat, commande, erreur). */
+  detail?: string;
+}
+
+/** Morceau d'une réponse, dans l'ordre d'affichage : texte ou action d'outil. */
+export type AssistantPart = { type: 'text'; text: string } | { type: 'tool'; tool: ToolActivity };
+
 /** Réponse du modèle, remplie au fil du streaming. */
 export interface AssistantEntry extends BaseEntry {
   kind: 'assistant';
   /** Id de la question (UserEntry) à laquelle répond cette entrée. */
   replyTo: string;
   replyToAuthor: string;
+  /** Texte complet de la réponse (sans les actions d'outils). */
   text: string;
+  /** Texte et actions d'outils entrelacés, pour l'affichage. */
+  parts: AssistantPart[];
   status: AssistantStatus;
   model?: string;
   error?: string;
@@ -133,6 +151,8 @@ export type ServerMessage =
   | { type: 'conversationDeleted'; conversationId: string }
   | { type: 'entry'; entry: ChatEntry }
   | { type: 'chunk'; entryId: string; text: string }
+  /** Action d'outil ajoutée à une réponse, ou mise à jour (même `tool.id`). */
+  | { type: 'tool'; entryId: string; tool: ToolActivity }
   | {
       type: 'entryUpdate';
       entryId: string;
