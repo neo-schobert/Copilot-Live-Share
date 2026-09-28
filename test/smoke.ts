@@ -158,7 +158,15 @@ function wsRejected(path: string): Promise<number> {
 
 async function main() {
   const backend = new FakeBackend();
-  const room = new ChatRoom(backend, { historyLength: () => 20 });
+  const room = new ChatRoom(backend, {
+    historyLength: () => 20,
+    onInviteRequested: async (publicUrl, copy) => ({
+      publicUrl: publicUrl ?? '',
+      localUrl: `http://127.0.0.1:${PORT}`,
+      link: `${publicUrl || `http://127.0.0.1:${PORT}`}/?token=${GUEST}`,
+      copied: copy,
+    }),
+  });
   const server = new ChatServer(
     {
       port: PORT,
@@ -446,6 +454,15 @@ async function main() {
   assert.equal(backend.outcomes[3], 'deny:');
   assert.equal(room.pendingApproval(pending4.entryId, pending4.tool.id), undefined);
   ok("Annulation pendant une validation : l'action est refusée et la file repart");
+
+  // 10 bis. Lien d'invitation depuis la page : réservé à l'hôte
+  bob.send({ type: 'invite', copy: true });
+  await bob.waitFor((m) => m.type === 'error' && m.message.includes("lien d'invitation"));
+  host.send({ type: 'invite', publicUrl: 'https://demo.ngrok-free.app', copy: true });
+  const invite = await host.waitFor((m) => m.type === 'invite');
+  assert.ok(invite.type === 'invite' && invite.copied && invite.link === `https://demo.ngrok-free.app/?token=${GUEST}`);
+  assert.ok(!bob.messages.some((m) => m.type === 'invite'), "le lien n'est envoyé qu'à l'hôte");
+  ok("Lien d'invitation depuis le chat : réservé à l'hôte, envoyé à lui seul");
 
   // 11. Reconnexion avec le même pseudo : historique complet renvoyé
   bob.ws.close();

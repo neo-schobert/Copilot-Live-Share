@@ -6,3 +6,7 @@ dist/test/**
 **/*.map
 esbuild.js
 tsconfig.json
+scripts/**
+media/marketplace-icon.svg
+.gitignore
+*.vsix

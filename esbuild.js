@@ -44,8 +44,8 @@ const targets = test
       },
       {
         ...common,
-        entryPoints: ['test/vscode/confine.ts'],
-        outfile: 'dist/test/vscode/confine.js',
+        entryPoints: ['test/vscode/confine.ts', 'test/vscode/view.ts'],
+        outdir: 'dist/test/vscode',
         platform: 'node',
         format: 'cjs',
         target: 'node18',

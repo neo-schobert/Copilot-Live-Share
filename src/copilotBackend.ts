@@ -15,7 +15,10 @@ export class CopilotBackend implements ModelBackend {
   /** Ids d'actions uniques pour toute la session (ils servent aussi à retrouver les diffs). */
   private toolCounter = 0;
 
-  constructor(private readonly tools: WorkspaceTools) {}
+  constructor(
+    private readonly tools: WorkspaceTools,
+    private readonly log: (message: string) => void = () => undefined,
+  ) {}
 
   async ask(request: ModelRequest, signal: AbortSignal): Promise<ModelResponse> {
     const model = request.modelId ? await selectById(request.modelId) : await selectModel();
@@ -28,7 +31,7 @@ export class CopilotBackend implements ModelBackend {
   }
 
   private async *run(
-    model: vscode.LanguageModelChat,
+    initialModel: vscode.LanguageModelChat,
     messages: vscode.LanguageModelChatMessage[],
     request: ModelRequest,
     signal: AbortSignal,
@@ -37,6 +40,7 @@ export class CopilotBackend implements ModelBackend {
     const onAbort = () => cts.cancel();
     signal.addEventListener('abort', onAbort, { once: true });
     let tools = this.tools.definitions();
+    let model = initialModel;
 
     try {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -51,6 +55,16 @@ export class CopilotBackend implements ModelBackend {
             cts.token,
           );
         } catch (err) {
+          // Le modèle « Auto » de Copilot peut refuser d'aiguiller une requête : on rejoue avec un modèle concret.
+          if (isAutoRoutingError(err)) {
+            const fallback = await concreteModel(model);
+            if (fallback) {
+              this.log(`Le modèle « ${model.name} » n'a pas pu aiguiller la requête : nouvel essai avec « ${fallback.name} ».`);
+              model = fallback;
+              round--;
+              continue;
+            }
+          }
           // Certains modèles n'acceptent pas les outils : on réessaie sans.
           if (tools.length && round === 0 && /tool/i.test(String((err as Error)?.message))) {
             tools = [];
@@ -94,7 +108,14 @@ export class CopilotBackend implements ModelBackend {
             return;
           }
         }
-        messages.push(vscode.LanguageModelChatMessage.User(results));
+        // Les résultats sont accompagnés d'un texte : sans lui, le modèle « Auto » de Copilot
+        // ne sait pas aiguiller la requête (« Auto mode needs a prompt or a command… »).
+        messages.push(
+          vscode.LanguageModelChatMessage.User([
+            ...results,
+            new vscode.LanguageModelTextPart(`Voici les résultats des outils ci-dessus. Continue ta réponse à la demande de ${request.author}.`),
+          ]),
+        );
       }
       yield { type: 'text', text: `\n\n_Limite de ${MAX_TOOL_ROUNDS} étapes atteinte : reformulez ou découpez la demande._` };
     } finally {
@@ -173,6 +194,16 @@ export class CopilotBackend implements ModelBackend {
       return `Erreur : ${message}`;
     }
   }
+}
+
+function isAutoRoutingError(err: unknown): boolean {
+  return /auto mode|route a request/i.test(err instanceof Error ? err.message : String(err));
+}
+
+/** Premier modèle Copilot qui n'est pas le routeur « Auto ». */
+async function concreteModel(current: vscode.LanguageModelChat): Promise<vscode.LanguageModelChat | undefined> {
+  const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+  return models.find((m) => m.id !== current.id && !/^auto$/i.test(m.family) && !/^auto$/i.test(m.id) && !/^auto\b/i.test(m.name));
 }
 
 /** Modèles Copilot disponibles, dédoublonnés et triés par nom. */

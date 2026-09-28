@@ -171,6 +171,11 @@ export type ClientMessage =
   | { type: 'approve'; entryId: string; toolId: string; decision: ApprovalDecision }
   /** Réservé à l'hôte : ouvre le diff complet dans VS Code. */
   | { type: 'showDiff'; entryId: string; toolId: string }
+  /**
+   * Réservé à l'hôte : lien d'invitation. `publicUrl` : URL du tunnel (absente : la dernière connue).
+   * `copy` : le copier dans le presse-papier de VS Code (sinon, simple consultation).
+   */
+  | { type: 'invite'; publicUrl?: string; copy: boolean }
   /** Le participant est en train d'écrire dans cette discussion (envoyé au plus toutes les 2 s). */
   | { type: 'typing'; conversationId: string }
   /** Réponse à une question de l'agent (par n'importe quel participant). */
@@ -206,6 +211,8 @@ export type ServerMessage =
   | { type: 'participants'; participants: Participant[] }
   | { type: 'queue'; queue: QueueState }
   | { type: 'models'; models: ModelsState }
+  /** Réponse à une demande de lien d'invitation (envoyée à l'hôte seulement). */
+  | { type: 'invite'; publicUrl: string; localUrl: string; link?: string; copied: boolean; error?: string }
   /** Un participant écrit dans une discussion (l'indicateur expire côté client). */
   | { type: 'typing'; conversationId: string; clientId: string; name: string }
   | { type: 'error'; message: string }

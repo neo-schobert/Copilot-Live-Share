@@ -31,21 +31,49 @@ Ouvrez ce dossier dans VS Code et appuyez sur **F5** : une fenêtre « Extension
 
 Pour installer l'extension de façon permanente : `npx @vscode/vsce package`, puis *Extensions : Installer depuis un VSIX…*.
 
-## Démarrer une session
+### Publier sur le Marketplace
 
-Dans la palette de commandes (`Ctrl+Maj+P`) :
+Le Marketplace n'accepte pas les API expérimentales de VS Code : `npm run package:marketplace` produit un VSIX sans elles (l'intégration au panneau Chat natif est alors simplement désactivée, tout le reste fonctionne).
+
+1. Créez un éditeur (*publisher*) sur <https://marketplace.visualstudio.com/manage> avec l'identifiant `neo-schobert` (ou changez le champ `publisher` de `package.json`), et un jeton d'accès Azure DevOps avec la portée *Marketplace › Manage*.
+2. `npm run package:marketplace` construit `shared-copilot-chat-<version>.vsix`.
+3. `npx vsce login neo-schobert`, puis `npx vsce publish --packagePath shared-copilot-chat-<version>.vsix`. On peut aussi téléverser le fichier `.vsix` à la main sur la page de gestion de l'éditeur.
+
+Avant de publier, vérifiez que le nom et l'usage partagé de Copilot respectent les conditions de GitHub (marque « Copilot », licence utilisée par plusieurs personnes).
+
+## Utilisation
+
+L'extension ajoute une icône **Shared Copilot** dans la barre d'activité, et un bouton `Shared Copilot` dans la barre d'état. Les deux ouvrent la vue du chat, qui propose deux choix.
+
+### Héberger une session
+
+1. Saisissez votre pseudo et cliquez sur **Héberger une session**.
+2. Sous Windows, l'extension propose de rouvrir le projet dans WSL (voir plus bas).
+3. Le chat s'ouvre. Pour inviter, exposez le port de la session avec un tunnel (voir « Exposer le chat aux invités »), puis cliquez sur **Inviter** en haut du chat : collez l'URL publique du tunnel et le lien d'invitation est copié dans votre presse-papier.
+4. L'icône de sortie en haut du chat arrête la session. Tous les participants sont alors déconnectés.
+
+La première question déclenche en général une demande de **consentement** de VS Code (« autoriser Shared Copilot Chat à utiliser les modèles de langage ? ») : l'hôte doit l'accepter. S'il refuse, les participants voient un message d'erreur explicite dans le chat.
+
+### Rejoindre une session
+
+- **Depuis VS Code**, sans navigateur : dans la vue Shared Copilot, saisissez votre pseudo, collez le lien d'invitation reçu de l'hôte et cliquez sur **Rejoindre**. C'est l'extension qui se connecte à la session de l'hôte, y compris à travers un tunnel ngrok gratuit (sa page d'avertissement est contournée).
+- **Depuis un navigateur**, pour ceux qui n'ont pas VS Code : ouvrez simplement le lien d'invitation.
+
+L'icône de sortie en haut du chat quitte la session.
+
+### Commandes
 
 | Commande | Effet |
 | --- | --- |
-| **Shared Copilot: Start Session** | Démarre le serveur, génère un token aléatoire, affiche l'URL locale. |
-| **Shared Copilot: Copy Invite Link** | Demande l'URL publique du tunnel et copie `<url>/?token=<token>` dans le presse-papier. Aussi accessible en cliquant sur l'indicateur de la barre d'état. |
-| **Shared Copilot: Open Chat** | Ouvre le chat dans une webview pour que l'hôte participe (avec le droit d'annuler). |
-| **Shared Copilot: Share Selection** | Envoie la sélection (ou le fichier entier si rien n'est sélectionné) comme « contexte partagé », dans la discussion ouverte dans la webview de l'hôte (sinon, une liste permet de la choisir). Aussi dans le menu contextuel de l'éditeur. |
+| **Shared Copilot: Host a Session** | Démarre une session et ouvre le chat. |
+| **Shared Copilot: Join a Session** | Demande un lien d'invitation et rejoint la session. |
+| **Shared Copilot: Open Chat** | Ouvre la vue du chat. |
+| **Shared Copilot: Leave Session** | Quitte la session rejointe, ou arrête la session hébergée. |
+| **Shared Copilot: Copy Invite Link** | Copie le lien d'invitation (même chose que le bouton **Inviter** du chat). |
+| **Shared Copilot: Share Selection** | Envoie la sélection (ou le fichier entier) comme « contexte partagé », dans la discussion ouverte dans le chat de l'hôte. Aussi dans le menu contextuel de l'éditeur. |
 | **Shared Copilot: Cancel Current Response** | Annule la réponse en cours. |
-| **Shared Copilot: Select Default Model** | Choisit dans une liste le modèle Copilot utilisé par défaut (enregistré dans `sharedCopilotChat.modelFamily`). |
+| **Shared Copilot: Select Default Model** | Choisit le modèle Copilot utilisé par défaut (enregistré dans `sharedCopilotChat.modelFamily`). |
 | **Shared Copilot: Stop Session** | Déconnecte tout le monde et arrête le serveur. |
-
-La première question déclenche en général une demande de **consentement** de VS Code (« autoriser Shared Copilot Chat à utiliser les modèles de langage ? ») : l'hôte doit l'accepter. S'il refuse, les participants voient un message d'erreur explicite dans le chat.
 
 ## L'agent : un Copilot à plusieurs, confiné au projet
 
@@ -183,7 +211,8 @@ src/
   wslSetup.ts        Windows : détection de WSL, réouverture dans WSL, installation de ce qui manque
   nativeChat.ts      Intégration au panneau Chat natif (API proposée chatSessionsProvider)
   types/             Définitions des API proposées de VS Code utilisées
-  extension.ts       Commandes, webview, barre d'état
+  extension.ts       Commandes, héberger / rejoindre, barre d'état
+  chatView.ts        Vue du chat dans VS Code : accueil, connexion relayée vers la session
   web/               Client navigateur (TypeScript vanilla, bundlé par esbuild)
 media/               index.html et style.css servis aux navigateurs
 test/smoke.ts        Test de bout en bout avec un modèle simulé
@@ -193,4 +222,5 @@ test/vscode/         Test d'intégration du confinement dans un vrai VS Code
 - `npm run watch` : recompilation continue
 - `npm run check-types` : vérification TypeScript stricte (extension et client)
 - `npm test` : lance le vrai serveur avec un modèle simulé et vérifie l'authentification, la diffusion identique à plusieurs clients, l'ordre FIFO, l'annulation, les discussions (historiques séparés, renommage, suppression), le choix du modèle, les actions d'outils, les règles de validation (auteur / hôte / hors projet), les questions de l'agent, la reconnexion et l'arrêt de session.
+- `npm run test:view` : construit le VSIX du Marketplace et lance deux VS Code isolés ; l'un héberge une session, l'autre la rejoint depuis sa vue, sans navigateur.
 - `npm run test:vscode` : lance un VS Code isolé (profil temporaire) sur un projet piégé (`.env`, `.git`, liens vers `/etc` et hors du projet) et vérifie le confinement de l'agent et du bac à sable, en mode Linux puis en mode WSL simulé (faux `wsl.exe`). Nécessite la commande `code` et un affichage.

@@ -12,6 +12,7 @@ import {
   WS_PATH,
 } from '../protocol';
 import { codeBlock, renderMarkdown } from './markdown';
+import { openVsCode, openWebSocket, Transport, vscodeApi } from './transport';
 
 // ---- Éléments ----
 
@@ -45,7 +46,21 @@ const askInput = $<HTMLTextAreaElement>('ask-input');
 const askSend = $<HTMLButtonElement>('ask-send');
 const modelSelect = $<HTMLSelectElement>('model-select');
 const presenceEl = $<HTMLElement>('presence');
+const jumpBtn = $<HTMLButtonElement>('jump');
+const inviteBtn = $<HTMLButtonElement>('invite-btn');
+const invitePop = $<HTMLElement>('invite-pop');
+const inviteHint = $<HTMLElement>('invite-hint');
+const inviteForm = $<HTMLFormElement>('invite-form');
+const inviteUrl = $<HTMLInputElement>('invite-url');
+const inviteResult = $<HTMLElement>('invite-result');
 const toastEl = $<HTMLElement>('toast');
+const homeScreen = $<HTMLElement>('home');
+const homeName = $<HTMLInputElement>('home-name');
+const homeHost = $<HTMLButtonElement>('home-host');
+const homeJoinForm = $<HTMLFormElement>('home-join-form');
+const homeLink = $<HTMLInputElement>('home-link');
+const homeStatus = $<HTMLElement>('home-status');
+const leaveBtn = $<HTMLButtonElement>('leave');
 
 // ---- État ----
 
@@ -55,7 +70,7 @@ const clientId = loadClientId();
 
 let myName = '';
 let me: Participant | undefined;
-let ws: WebSocket | undefined;
+let ws: Transport | undefined;
 let ended = false;
 let reconnectDelay = 1000;
 let reconnectTimer: number | undefined;
@@ -93,8 +108,15 @@ askInput.maxLength = LIMITS.maxQuestionLength;
 renameInput.maxLength = LIMITS.maxTitleLength;
 nameInput.value = params.get('name') ?? storage('session', 'scc.name') ?? storage('local', 'scc.name') ?? '';
 
-// Reconnexion après rechargement de l'onglet, ou pseudo fourni par l'hôte (webview) : on rejoint directement.
-if (nameInput.value.trim() && (params.has('name') || storage('session', 'scc.name'))) {
+if (vscodeApi) {
+  // Dans VS Code : écran d'accueil (héberger / rejoindre), la connexion est tenue par l'extension.
+  document.documentElement.classList.add('vscode-theme');
+  joinScreen.hidden = true;
+  homeScreen.hidden = false;
+  window.addEventListener('message', (event) => onExtensionMessage(event.data));
+  vscodeApi.postMessage({ type: 'scc-ready' });
+} else if (nameInput.value.trim() && (params.has('name') || storage('session', 'scc.name'))) {
+  // Reconnexion après rechargement de l'onglet : on rejoint directement.
   join(nameInput.value);
 }
 
@@ -116,21 +138,56 @@ function join(name: string): void {
   askInput.focus();
 }
 
-// Thème de VS Code transmis par la webview de l'hôte (la page est dans une iframe).
-window.addEventListener('message', (event) => {
-  const data = event.data as { type?: string; kind?: string; vars?: Record<string, string> } | null;
-  if (event.source !== window.parent || window.parent === window || data?.type !== 'scc-theme' || !data.vars) {
+// ---- Dans VS Code : accueil et état de la session, pilotés par l'extension ----
+
+interface ExtensionState {
+  type: 'scc-state';
+  mode: 'idle' | 'host' | 'guest';
+  name: string;
+  /** Message affiché sur l'accueil (erreur, démarrage en cours…). */
+  status?: string;
+  error?: boolean;
+  busy?: boolean;
+}
+
+function onExtensionMessage(data: unknown): void {
+  const msg = data as ExtensionState | null;
+  if (msg?.type !== 'scc-state') {
     return;
   }
-  const root = document.documentElement;
-  for (const [name, value] of Object.entries(data.vars)) {
-    if (/^--vscode-[\w-]+$/.test(name) && typeof value === 'string' && value.length < 300) {
-      root.style.setProperty(name, value);
-    }
+  homeName.value ||= msg.name;
+  homeStatus.hidden = !msg.status;
+  homeStatus.textContent = msg.status ?? '';
+  homeStatus.classList.toggle('error', !!msg.error);
+  homeHost.disabled = !!msg.busy;
+  homeJoinForm.querySelector('button')!.disabled = !!msg.busy;
+  if (msg.mode === 'idle') {
+    return;
   }
-  root.classList.add('vscode-theme');
-  root.classList.toggle('vscode-light', data.kind === 'light');
+  // Session ouverte (hébergée ou rejointe) : on passe au chat, avec une seule connexion
+  // (l'extension renvoie l'état à chaque changement ; la reconnexion a sa propre logique).
+  leaveBtn.title = msg.mode === 'host' ? 'Arrêter la session' : 'Quitter la session';
+  if (homeScreen.hidden) {
+    return;
+  }
+  myName = msg.name;
+  homeScreen.hidden = true;
+  app.hidden = false;
+  leaveBtn.hidden = false;
+  connect();
+  askInput.focus();
+}
+
+homeHost.addEventListener('click', () => {
+  vscodeApi?.postMessage({ type: 'scc-host', name: homeName.value.trim() });
 });
+
+homeJoinForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  vscodeApi?.postMessage({ type: 'scc-join', name: homeName.value.trim(), link: homeLink.value.trim() });
+});
+
+leaveBtn.addEventListener('click', () => vscodeApi?.postMessage({ type: 'scc-leave' }));
 
 // ---- WebSocket ----
 
@@ -139,39 +196,47 @@ function connect(): void {
     return;
   }
   setConnection('connecting', me ? 'Reconnexion…' : 'Connexion…');
+  const handlers = {
+    onOpen: () => {
+      reconnectDelay = 1000;
+      transport.send(JSON.stringify({ type: 'hello', name: myName, clientId }));
+    },
+    onMessage: (data: string) => {
+      let msg: ServerMessage;
+      try {
+        msg = JSON.parse(data) as ServerMessage;
+      } catch {
+        return;
+      }
+      handle(msg);
+    },
+    onClose: (code: number, reason: string) => {
+      if (ws !== transport) {
+        return;
+      }
+      ws = undefined;
+      if (code === CLOSE_CODES.sessionEnded) {
+        endSession("L'hôte a arrêté la session.");
+        return;
+      }
+      if (code === CLOSE_CODES.protocolError) {
+        endSession(`Connexion refusée par le serveur${reason ? ` : ${reason}` : ''}.`);
+        return;
+      }
+      // Refus à la connexion (lien invalide, session arrêtée) : inutile de réessayer.
+      if (code === 4401) {
+        endSession(reason || 'Accès refusé : lien invalide ou session terminée.');
+        return;
+      }
+      scheduleReconnect();
+    },
+  };
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const base = location.pathname.replace(/[^/]*$/, '');
-  const socket = new WebSocket(`${proto}//${location.host}${base}${WS_PATH}?token=${encodeURIComponent(token)}`);
-  ws = socket;
-
-  socket.onopen = () => {
-    reconnectDelay = 1000;
-    socket.send(JSON.stringify({ type: 'hello', name: myName, clientId }));
-  };
-  socket.onmessage = (ev) => {
-    let msg: ServerMessage;
-    try {
-      msg = JSON.parse(String(ev.data)) as ServerMessage;
-    } catch {
-      return;
-    }
-    handle(msg);
-  };
-  socket.onclose = (ev) => {
-    if (ws !== socket) {
-      return;
-    }
-    ws = undefined;
-    if (ev.code === CLOSE_CODES.sessionEnded) {
-      endSession("L'hôte a arrêté la session.");
-      return;
-    }
-    if (ev.code === CLOSE_CODES.protocolError) {
-      endSession(`Connexion refusée par le serveur${ev.reason ? ` : ${ev.reason}` : ''}.`);
-      return;
-    }
-    scheduleReconnect();
-  };
+  const transport: Transport = vscodeApi
+    ? openVsCode(vscodeApi, handlers)
+    : openWebSocket(`${proto}//${location.host}${base}${WS_PATH}?token=${encodeURIComponent(token)}`, handlers);
+  ws = transport;
 }
 
 function scheduleReconnect(): void {
@@ -187,11 +252,7 @@ function scheduleReconnect(): void {
 }
 
 function send(msg: object): boolean {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-    return true;
-  }
-  return false;
+  return !!ws && ws.send(JSON.stringify(msg));
 }
 
 function endSession(reason: string): void {
@@ -204,6 +265,15 @@ function endSession(reason: string): void {
   ws = undefined;
   setConnection('offline', 'Session terminée');
   bannerEl.textContent = `${reason} L'historique affiché n'est conservé nulle part : copiez ce dont vous avez besoin.`;
+  if (vscodeApi) {
+    const back = document.createElement('button');
+    back.className = 'secondary';
+    back.type = 'button';
+    back.textContent = 'Retour à l’accueil';
+    back.addEventListener('click', () => vscodeApi?.postMessage({ type: 'scc-leave', ended: true }));
+    bannerEl.append(back);
+    leaveBtn.hidden = true;
+  }
   bannerEl.hidden = false;
   queue = { current: null, pending: [] };
   participants = [];
@@ -236,6 +306,7 @@ function handle(msg: ServerMessage): void {
       renderParticipants();
       renderModels();
       updateActivity();
+      inviteBtn.hidden = !me.isHost;
       break;
     }
     case 'conversation': {
@@ -356,6 +427,9 @@ function handle(msg: ServerMessage): void {
     case 'models':
       models = msg.models;
       renderModels();
+      break;
+    case 'invite':
+      renderInvite(msg);
       break;
     case 'error':
       toast(msg.message);
@@ -986,17 +1060,37 @@ function markDirty(id: string): void {
   }
 }
 
+/**
+ * Suivi du bas de la conversation, comme dans Copilot : on reste collé en bas tant
+ * que l'utilisateur ne remonte pas lui-même. Le défilement est instantané : une
+ * animation laisserait des positions intermédiaires qui feraient croire à une remontée.
+ */
+let stickToBottom = true;
+
+messagesEl.addEventListener('scroll', () => {
+  const distance = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+  stickToBottom = distance < 40;
+  if (stickToBottom) {
+    jumpBtn.hidden = true;
+  }
+});
+
 function withAutoScroll(fn: () => void): void {
-  const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
   fn();
-  if (nearBottom) {
+  if (stickToBottom) {
     scrollToBottom();
+  } else {
+    jumpBtn.hidden = false;
   }
 }
 
-function scrollToBottom(instant = false): void {
-  messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: instant ? 'auto' : 'smooth' });
+function scrollToBottom(_instant = true): void {
+  stickToBottom = true;
+  jumpBtn.hidden = true;
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
+
+jumpBtn.addEventListener('click', () => scrollToBottom());
 
 // ---- Participants, modèles, file d'attente, saisie ----
 
@@ -1045,7 +1139,71 @@ function renderParticipants(): void {
   );
 }
 
+// ---- Invitation (hôte) ----
+
+function toggleInvite(open = invitePop.hidden): void {
+  invitePop.hidden = !open;
+  inviteBtn.setAttribute('aria-expanded', String(open));
+  if (open) {
+    togglePeople(false);
+    send({ type: 'invite', copy: false }); // Préremplit l'URL publique déjà connue.
+    inviteUrl.focus();
+  }
+}
+
+inviteBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleInvite();
+});
+
+inviteForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  send({ type: 'invite', publicUrl: inviteUrl.value.trim(), copy: true });
+});
+
+function renderInvite(msg: Extract<ServerMessage, { type: 'invite' }>): void {
+  const port = /:(\d+)/.exec(msg.localUrl)?.[1] ?? '3717';
+  inviteHint.replaceChildren(
+    document.createTextNode('Exposez le port '),
+    Object.assign(document.createElement('code'), { textContent: port }),
+    document.createTextNode(' avec '),
+    Object.assign(document.createElement('code'), { textContent: `ngrok http ${port}` }),
+    document.createTextNode(' ou le panneau Ports de VS Code (visibilité Public), puis collez l’URL publique :'),
+  );
+  if (!inviteUrl.value && msg.publicUrl) {
+    inviteUrl.value = msg.publicUrl;
+  }
+  inviteResult.replaceChildren();
+  if (msg.error) {
+    inviteResult.append(Object.assign(document.createElement('span'), { className: 'error', textContent: msg.error }));
+  } else if (msg.link && (msg.copied || msg.publicUrl)) {
+    const field = Object.assign(document.createElement('input'), { value: msg.link, readOnly: true });
+    field.addEventListener('focus', () => field.select());
+    inviteResult.append(field);
+    if (msg.copied) {
+      inviteResult.append(
+        Object.assign(document.createElement('span'), {
+          className: msg.publicUrl ? 'ok' : 'warn',
+          textContent: msg.publicUrl
+            ? 'Lien copié dans le presse-papier : envoyez-le aux participants.'
+            : 'Lien local copié : il ne fonctionne que sur cette machine. Ajoutez l’URL du tunnel pour inviter d’autres personnes.',
+        }),
+      );
+    }
+  }
+  inviteResult.hidden = inviteResult.childElementCount === 0;
+}
+
+document.addEventListener('click', (e) => {
+  if (!invitePop.hidden && !invitePop.contains(e.target as Node) && e.target !== inviteBtn) {
+    toggleInvite(false);
+  }
+});
+
 function togglePeople(open = peoplePopover.hidden): void {
+  if (open) {
+    toggleInvite(false);
+  }
   peoplePopover.hidden = !open;
   peopleToggle.setAttribute('aria-expanded', String(open));
 }
@@ -1112,7 +1270,7 @@ function updateActivity(): void {
 }
 
 function updateComposer(): void {
-  const online = !!ws && ws.readyState === WebSocket.OPEN && !!me && !ended && !!activeId;
+  const online = !!ws && ws.isOpen && !!me && !ended && !!activeId;
   askInput.disabled = ended;
   askSend.disabled = !online;
   renameBtn.disabled = ended || !activeId;
@@ -1145,6 +1303,7 @@ function submitQuestion(): void {
     return;
   }
   askInput.value = '';
+  scrollToBottom();
 }
 
 cancelBtn.addEventListener('click', () => {

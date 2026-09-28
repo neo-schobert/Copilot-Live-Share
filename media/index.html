@@ -10,6 +10,23 @@
   <link rel="stylesheet" href="style.css?token=__TOKEN__">
 </head>
 <body>
+  <section id="home" class="join" hidden>
+    <div class="join-card">
+      <div class="join-logo"><i class="codicon codicon-copilot"></i></div>
+      <h1>Shared Copilot</h1>
+      <p>Un chat Copilot partagé : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte.</p>
+      <label for="home-name">Votre pseudo</label>
+      <input id="home-name" maxlength="32" autocomplete="nickname" placeholder="ex. Camille">
+      <button id="home-host" type="button" class="primary"><i class="codicon codicon-broadcast"></i>Héberger une session</button>
+      <div class="home-sep"><span>ou rejoindre celle de quelqu'un</span></div>
+      <form id="home-join-form" class="home-join">
+        <input id="home-link" placeholder="Lien d'invitation (https://…/?token=…)" aria-label="Lien d'invitation">
+        <button type="submit" class="secondary"><i class="codicon codicon-plug"></i>Rejoindre</button>
+      </form>
+      <p id="home-status" class="home-status" hidden></p>
+    </div>
+  </section>
+
   <section id="join" class="join">
     <form id="join-form" class="join-card" autocomplete="off">
       <div class="join-logo"><i class="codicon codicon-copilot"></i></div>
@@ -47,6 +64,21 @@
           <button id="rename" class="icon-btn" type="button" title="Renommer"><i class="codicon codicon-edit"></i></button>
         </div>
         <span id="connection" class="connection" data-state="connecting" title="Connexion…"></span>
+        <div class="invite-wrap">
+          <button id="invite-btn" class="invite-btn" type="button" aria-expanded="false" aria-controls="invite-pop" hidden>
+            <i class="codicon codicon-person-add"></i><span>Inviter</span>
+          </button>
+          <div id="invite-pop" class="popover invite-pop" hidden>
+            <div class="section-title">Inviter des participants</div>
+            <p id="invite-hint" class="hint"></p>
+            <form id="invite-form" class="invite-form">
+              <input id="invite-url" type="url" placeholder="https://xxxx.ngrok-free.app" aria-label="URL publique du tunnel">
+              <button type="submit" class="primary"><i class="codicon codicon-copy"></i>Copier le lien</button>
+            </form>
+            <div id="invite-result" class="invite-result" hidden></div>
+          </div>
+        </div>
+        <button id="leave" class="icon-btn" type="button" title="Quitter la session" hidden><i class="codicon codicon-sign-out"></i></button>
         <div class="people-wrap">
           <button id="toggle-people" class="people-btn" type="button" aria-expanded="false" aria-controls="people" title="Participants">
             <span id="avatar-stack" class="avatar-stack"></span>
@@ -62,6 +94,7 @@
       <main id="messages" class="messages" aria-live="polite"></main>
 
       <footer class="composer">
+        <button id="jump" class="jump" type="button" title="Aller aux derniers messages" hidden><i class="codicon codicon-arrow-down"></i></button>
         <div id="banner" class="banner" hidden></div>
         <div id="activity" class="activity" hidden>
           <i class="codicon codicon-loading codicon-modifier-spin"></i>
@@ -71,7 +104,7 @@
         <form id="ask-form" class="input-box">
           <textarea id="ask-input" rows="1" maxlength="8000" placeholder="Demandez à Copilot… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
           <div class="input-toolbar">
-            <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation"><i class="codicon codicon-copilot"></i> Agent</span>
+            <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation"><i class="codicon codicon-copilot"></i><span class="mode-label">Agent</span></span>
             <label class="model-picker" title="Modèle utilisé pour vos questions">
               <select id="model-select" aria-label="Modèle"></select>
               <i class="codicon codicon-chevron-down"></i>

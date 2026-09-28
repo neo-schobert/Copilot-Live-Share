@@ -61,6 +61,14 @@ export interface ToolInteraction {
   answer(tool: ToolActivity & { question: AgentQuestion }): Promise<AnswerOutcome>;
 }
 
+export interface InviteResult {
+  publicUrl: string;
+  localUrl: string;
+  link?: string;
+  copied: boolean;
+  error?: string;
+}
+
 export interface AnswerOutcome {
   text: string;
   /** Qui a répondu (vide si annulé). */
@@ -105,6 +113,8 @@ export interface ChatRoomOptions {
   extraInstructions?: () => string;
   onApprovalRequested?: (pending: PendingApproval) => void;
   onQuestionAsked?: (pending: PendingQuestion) => void;
+  /** L'hôte demande le lien d'invitation (et sa copie dans le presse-papier de VS Code). */
+  onInviteRequested?: (publicUrl: string | undefined, copy: boolean) => Promise<InviteResult>;
   /** L'hôte demande à voir le diff complet d'une action. */
   onShowDiff?: (entryId: string, toolId: string) => void;
 }
@@ -200,6 +210,13 @@ export class ChatRoom implements ConnectionHandler {
           fail("Seul l'hôte peut annuler une réponse.");
         } else if (!this.cancelCurrent()) {
           fail('Aucune réponse en cours.');
+        }
+        break;
+      case 'invite':
+        if (!state.isHost) {
+          fail("Seul l'hôte peut obtenir le lien d'invitation.");
+        } else if (this.options.onInviteRequested) {
+          void this.options.onInviteRequested(msg.publicUrl, msg.copy).then((result) => conn.send({ type: 'invite', ...result }));
         }
         break;
       case 'typing':
@@ -821,6 +838,10 @@ function parseClientMessage(data: string): ClientMessage | undefined {
       return str(m.conversationId) ? { type: 'view', conversationId: m.conversationId } : undefined;
     case 'typing':
       return str(m.conversationId) ? { type: 'typing', conversationId: m.conversationId } : undefined;
+    case 'invite':
+      return m.publicUrl === undefined || str(m.publicUrl)
+        ? { type: 'invite', publicUrl: m.publicUrl as string | undefined, copy: m.copy === true }
+        : undefined;
     case 'createConversation':
       return { type: 'createConversation' };
     case 'renameConversation':

@@ -4,7 +4,7 @@
  * extensions temporaires), sur un projet piégé créé pour l'occasion.
  * Usage : npm run test:vscode   (nécessite la commande « code » et un affichage).
  */
-const { spawn } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -42,32 +42,67 @@ if (process.argv.includes('--wsl')) {
   env.SCC_TEST_FAKE_WSL = fake;
 }
 
-const out = path.join(tmp, 'result.txt');
 const code = process.env.SCC_CODE_CLI ?? 'code';
-const child = spawn(
-  code,
-  [
-    ws,
-    '--user-data-dir', path.join(tmp, 'user-data'),
-    '--extensions-dir', path.join(tmp, 'extensions'),
-    '--new-window', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
-    `--extensionDevelopmentPath=${root}`,
-    `--extensionTestsPath=${path.join(root, 'dist', 'test', 'vscode', 'confine.js')}`,
-  ],
-  // Sous Windows, « code » est un script code.cmd : il faut passer par le shell.
-  { env: { ...env, SCC_TEST_OUT: out, SCC_TEST_OUTSIDE: outside }, stdio: 'ignore', shell: process.platform === 'win32' },
-);
-child.on('error', (err) => {
-  console.error(`Impossible de lancer « ${code} » : ${err.message}`);
-  process.exit(1);
-});
 
-const deadline = Date.now() + 180_000;
-const timer = setInterval(() => {
-  const text = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
-  if (text.includes('RESULT:') || Date.now() > deadline) {
-    clearInterval(timer);
-    console.log(text || 'Aucun résultat (délai dépassé).');
-    process.exit(text.includes('RESULT: PASS') ? 0 : 1);
+/** Lance une instance VS Code isolée et renvoie une promesse du texte de résultat. */
+function launch(name, { workspace, devPath, testFile, extraEnv = {} }) {
+  const out = path.join(tmp, `result-${name}.txt`);
+  const child = spawn(
+    code,
+    [
+      workspace,
+      '--user-data-dir', path.join(tmp, `user-data-${name}`),
+      '--extensions-dir', path.join(tmp, `extensions-${name}`),
+      '--new-window', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
+      `--extensionDevelopmentPath=${devPath}`,
+      `--extensionTestsPath=${path.join(root, 'dist', 'test', 'vscode', testFile)}`,
+    ],
+    // Sous Windows, « code » est un script code.cmd : il faut passer par le shell.
+    { env: { ...env, ...extraEnv, SCC_TEST_OUT: out, SCC_TEST_OUTSIDE: outside }, stdio: 'ignore', shell: process.platform === 'win32' },
+  );
+  child.on('error', (err) => {
+    console.error(`Impossible de lancer « ${code} » : ${err.message}`);
+    process.exit(1);
+  });
+  return new Promise((resolve) => {
+    const deadline = Date.now() + 180_000;
+    const timer = setInterval(() => {
+      const text = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
+      if (text.includes('RESULT:') || Date.now() > deadline) {
+        clearInterval(timer);
+        resolve(text || `[${name}] aucun résultat (délai dépassé).`);
+      }
+    }, 1000);
+  });
+}
+
+async function main() {
+  let results;
+  if (process.argv.includes('--view')) {
+    // Vue « Shared Copilot » : deux VS Code, l'un héberge, l'autre rejoint. On teste le VSIX
+    // du Marketplace (sans API proposées), extrait et chargé comme extension de développement.
+    const vsix = fs.readdirSync(root).find((f) => f.endsWith('.vsix'));
+    if (!vsix) {
+      console.error('Aucun .vsix : lancez d’abord « npm run package:marketplace ».');
+      process.exit(1);
+    }
+    const unpacked = path.join(tmp, 'vsix');
+    fs.mkdirSync(unpacked);
+    execFileSync(process.platform === 'win32' ? 'tar.exe' : 'unzip', process.platform === 'win32' ? ['-xf', path.join(root, vsix), '-C', unpacked] : ['-q', path.join(root, vsix), '-d', unpacked]);
+    const sync = path.join(tmp, 'sync');
+    fs.mkdirSync(sync);
+    const devPath = path.join(unpacked, 'extension');
+    const guestWs = path.join(tmp, 'guest-workspace');
+    fs.mkdirSync(guestWs);
+    results = await Promise.all([
+      launch('hote', { workspace: ws, devPath, testFile: 'view.js', extraEnv: { SCC_VIEW_ROLE: 'host', SCC_TEST_SYNC: sync } }),
+      launch('invite', { workspace: guestWs, devPath, testFile: 'view.js', extraEnv: { SCC_VIEW_ROLE: 'guest', SCC_TEST_SYNC: sync } }),
+    ]);
+  } else {
+    results = [await launch('confine', { workspace: ws, devPath: root, testFile: 'confine.js' })];
   }
-}, 1000);
+  console.log(results.join('\n'));
+  process.exit(results.every((r) => r.includes('RESULT: PASS')) ? 0 : 1);
+}
+
+void main();

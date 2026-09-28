@@ -4,8 +4,9 @@ import * as os from 'os';
 import * as vscode from 'vscode';
 import { PROPOSAL_SCHEME, ProposalContentProvider, WorkspaceTools } from './agentTools';
 import type { ApprovalDecision } from './protocol';
-import { ChatRoom, LOCAL_HOST_CLIENT_ID, PendingApproval, PendingQuestion } from './chatRoom';
+import { ChatRoom, InviteResult, LOCAL_HOST_CLIENT_ID, PendingApproval, PendingQuestion } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
+import { ChatController, ChatViewProvider, ConnectionTarget, inviteTarget, ViewState } from './chatView';
 import { NativeChatBridge } from './nativeChat';
 import { consumePendingStart, prepareEnvironment } from './wslSetup';
 import { ChatServer } from './server';
@@ -15,7 +16,6 @@ const CONFIG = 'sharedCopilotChat';
 const LARGE_CONTEXT_CHARS = 60_000;
 
 class Session {
-  private panel: vscode.WebviewPanel | undefined;
   /** URL publique du tunnel saisie par l'hôte, gardée en mémoire seulement. */
   publicUrl: string | undefined;
   /** Intégration au panneau Chat natif, si l'API proposée est disponible. */
@@ -32,36 +32,9 @@ class Session {
     return `http://127.0.0.1:${this.server.port}`;
   }
 
-  async openChat(): Promise<void> {
-    if (this.panel) {
-      this.panel.reveal();
-      return;
-    }
-    // asExternalUri gère le cas où l'extension tourne à distance (SSH, Codespaces).
-    const external = await vscode.env.asExternalUri(vscode.Uri.parse(`${this.localUrl}/`));
-    const src = new URL(external.toString(true));
-    src.searchParams.set('token', this.hostToken);
-    src.searchParams.set('name', hostName());
-
-    const panel = vscode.window.createWebviewPanel('sharedCopilotChat', 'Shared Copilot Chat', vscode.ViewColumn.Beside, {
-      enableScripts: true,
-      // Garde la connexion WebSocket ouverte quand l'onglet est masqué.
-      retainContextWhenHidden: true,
-    });
-    panel.webview.html = webviewHtml(src);
-    panel.onDidDispose(() => {
-      if (this.panel === panel) {
-        this.panel = undefined;
-      }
-    });
-    this.panel = panel;
-  }
-
   async stop(): Promise<void> {
     this.nativeChat?.dispose();
     this.nativeChat = undefined;
-    this.panel?.dispose();
-    this.panel = undefined;
     this.room.dispose("L'hôte a arrêté la session.");
     await this.server.stop('Session ended');
   }
@@ -78,6 +51,13 @@ let tools: WorkspaceTools;
 /** Détection du bac à sable des commandes (bubblewrap, ou WSL sous Windows). */
 let sandboxReady: Promise<unknown> = Promise.resolve();
 const log = (message: string) => output?.appendLine(message);
+let chatView: ChatViewProvider | undefined;
+/** Derniers évènements de la vue (diagnostic, tests). */
+const viewEvents: string[] = [];
+/** Session rejointe (invité) depuis la vue, avec sa cible de connexion. */
+let guest: { link: string; target: ConnectionTarget } | undefined;
+/** Message affiché sur l'accueil de la vue (démarrage, erreur). */
+let viewStatus: { status?: string; error?: boolean } = {};
 
 /** API interne renvoyée par activate(), utilisée par les tests d'intégration. */
 export interface SharedCopilotApi {
@@ -85,6 +65,12 @@ export interface SharedCopilotApi {
   readonly nativeChatActive: () => boolean;
   /** Résolue quand la détection du bac à sable est terminée. */
   readonly sandboxReady: Promise<unknown>;
+  /** Session hébergée : lien d'invitation local et pseudos des participants connectés. */
+  readonly hostedSession: () => { inviteLink: string; participants: string[] } | undefined;
+  /** Rejoint une session comme le ferait l'accueil de la vue. */
+  readonly join: (link: string, name: string) => Promise<void>;
+  readonly viewState: () => ViewState;
+  readonly viewEvents: () => string[];
 }
 
 export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
@@ -93,13 +79,21 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
   tools = new WorkspaceTools(proposals, output);
   sandboxReady = tools.initSandbox(log);
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.command = 'sharedCopilotChat.copyInviteLink';
+  statusBar.command = 'sharedCopilotChat.openChat';
   lastTextEditor = vscode.window.activeTextEditor;
+  chatView = new ChatViewProvider(context.extensionUri, viewController(context), (m) => {
+    log(m);
+    viewEvents.push(m);
+  });
+  updateStatusBar(0);
 
   log(`Extension activée : ${describeEnvironment(context)}`);
 
   context.subscriptions.push(
     output,
+    chatView,
+    // La vue garde sa connexion quand elle est masquée (changement d'onglet de la barre latérale).
+    vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, chatView, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.workspace.registerTextDocumentContentProvider(PROPOSAL_SCHEME, proposals),
     statusBar,
     vscode.window.onDidChangeActiveTextEditor((e) => {
@@ -107,9 +101,12 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
         lastTextEditor = e;
       }
     }),
-    vscode.commands.registerCommand('sharedCopilotChat.startSession', () => startSession(context)),
+    vscode.commands.registerCommand('sharedCopilotChat.startSession', () => hostSession(context)),
+    vscode.commands.registerCommand('sharedCopilotChat.host', () => hostSession(context)),
+    vscode.commands.registerCommand('sharedCopilotChat.join', () => joinFromCommand()),
+    vscode.commands.registerCommand('sharedCopilotChat.leave', () => viewController(context).leave(false)),
     vscode.commands.registerCommand('sharedCopilotChat.copyInviteLink', withSession(copyInviteLink)),
-    vscode.commands.registerCommand('sharedCopilotChat.openChat', withSession((s) => s.openChat())),
+    vscode.commands.registerCommand('sharedCopilotChat.openChat', () => chatView?.reveal()),
     vscode.commands.registerCommand('sharedCopilotChat.shareSelection', withSession(shareSelection)),
     vscode.commands.registerCommand('sharedCopilotChat.cancelResponse', withSession(cancelResponse)),
     vscode.commands.registerCommand('sharedCopilotChat.stopSession', withSession(stopSession)),
@@ -143,11 +140,7 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
   );
   // Fenêtre rouverte dans WSL à la demande de « Start Session » : la session reprend d'elle-même.
   if (consumePendingStart(context)) {
-    setTimeout(() => {
-      void vscode.commands.executeCommand('sharedCopilotChat.startSession').then(() =>
-        session ? vscode.commands.executeCommand('sharedCopilotChat.openChat') : undefined,
-      );
-    }, 1000);
+    setTimeout(() => void hostSession(context), 1000);
   }
 
   return {
@@ -156,6 +149,17 @@ export function activate(context: vscode.ExtensionContext): SharedCopilotApi {
     get sandboxReady() {
       return sandboxReady;
     },
+    hostedSession: () =>
+      session && {
+        inviteLink: inviteLink(session, session.localUrl) ?? '',
+        participants: session.room.participantList.map((p) => p.name),
+      },
+    join: async (link, name) => {
+      await chatView?.reveal();
+      await joinSession(name, link);
+    },
+    viewState: () => viewController(context).state(),
+    viewEvents: () => [...viewEvents],
   };
 }
 
@@ -175,16 +179,19 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
   starting = true;
+  setViewStatus('Démarrage de la session…');
   log(`Start Session : ${describeEnvironment(context)}`);
   try {
     // Windows + WSL : proposition de rouvrir dans WSL, installation de ce qui manque.
     const setup = await prepareEnvironment(context, log);
     log(`Préparation de l'environnement : ${setup.outcome}${setup.redetect ? ' (nouvelle détection du bac à sable)' : ''}`);
     if (setup.outcome === 'cancelled') {
+      setViewStatus('Démarrage annulé.');
       void vscode.window.showInformationMessage('Shared Copilot : démarrage de la session annulé.');
       return;
     }
     if (setup.outcome === 'reopening') {
+      setViewStatus('Réouverture du projet dans WSL…');
       return;
     }
     // Bac à sable absent jusqu'ici (ex. bubblewrap installé entre-temps) : nouvelle détection.
@@ -194,12 +201,115 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     await createSession(context);
     const started = session as Session | undefined; // modifiée par createSession
     log(started ? `Session démarrée sur ${started.localUrl}` : 'Session non démarrée.');
+    setViewStatus(started ? undefined : 'La session n’a pas pu démarrer (détails dans le canal de sortie « Shared Copilot »).', !started);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Erreur au démarrage de la session : ${err instanceof Error && err.stack ? err.stack : message}`);
+    setViewStatus(`Impossible de démarrer la session : ${message}`, true);
     void showError(`impossible de démarrer la session (${message}).`);
   } finally {
     starting = false;
+    chatView?.postState();
+  }
+}
+
+// ---- Vue du chat : héberger, rejoindre, quitter ----
+
+/** Héberger : démarre la session (avec la proposition WSL sous Windows) et affiche le chat. */
+async function hostSession(context: vscode.ExtensionContext): Promise<void> {
+  void chatView?.reveal();
+  await startSession(context);
+}
+
+/** Rejoindre depuis la palette : demande le lien puis ouvre le chat. */
+async function joinFromCommand(): Promise<void> {
+  const link = await vscode.window.showInputBox({
+    title: 'Rejoindre une session Shared Copilot',
+    prompt: "Collez le lien d'invitation reçu de l'hôte.",
+    placeHolder: 'https://xxxx.ngrok-free.app/?token=…',
+    ignoreFocusOut: true,
+  });
+  if (link) {
+    await chatView?.reveal();
+    await joinSession(hostName(), link);
+  }
+}
+
+async function joinSession(name: string, link: string): Promise<void> {
+  if (session) {
+    setViewStatus('Vous hébergez déjà une session : arrêtez-la avant d’en rejoindre une autre.', true);
+    return;
+  }
+  const target = inviteTarget(link);
+  if (typeof target === 'string') {
+    setViewStatus(target, true);
+    return;
+  }
+  saveName(name);
+  guest = { link, target };
+  viewStatus = {};
+  log(`Session rejointe : ${new URL(link).host}`);
+  updateStatusBar(0);
+  chatView?.postState();
+}
+
+function viewController(context: vscode.ExtensionContext): ChatController {
+  return {
+    state: (): ViewState => ({
+      mode: session ? 'host' : guest ? 'guest' : 'idle',
+      name: hostName(),
+      busy: starting,
+      ...viewStatus,
+    }),
+    connectionTarget: () =>
+      session
+        ? { url: `ws://127.0.0.1:${session.server.port}/ws?token=${encodeURIComponent(session.hostToken)}`, headers: {} }
+        : guest?.target,
+    host: async (name) => {
+      saveName(name);
+      await hostSession(context);
+    },
+    join: joinSession,
+    leave: async (ended) => {
+      if (guest) {
+        guest = undefined;
+        viewStatus = {};
+        updateStatusBar(0);
+        chatView?.reset();
+        return;
+      }
+      if (session && !ended) {
+        const stop = 'Arrêter la session';
+        const answer = await vscode.window.showWarningMessage(
+          'Arrêter la session partagée ?',
+          { modal: true, detail: 'Tous les participants seront déconnectés et l’historique sera perdu.' },
+          stop,
+        );
+        if (answer !== stop) {
+          return;
+        }
+        await stopSession();
+      }
+      viewStatus = {};
+      chatView?.reset();
+    },
+  };
+}
+
+function setViewStatus(status: string | undefined, error = false): void {
+  viewStatus = status ? { status, error } : {};
+  chatView?.postState();
+}
+
+/** Pseudo saisi dans la vue, utilisé tout de suite (l'enregistrement du paramètre est asynchrone). */
+let chosenName: string | undefined;
+
+/** Mémorise le pseudo saisi dans la vue (paramètre sharedCopilotChat.hostName). */
+function saveName(name: string): void {
+  const clean = name.trim().slice(0, 32);
+  if (clean && clean !== hostName()) {
+    chosenName = clean;
+    void vscode.workspace.getConfiguration(CONFIG).update('hostName', clean, vscode.ConfigurationTarget.Global);
   }
 }
 
@@ -241,7 +351,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
 
   const guestToken = crypto.randomBytes(24).toString('base64url');
   const hostToken = crypto.randomBytes(24).toString('base64url');
-  const room = new ChatRoom(new CopilotBackend(tools), {
+  const room = new ChatRoom(new CopilotBackend(tools, log), {
     historyLength: () => vscode.workspace.getConfiguration(CONFIG).get<number>('historyLength', 20),
     hostName: hostName(),
     onParticipantsChanged: (p) => updateStatusBar(p.length),
@@ -249,6 +359,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     onApprovalRequested: (pending) => void notifyApproval(pending),
     onQuestionAsked: (pending) => void askLocalHost(pending),
     onShowDiff: (_entryId, toolId) => void tools.showDiff(toolId),
+    onInviteRequested: inviteFromChat,
   });
   const server = new ChatServer(
     {
@@ -286,6 +397,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   }
   await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', true);
   updateStatusBar(0);
+  chatView?.postState();
   void refreshModels();
   void showSessionNotification(session, 'Session démarrée');
 }
@@ -405,14 +517,14 @@ async function showSessionNotification(s: Session, title: string): Promise<void>
   const copy = "Copier le lien d'invitation";
   const open = 'Ouvrir le chat';
   const choice = await vscode.window.showInformationMessage(
-    `Shared Copilot : ${title} sur ${s.localUrl} (127.0.0.1 uniquement — exposez ce port avec un tunnel pour inviter).`,
+    `Shared Copilot : ${title} sur ${s.localUrl}. Pour inviter, exposez ce port avec un tunnel puis utilisez « Inviter » dans le chat.`,
     copy,
     open,
   );
   if (choice === copy) {
     await copyInviteLink(s);
   } else if (choice === open) {
-    await s.openChat();
+    await chatView?.reveal();
   }
 }
 
@@ -427,17 +539,56 @@ async function copyInviteLink(s: Session): Promise<void> {
   if (input === undefined) {
     return;
   }
-  const url = parseHttpUrl(input);
-  if (!url) {
+  const link = inviteLink(s, input);
+  if (!link) {
     return;
   }
   s.publicUrl = input.trim();
+  await vscode.env.clipboard.writeText(link);
+  void vscode.window.showInformationMessage("Shared Copilot : lien d'invitation copié. Toute personne qui l'a peut rejoindre le chat.");
+}
+
+/** Lien d'invitation pour une URL de base (tunnel ou locale), ou undefined si l'URL est invalide. */
+function inviteLink(s: Session, base: string): string | undefined {
+  const url = parseHttpUrl(base);
+  if (!url) {
+    return undefined;
+  }
   url.pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
   url.search = '';
   url.hash = '';
   url.searchParams.set('token', s.guestToken);
-  await vscode.env.clipboard.writeText(url.toString());
-  void vscode.window.showInformationMessage("Shared Copilot : lien d'invitation copié. Toute personne qui l'a peut rejoindre le chat.");
+  return url.toString();
+}
+
+/** Demande de lien depuis la page de chat de l'hôte : le lien est copié par VS Code (fiable dans la webview). */
+async function inviteFromChat(publicUrl: string | undefined, copy: boolean): Promise<InviteResult> {
+  const s = session;
+  if (!s) {
+    return { publicUrl: '', localUrl: '', copied: false, error: 'Aucune session en cours.' };
+  }
+  const base = publicUrl?.trim() || s.publicUrl || '';
+  const result: InviteResult = { publicUrl: base, localUrl: s.localUrl, copied: false };
+  if (!base) {
+    // Sans tunnel : lien local, valable seulement sur cette machine.
+    result.link = inviteLink(s, s.localUrl);
+    if (copy && result.link) {
+      await vscode.env.clipboard.writeText(result.link);
+      result.copied = true;
+    }
+    return result;
+  }
+  const link = inviteLink(s, base);
+  if (!link) {
+    return { ...result, error: 'URL invalide : collez une adresse http(s), par exemple https://xxxx.ngrok-free.app' };
+  }
+  result.link = link;
+  if (copy) {
+    s.publicUrl = base;
+    await vscode.env.clipboard.writeText(link);
+    result.copied = true;
+  }
+  return result;
 }
 
 async function shareSelection(s: Session): Promise<void> {
@@ -514,9 +665,9 @@ async function stopSession(): Promise<void> {
   }
   session = undefined;
   tools.resetSession();
-  statusBar?.hide();
   await vscode.commands.executeCommand('setContext', 'sharedCopilotChat.active', false);
   await s.stop();
+  updateStatusBar(0);
 }
 
 // ---- Utilitaires ----
@@ -535,16 +686,30 @@ function withSession(fn: (s: Session) => unknown): () => Promise<void> {
   };
 }
 
+/** Bouton de la barre d'état, toujours visible : ouvre le chat (accueil, session hébergée ou rejointe). */
 function updateStatusBar(participants: number): void {
-  if (!statusBar || !session) {
+  if (!statusBar) {
     return;
   }
-  statusBar.text = `$(broadcast) Shared Copilot · ${participants}`;
-  statusBar.tooltip = `Session partagée sur ${session.localUrl} — ${participants} participant(s). Cliquer pour copier le lien d'invitation.`;
+  if (session) {
+    statusBar.text = `$(broadcast) Shared Copilot · ${participants}`;
+    statusBar.tooltip = `Vous hébergez une session (${participants} participant(s)). Cliquer pour ouvrir le chat.`;
+  } else if (guest) {
+    statusBar.text = '$(plug) Shared Copilot';
+    statusBar.tooltip = `Connecté à la session de ${new URL(guest.link).host}. Cliquer pour ouvrir le chat.`;
+  } else {
+    statusBar.text = '$(copilot) Shared Copilot';
+    statusBar.tooltip = 'Héberger ou rejoindre une session Shared Copilot';
+  }
   statusBar.show();
+  // Utilisé par le menu de la vue (bouton « Quitter ») et la palette.
+  void vscode.commands.executeCommand('setContext', 'sharedCopilotChat.connected', !!session || !!guest);
 }
 
 function hostName(): string {
+  if (chosenName) {
+    return chosenName;
+  }
   const configured = vscode.workspace.getConfiguration(CONFIG).get<string>('hostName', '').trim();
   if (configured) {
     return configured;
@@ -563,39 +728,4 @@ function parseHttpUrl(value: string): URL | undefined {
   } catch {
     return undefined;
   }
-}
-
-function webviewHtml(src: URL): string {
-  const attr = (v: string) => v.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
-  const nonce = crypto.randomBytes(16).toString('base64');
-  // La page du chat est dans une iframe (autre origine) : on lui transmet les variables de thème de VS Code.
-  const script = `
-    const frame = document.querySelector('iframe');
-    const target = ${JSON.stringify(src.origin)};
-    function sendTheme() {
-      // VS Code place les variables du thème dans l'attribut style de <html>.
-      const style = document.documentElement.style;
-      const vars = {};
-      for (let i = 0; i < style.length; i++) {
-        const name = style[i];
-        if (name.startsWith('--vscode-')) vars[name] = style.getPropertyValue(name).trim();
-      }
-      const kind = document.body.classList.contains('vscode-light') || document.body.classList.contains('vscode-high-contrast-light') ? 'light' : 'dark';
-      frame.contentWindow.postMessage({ type: 'scc-theme', kind, vars }, target);
-    }
-    frame.addEventListener('load', sendTheme);
-    new MutationObserver(sendTheme).observe(document.body, { attributes: true, attributeFilter: ['class'] });
-    new MutationObserver(sendTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
-  `;
-  return `<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src ${attr(src.origin)}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
-<style>html, body, iframe { margin: 0; padding: 0; border: 0; width: 100%; height: 100%; overflow: hidden; }</style>
-</head>
-<body><iframe src="${attr(src.toString())}" allow="clipboard-write; clipboard-read" title="Shared Copilot Chat"></iframe>
-<script nonce="${nonce}">${script}</script>
-</body>
-</html>`;
 }

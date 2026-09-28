@@ -34,7 +34,7 @@ async function refused(api: SharedCopilotApi, name: string, input: object, expec
 
 export async function run(): Promise<void> {
   try {
-    const api = (await vscode.extensions.getExtension('local.shared-copilot-chat')!.activate()) as SharedCopilotApi;
+    const api = (await vscode.extensions.getExtension('neo-schobert.shared-copilot-chat')!.activate()) as SharedCopilotApi;
     await api.sandboxReady;
     const sandbox = api.tools.sandboxDescription();
     const wslMode = !!process.env.SCC_TEST_FAKE_WSL;

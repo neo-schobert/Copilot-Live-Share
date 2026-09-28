@@ -1,9 +1,9 @@
 {
   "name": "shared-copilot-chat",
   "displayName": "Shared Copilot Chat",
-  "description": "Partagez un chat avec les modèles Copilot entre plusieurs personnes, via la machine de l'hôte.",
+  "description": "Un chat Copilot à plusieurs dans VS Code : héberger ou rejoindre une session, agent confiné au projet de l'hôte avec validation des actions.",
   "version": "0.1.0",
-  "publisher": "local",
+  "publisher": "neo-schobert",
   "license": "MIT",
   "engines": {
     "vscode": "^1.136.0"
@@ -19,6 +19,24 @@
   ],
   "contributes": {
     "commands": [
+      {
+        "command": "sharedCopilotChat.host",
+        "title": "Host a Session",
+        "category": "Shared Copilot",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "sharedCopilotChat.join",
+        "title": "Join a Session",
+        "category": "Shared Copilot",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "sharedCopilotChat.leave",
+        "title": "Leave Session",
+        "category": "Shared Copilot",
+        "icon": "$(sign-out)"
+      },
       {
         "command": "sharedCopilotChat.startSession",
         "title": "Start Session",
@@ -77,10 +95,6 @@
           "when": "sharedCopilotChat.active"
         },
         {
-          "command": "sharedCopilotChat.openChat",
-          "when": "sharedCopilotChat.active"
-        },
-        {
           "command": "sharedCopilotChat.shareSelection",
           "when": "sharedCopilotChat.active"
         },
@@ -103,6 +117,14 @@
         {
           "command": "sharedCopilotChat.answerQuestion",
           "when": "false"
+        },
+        {
+          "command": "sharedCopilotChat.startSession",
+          "when": "false"
+        },
+        {
+          "command": "sharedCopilotChat.leave",
+          "when": "sharedCopilotChat.connected"
         }
       ],
       "editor/context": [
@@ -110,6 +132,13 @@
           "command": "sharedCopilotChat.shareSelection",
           "when": "sharedCopilotChat.active",
           "group": "9_sharedCopilot"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "sharedCopilotChat.leave",
+          "when": "view == sharedCopilotChat.view && sharedCopilotChat.connected",
+          "group": "navigation"
         }
       ]
     },
@@ -143,7 +172,7 @@
         "sharedCopilotChat.hostName": {
           "type": "string",
           "default": "",
-          "description": "Pseudo de l'hôte dans le chat (vide : nom d'utilisateur système)."
+          "description": "Votre pseudo dans les sessions, que vous hébergiez ou rejoigniez (vide : nom d'utilisateur système)."
         },
         "sharedCopilotChat.agentMode": {
           "type": "string",
@@ -218,7 +247,26 @@
         "description": "Discussions de la session Shared Copilot partagée avec les invités",
         "when": "sharedCopilotChat.active"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sharedCopilot",
+          "title": "Shared Copilot",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "sharedCopilot": [
+        {
+          "type": "webview",
+          "id": "sharedCopilotChat.view",
+          "name": "Chat",
+          "icon": "media/icon.svg"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "npm run check-types && node esbuild.js",
@@ -227,7 +275,9 @@
     "check-types": "tsc -p . --noEmit && tsc -p src/web --noEmit",
     "test": "node esbuild.js --test && node dist/test/smoke.js",
     "vscode:prepublish": "npm run package",
-    "test:vscode": "node esbuild.js && node esbuild.js --test && node test/vscode/run.js && node test/vscode/run.js --wsl"
+    "test:vscode": "node esbuild.js && node esbuild.js --test && node test/vscode/run.js && node test/vscode/run.js --wsl",
+    "package:marketplace": "npm run package && node scripts/package-marketplace.js",
+    "test:view": "npm run package:marketplace && node esbuild.js --test && node test/vscode/run.js --view"
   },
   "dependencies": {
     "@vscode/codicons": "^0.0.46-24",
@@ -237,6 +287,7 @@
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.136.0",
     "@types/ws": "^8.5.12",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.24.0",
     "typescript": "^5.6.0"
   },
@@ -247,5 +298,26 @@
   ],
   "activationEvents": [
     "onStartupFinished"
+  ],
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#2b3fa8",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neo-schobert/Copilot-Live-Share.git"
+  },
+  "bugs": {
+    "url": "https://github.com/neo-schobert/Copilot-Live-Share/issues"
+  },
+  "homepage": "https://github.com/neo-schobert/Copilot-Live-Share#readme",
+  "keywords": [
+    "copilot",
+    "chat",
+    "collaboration",
+    "pair programming",
+    "live share",
+    "agent"
   ]
 }
