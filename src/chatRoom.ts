@@ -18,6 +18,8 @@ import {
   ServerMessage,
   SessionPolicy,
   SharedApp,
+  TunnelProviderId,
+  TunnelState,
   ToolActivity,
   UserEntry,
 } from './protocol';
@@ -136,7 +138,9 @@ export interface ChatRoomOptions {
   /** Une question d'invité attend l'accord de l'hôte. */
   onReviewRequested?: (pending: PendingReview) => void;
   /** L'hôte demande l'ouverture d'un tunnel public depuis la page. */
-  onTunnelRequested?: () => Promise<InviteResult>;
+  onTunnelRequested?: (provider?: TunnelProviderId) => Promise<InviteResult>;
+  /** L'hôte demande la fermeture du tunnel public. */
+  onTunnelStop?: () => void;
   /** Motif de refus du partage de ce port (ex. port du serveur de session), sinon undefined. */
   appRefusal?: (port: number) => string | undefined;
   /** Liste des applications partagées modifiée (coupure des relais d'un port retiré). */
@@ -179,6 +183,8 @@ export class ChatRoom implements ConnectionHandler {
   private readonly queue: QueuedQuestion[] = [];
   /** Questions d'invités en attente de l'accord de l'hôte. */
   private readonly awaitingReview: QueuedQuestion[] = [];
+  /** État du tunnel public, transmis aux pages de l'hôte. */
+  private tunnel: TunnelState = { status: 'off', provider: 'cloudflare' };
   /** Applications locales partagées par l'hôte, par port. */
   private readonly apps = new Map<number, SharedApp>();
   /** Horodatages des questions d'invités envoyées au modèle (limite horaire). */
@@ -316,7 +322,14 @@ export class ChatRoom implements ConnectionHandler {
         if (!state.isHost) {
           fail("Seul l'hôte peut ouvrir un tunnel.");
         } else if (this.options.onTunnelRequested) {
-          void this.options.onTunnelRequested().then((result) => conn.send({ type: 'invite', ...result }));
+          void this.options.onTunnelRequested(msg.provider).then((result) => conn.send({ type: 'invite', ...result }));
+        }
+        break;
+      case 'stopTunnel':
+        if (!state.isHost) {
+          fail("Seul l'hôte peut fermer le tunnel.");
+        } else {
+          this.options.onTunnelStop?.();
         }
         break;
       case 'reviewQuestion':
@@ -485,6 +498,16 @@ export class ChatRoom implements ConnectionHandler {
     return true;
   }
 
+  /** Met à jour l'état du tunnel et le transmet aux pages de l'hôte. */
+  setTunnelState(tunnel: TunnelState): void {
+    this.tunnel = tunnel;
+    for (const [conn, state] of this.clients) {
+      if (state.joined && state.isHost) {
+        conn.send({ type: 'tunnel', tunnel });
+      }
+    }
+  }
+
   /** Partage une application locale de l'hôte. Renvoie un motif de refus, ou undefined. */
   shareApp(port: number, rawLabel?: string): string | undefined {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -634,6 +657,9 @@ export class ChatRoom implements ConnectionHandler {
       policy: this.policy(),
       apps: this.sharedApps,
     });
+    if (state.isHost) {
+      conn.send({ type: 'tunnel', tunnel: this.tunnel });
+    }
     this.broadcastParticipants();
   }
 
@@ -1067,7 +1093,11 @@ function parseClientMessage(data: string): ClientMessage | undefined {
     case 'unshareApp':
       return typeof m.port === 'number' ? { type: 'unshareApp', port: m.port } : undefined;
     case 'startTunnel':
-      return { type: 'startTunnel' };
+      return m.provider === undefined || m.provider === 'cloudflare' || m.provider === 'ngrok'
+        ? { type: 'startTunnel', provider: m.provider }
+        : undefined;
+    case 'stopTunnel':
+      return { type: 'stopTunnel' };
     case 'reviewQuestion':
       return str(m.entryId) && typeof m.accept === 'boolean' ? { type: 'reviewQuestion', entryId: m.entryId, accept: m.accept } : undefined;
     case 'answer':

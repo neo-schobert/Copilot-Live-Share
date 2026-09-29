@@ -58,6 +58,19 @@ export interface SharedApp {
   label: string;
 }
 
+export type TunnelProviderId = 'cloudflare' | 'ngrok';
+
+/** Tunnel public de la session, visible par l'hôte seulement. */
+export interface TunnelState {
+  status: 'off' | 'starting' | 'on' | 'error';
+  /** Service du tunnel ouvert, ou préféré par l'hôte quand il n'y en a pas. */
+  provider: TunnelProviderId;
+  url?: string;
+  /** Ouverture du tunnel (epoch ms). */
+  since?: number;
+  error?: string;
+}
+
 /** Règles de la session fixées par l'hôte, affichées aux participants. */
 export interface SessionPolicy {
   /** Les questions des invités attendent l'accord de l'hôte avant d'être envoyées au modèle. */
@@ -213,8 +226,10 @@ export type ClientMessage =
   /** Réservé à l'hôte : partage (ou arrête de partager) une application locale. */
   | { type: 'shareApp'; port: number; label?: string }
   | { type: 'unshareApp'; port: number }
-  /** Réservé à l'hôte : ouvre un tunnel public (réponse : message « invite »). */
-  | { type: 'startTunnel' };
+  /** Réservé à l'hôte : ouvre un tunnel public avec ce service (réponse : message « invite »). */
+  | { type: 'startTunnel'; provider?: TunnelProviderId }
+  /** Réservé à l'hôte : ferme le tunnel public. */
+  | { type: 'stopTunnel' };
 
 // ---- Serveur -> client ----
 
@@ -249,6 +264,8 @@ export type ServerMessage =
   | { type: 'questionReview'; entryId: string; review: QuestionReview; by: string }
   | { type: 'policy'; policy: SessionPolicy }
   | { type: 'sharedApps'; apps: SharedApp[] }
+  /** État du tunnel public (envoyé à l'hôte seulement). */
+  | { type: 'tunnel'; tunnel: TunnelState }
   | { type: 'participants'; participants: Participant[] }
   | { type: 'queue'; queue: QueueState }
   | { type: 'models'; models: ModelsState }

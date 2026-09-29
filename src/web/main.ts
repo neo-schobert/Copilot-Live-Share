@@ -11,6 +11,8 @@ import {
   SessionPolicy,
   SharedApp,
   ToolActivity,
+  TunnelProviderId,
+  TunnelState,
   UserEntry,
   WS_PATH,
 } from '../protocol';
@@ -68,6 +70,13 @@ const policyNote = $<HTMLElement>('policy-note');
 const openTabBtn = $<HTMLButtonElement>('open-tab');
 const tunnelBtn = $<HTMLButtonElement>('tunnel-btn');
 const tunnelStatus = $<HTMLElement>('tunnel-status');
+const tunnelChoose = $<HTMLElement>('tunnel-choose');
+const tunnelOn = $<HTMLElement>('tunnel-on');
+const tunnelTitle = $<HTMLElement>('tunnel-title');
+const tunnelSince = $<HTMLElement>('tunnel-since');
+const tunnelUrl = $<HTMLElement>('tunnel-url');
+const tunnelCopy = $<HTMLButtonElement>('tunnel-copy');
+const tunnelStop = $<HTMLButtonElement>('tunnel-stop');
 const appsWrap = $<HTMLElement>('apps-wrap');
 const appsBtn = $<HTMLButtonElement>('apps-btn');
 const appsCount = $<HTMLElement>('apps-count');
@@ -105,6 +114,9 @@ let participants: Participant[] = [];
 let policy: SessionPolicy = { reviewGuestQuestions: false, guestQuestionsPerHour: 0 };
 /** Applications locales partagées par l'hôte. */
 let apps: SharedApp[] = [];
+/** Tunnel public de la session (hôte seulement). */
+let tunnel: TunnelState | undefined;
+const TUNNEL_LABELS: Record<TunnelProviderId, string> = { cloudflare: 'Cloudflare', ngrok: 'ngrok' };
 let queue: QueueState = { current: null, pending: [] };
 let models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
 /** Modèle choisi par ce participant ; '' = modèle par défaut de la session. */
@@ -485,6 +497,10 @@ function handle(msg: ServerMessage): void {
     case 'policy':
       policy = msg.policy;
       renderPolicy();
+      break;
+    case 'tunnel':
+      tunnel = msg.tunnel;
+      renderTunnel();
       break;
     case 'sharedApps': {
       const added = msg.apps.filter((a) => !apps.some((b) => b.port === a.port));
@@ -1285,23 +1301,73 @@ inviteForm.addEventListener('submit', (e) => {
   send({ type: 'invite', publicUrl: inviteUrl.value.trim(), copy: true });
 });
 
-tunnelBtn.addEventListener('click', () => {
-  if (send({ type: 'startTunnel' })) {
-    tunnelBtn.disabled = true;
-    tunnelStatus.hidden = false;
-    tunnelStatus.textContent = 'Ouverture du tunnel… Suivez les éventuelles questions dans VS Code (téléchargement, compte ngrok).';
+// ---- Tunnel public (hôte) ----
+
+const tunnelRadios = () => [...document.querySelectorAll<HTMLInputElement>('input[name="tunnel-provider"]')];
+
+/** Choix du service, ouverture en cours, tunnel actif (adresse, depuis quand, arrêt) ou erreur. */
+function renderTunnel(): void {
+  const state = tunnel ?? { status: 'off', provider: 'cloudflare' };
+  const on = state.status === 'on';
+  const starting = state.status === 'starting';
+  tunnelChoose.hidden = on;
+  tunnelOn.hidden = !on;
+  // Avec un tunnel ouvert, l'adresse manuelle est inutile.
+  inviteHint.hidden = on;
+  inviteForm.hidden = on;
+  if (!starting) {
+    for (const radio of tunnelRadios()) {
+      radio.checked = radio.value === state.provider;
+    }
   }
+  for (const radio of tunnelRadios()) {
+    radio.disabled = starting;
+  }
+  tunnelBtn.disabled = starting;
+  tunnelBtn.lastElementChild!.textContent = starting ? 'Ouverture…' : 'Ouvrir le tunnel et copier le lien';
+  if (on) {
+    tunnelTitle.textContent = `Tunnel ${TUNNEL_LABELS[state.provider]} actif`;
+    tunnelSince.textContent = state.since ? `depuis ${formatTime(state.since)}` : '';
+    tunnelUrl.textContent = state.url ?? '';
+    resetTunnelStop();
+  }
+  tunnelStatus.classList.toggle('error', state.status === 'error');
+  tunnelStatus.hidden = !starting && state.status !== 'error';
+  tunnelStatus.textContent = starting
+    ? `Ouverture du tunnel ${TUNNEL_LABELS[state.provider]}… Répondez aux éventuelles questions dans VS Code (téléchargement, compte ngrok).`
+    : state.status === 'error'
+      ? `Tunnel ${TUNNEL_LABELS[state.provider]} : ${state.error ?? 'erreur'}`
+      : '';
+}
+
+tunnelBtn.addEventListener('click', () => {
+  const provider = (tunnelRadios().find((r) => r.checked)?.value ?? 'cloudflare') as TunnelProviderId;
+  send({ type: 'startTunnel', provider });
+});
+
+tunnelCopy.addEventListener('click', () => send({ type: 'invite', copy: true }));
+
+/** Arrêt en deux clics : il déconnecte les invités à distance. */
+let stopArmed: number | undefined;
+function resetTunnelStop(): void {
+  clearTimeout(stopArmed);
+  stopArmed = undefined;
+  tunnelStop.classList.remove('confirm');
+  tunnelStop.lastChild!.textContent = 'Arrêter';
+  tunnelStop.title = 'Fermer le tunnel : le lien ne fonctionnera plus et les invités à distance seront déconnectés';
+}
+tunnelStop.addEventListener('click', () => {
+  if (stopArmed === undefined) {
+    tunnelStop.classList.add('confirm');
+    tunnelStop.lastChild!.textContent = 'Confirmer l’arrêt';
+    stopArmed = window.setTimeout(resetTunnelStop, 4000);
+    return;
+  }
+  resetTunnelStop();
+  send({ type: 'stopTunnel' });
 });
 
 function renderInvite(msg: Extract<ServerMessage, { type: 'invite' }>): void {
-  if (tunnelBtn.disabled || msg.tunnel) {
-    tunnelBtn.disabled = false;
-    tunnelStatus.hidden = !msg.tunnel;
-    tunnelStatus.textContent = msg.tunnel ? `Tunnel ${msg.tunnel} actif : ${msg.publicUrl}` : '';
-  }
-  if (msg.tunnel) {
-    tunnelBtn.lastElementChild!.textContent = 'Copier le lien d’invitation';
-  }
   const port = /:(\d+)/.exec(msg.localUrl)?.[1] ?? '3717';
   inviteHint.replaceChildren(
     document.createTextNode('Ou, avec votre propre tunnel, exposez le port '),

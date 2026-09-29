@@ -312,6 +312,30 @@ button:disabled { cursor: default; opacity: 0.5; }
 .invite-pop code { font-family: var(--mono); background: var(--code-bg); padding: 0 4px; border-radius: 3px; color: var(--text-strong); }
 .invite-form { display: flex; gap: 6px; }
 .tunnel-btn { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.tunnel-choose, .tunnel-on { display: grid; gap: 8px; }
+.tunnel-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 6px; }
+.tunnel-option {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.tunnel-option:has(input:checked) { border-color: var(--focus); background: var(--hover); }
+.tunnel-option input { margin: 2px 0 0; accent-color: var(--accent); }
+.tunnel-option span { display: grid; gap: 1px; min-width: 0; }
+.tunnel-option small { color: var(--muted); font-size: 11px; }
+.tunnel-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+.tunnel-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok, #3fb950); box-shadow: 0 0 0 3px rgba(63, 185, 80, 0.2); }
+.tunnel-since { color: var(--muted); font-size: 11px; }
+.tunnel-url { font: 11px var(--mono); overflow-wrap: anywhere; color: var(--text-strong); }
+.tunnel-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.tunnel-actions button { display: inline-flex; align-items: center; gap: 4px; }
+.tunnel-actions .confirm { background: var(--danger); color: #fff; }
+#tunnel-status.error { color: var(--danger); }
 .apps-wrap { position: relative; }
 .apps-btn { position: relative; }
 .apps-count {

@@ -109,11 +109,14 @@ async function main() {
     ]);
   } else {
     results = [];
-    if (!process.argv.includes('--native')) {
+    if (process.argv.includes('--tunnel')) {
+      // Test optionnel : vrai tunnel (Internet, compte ngrok pour ngrok).
+      results.push(await launch('tunnel', { workspace: ws, devPath: root, testFile: 'tunnel.js' }));
+    } else if (!process.argv.includes('--native')) {
       results.push(await launch('confine', { workspace: ws, devPath: root, testFile: 'confine.js' }));
     }
     // Chat natif (API proposées) : une seule fois, le mode WSL simulé n'y change rien.
-    if (!process.argv.includes('--wsl')) {
+    if (!process.argv.includes('--wsl') && !process.argv.includes('--tunnel')) {
       results.push(await launch('native', { workspace: ws, devPath: root, testFile: 'native.js' }));
     }
   }

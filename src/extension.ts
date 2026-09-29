@@ -3,7 +3,7 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
 import { PROPOSAL_SCHEME, ProposalContentProvider, WorkspaceTools } from './agentTools';
-import type { ApprovalDecision, ServerMessage, SessionPolicy } from './protocol';
+import type { ApprovalDecision, ServerMessage, SessionPolicy, TunnelState } from './protocol';
 import { NotificationLevel, SessionNotifier } from './notifications';
 import { ChatRoom, InviteResult, LOCAL_HOST_CLIENT_ID, PendingQuestion } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
@@ -25,6 +25,7 @@ class Session {
   nativeChat: NativeChatBridge | undefined;
   /** Tunnel public ouvert par l'extension (arrêté avec la session). */
   tunnel: Tunnel | undefined;
+  tunnelState: TunnelState = { status: 'off', provider: 'cloudflare' };
 
   constructor(
     readonly server: ChatServer,
@@ -85,7 +86,7 @@ export interface PromptShareApi {
   /** Résolue quand la détection du bac à sable est terminée. */
   readonly sandboxReady: Promise<unknown>;
   /** Session hébergée : lien d'invitation local et pseudos des participants connectés. */
-  readonly hostedSession: () => { inviteLink: string; participants: string[]; awaitingReview: string[] } | undefined;
+  readonly hostedSession: () => { inviteLink: string; participants: string[]; awaitingReview: string[]; tunnel: TunnelState } | undefined;
   /** Rejoint une session comme le ferait l'accueil de la vue. */
   readonly join: (link: string, name: string) => Promise<void>;
   readonly viewState: () => ViewState;
@@ -156,6 +157,7 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
     vscode.commands.registerCommand('promptShare.openChat', () => chatView?.reveal()),
     vscode.commands.registerCommand('promptShare.openConversationTab', openConversationTabCommand),
     vscode.commands.registerCommand('promptShare.startTunnel', withSession(startTunnelCommand)),
+    vscode.commands.registerCommand('promptShare.stopTunnel', withSession((s) => stopTunnel(s))),
     vscode.commands.registerCommand('promptShare.shareApp', withSession(shareAppCommand)),
     vscode.commands.registerCommand('promptShare.shareSelection', withSession(shareSelection)),
     vscode.commands.registerCommand('promptShare.cancelResponse', withSession(cancelResponse)),
@@ -219,6 +221,7 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
         inviteLink: inviteLink(session, session.localUrl) ?? '',
         participants: session.room.participantList.map((p) => p.name),
         awaitingReview: session.room.awaitingReviewIds,
+        tunnel: session.tunnelState,
       },
     join: async (link, name) => {
       await chatView?.reveal();
@@ -499,7 +502,12 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     onShowDiff: (_entryId, toolId) => void tools.showDiff(toolId),
     onInviteRequested: inviteFromChat,
     policy: sessionPolicy,
-    onTunnelRequested: () => startTunnel(),
+    onTunnelRequested: (provider) => startTunnel(provider),
+    onTunnelStop: () => {
+      if (session) {
+        stopTunnel(session);
+      }
+    },
     appRefusal: (p: number): string | undefined => (p === server.port ? 'C’est le port de la session elle-même : il est déjà partagé par le lien d’invitation.' : undefined),
     onAppsChanged: (apps) => server.closeRelays((p: number) => !apps.some((a) => a.port === p)),
   });
@@ -537,6 +545,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   await sandboxReady;
   tools.resetSession();
   session = new Session(server, room, guestToken, hostToken);
+  setTunnelState(session, { status: 'off' });
   if (config.get<boolean>('nativeChat', true)) {
     session.nativeChat = NativeChatBridge.tryCreate(room, hostName, (m) => output.appendLine(m));
   }
@@ -702,98 +711,149 @@ async function inviteFromChat(publicUrl: string | undefined, copy: boolean): Pro
   return result;
 }
 
+function preferredTunnel(): TunnelProvider {
+  return vscode.workspace.getConfiguration(CONFIG).get<TunnelProvider>('tunnelProvider', 'cloudflare');
+}
+
+/** Met à jour l'état du tunnel : pages de l'hôte et barre d'état. */
+function setTunnelState(s: Session, state: Omit<TunnelState, 'provider'> & { provider?: TunnelProvider }): void {
+  s.tunnelState = { ...state, provider: state.provider ?? preferredTunnel() };
+  s.room.setTunnelState(s.tunnelState);
+  updateStatusBar();
+}
+
 /**
- * Ouvre un tunnel public vers la session (Cloudflare par défaut, ou ngrok) et copie le lien
- * d'invitation. Déjà ouvert : renvoie simplement le lien.
+ * Ouvre un tunnel public vers la session avec le service choisi (le dernier utilisé par
+ * défaut) et copie le lien d'invitation. Déjà ouvert avec ce service : copie simplement le lien.
  */
-async function startTunnel(): Promise<InviteResult> {
+async function startTunnel(requested?: TunnelProvider): Promise<InviteResult> {
   const s = session;
   if (!s) {
     return { publicUrl: '', localUrl: '', copied: false, error: 'Aucune session en cours.' };
   }
-  let provider = vscode.workspace.getConfiguration(CONFIG).get<TunnelProvider>('tunnelProvider', 'cloudflare');
-  if (s.tunnel) {
-    return { ...(await inviteFromChat(s.tunnel.url, true)), tunnel: TunnelManager.label(s.tunnel.provider) };
+  const provider = requested ?? preferredTunnel();
+  if (provider !== preferredTunnel()) {
+    // Dernier choix mémorisé : il sera présélectionné la prochaine fois.
+    await vscode.workspace.getConfiguration(CONFIG).update('tunnelProvider', provider, vscode.ConfigurationTarget.Global);
   }
+  if (s.tunnel?.provider === provider) {
+    return { ...(await inviteFromChat(s.tunnel.url, true)), tunnel: TunnelManager.label(provider) };
+  }
+  if (s.tunnelState.status === 'starting') {
+    return { publicUrl: '', localUrl: s.localUrl, copied: false, error: 'Ouverture du tunnel déjà en cours.' };
+  }
+  if (s.tunnel) {
+    stopTunnel(s, false); // Changement de service.
+  }
+  setTunnelState(s, { status: 'starting', provider });
   try {
-    const onExit = (reason: string) => void onTunnelExit(s, reason);
-    let tunnel: Tunnel | undefined;
-    try {
-      tunnel = await tunnels.open(provider, s.server.port, onExit);
-    } catch (err) {
-      if (!(err instanceof TunnelUnreachableError) || !(await offerNgrokFallback(err.message))) {
-        throw err;
-      }
-      provider = 'ngrok';
-      tunnel = await tunnels.open(provider, s.server.port, onExit);
-    }
-    if (!tunnel) {
-      return { publicUrl: '', localUrl: s.localUrl, copied: false, error: 'Ouverture du tunnel annulée.' };
-    }
+    const tunnel = await openTunnelWithFallback(s, provider);
     if (session !== s) {
-      tunnel.stop();
+      tunnel?.stop();
       return { publicUrl: '', localUrl: '', copied: false, error: 'La session est terminée.' };
     }
+    if (!tunnel) {
+      setTunnelState(s, { status: 'off', provider });
+      return { publicUrl: '', localUrl: s.localUrl, copied: false, error: 'Ouverture du tunnel annulée.' };
+    }
     s.tunnel = tunnel;
-    const result = { ...(await inviteFromChat(tunnel.url, true)), tunnel: TunnelManager.label(provider) };
-    void vscode.window.showInformationMessage(`Prompt Share : tunnel ${TunnelManager.label(provider)} ouvert, lien d'invitation copié.`);
-    return result;
+    setTunnelState(s, { status: 'on', provider: tunnel.provider, url: tunnel.url, since: Date.now() });
+    const label = TunnelManager.label(tunnel.provider);
+    void vscode.window.showInformationMessage(`Prompt Share : tunnel ${label} ouvert, lien d'invitation copié.`);
+    return { ...(await inviteFromChat(tunnel.url, true)), tunnel: label };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Tunnel : échec (${message}).`);
+    if (session === s) {
+      setTunnelState(s, { status: 'error', provider, error: message });
+    }
     void showError(`impossible d'ouvrir le tunnel : ${message}`);
     return { publicUrl: '', localUrl: s.localUrl, copied: false, error: `Tunnel impossible : ${message}` };
   }
 }
 
-/** Cloudflare injoignable (réseau filtré) : proposer ngrok, qui passe par le port 443. */
-async function offerNgrokFallback(reason: string): Promise<boolean> {
-  log(`Tunnel Cloudflare injoignable : ${reason}`);
-  const once = 'Utiliser ngrok';
-  const always = 'Toujours utiliser ngrok';
-  const choice = await vscode.window.showWarningMessage(
-    'Prompt Share : le tunnel Cloudflare est injoignable depuis ce réseau.',
-    {
-      modal: true,
-      detail:
-        'Le réseau bloque probablement le port 7844 utilisé par Cloudflare (pare-feu d’entreprise ou d’école). ' +
-        'ngrok passe par le port 443, comme un site web, mais demande un compte gratuit.',
-    },
-    once,
-    always,
-  );
-  if (choice === always) {
-    await vscode.workspace.getConfiguration(CONFIG).update('tunnelProvider', 'ngrok', vscode.ConfigurationTarget.Global);
+/** Ouvre le tunnel ; en cas d'échec, propose d'essayer l'autre service. */
+async function openTunnelWithFallback(s: Session, provider: TunnelProvider): Promise<Tunnel | undefined> {
+  const onExit = (reason: string) => void onTunnelExit(s, reason);
+  try {
+    return await tunnels.open(provider, s.server.port, onExit);
+  } catch (err) {
+    const other: TunnelProvider = provider === 'cloudflare' ? 'ngrok' : 'cloudflare';
+    const reason = err instanceof Error ? err.message : String(err);
+    log(`Tunnel ${provider} impossible : ${reason}`);
+    const tryOther = `Essayer ${TunnelManager.label(other)}`;
+    const hint =
+      err instanceof TunnelUnreachableError
+        ? 'Le réseau bloque probablement le port 7844 utilisé par Cloudflare (pare-feu d’entreprise ou d’école). ngrok passe par le port 443, comme un site web, mais demande un compte gratuit.'
+        : provider === 'ngrok'
+          ? 'Cloudflare ne demande pas de compte, mais passe par le port 7844, parfois bloqué par les réseaux d’entreprise.'
+          : 'ngrok passe par le port 443, comme un site web, mais demande un compte gratuit.';
+    const choice = await vscode.window.showWarningMessage(
+      `Prompt Share : impossible d'ouvrir le tunnel ${TunnelManager.label(provider)}.`,
+      { modal: true, detail: `${reason}\n\n${hint}` },
+      tryOther,
+    );
+    if (choice !== tryOther || session !== s) {
+      throw err;
+    }
+    setTunnelState(s, { status: 'starting', provider: other });
+    return tunnels.open(other, s.server.port, onExit);
   }
-  return choice === once || choice === always;
+}
+
+/** Ferme le tunnel : le lien public cesse de fonctionner, les invités à distance sont déconnectés. */
+function stopTunnel(s: Session, notify = true): void {
+  const tunnel = s.tunnel;
+  if (!tunnel) {
+    return;
+  }
+  s.tunnel = undefined; // Avant stop() : l'arrêt n'est pas un incident (voir onTunnelExit).
+  if (s.publicUrl === tunnel.url) {
+    s.publicUrl = undefined;
+  }
+  tunnel.stop();
+  log(`Tunnel ${tunnel.provider} fermé par l'hôte.`);
+  setTunnelState(s, { status: 'off', provider: tunnel.provider });
+  if (notify) {
+    void vscode.window.showInformationMessage(`Prompt Share : tunnel ${TunnelManager.label(tunnel.provider)} fermé.`);
+  }
 }
 
 /** Le tunnel s'est arrêté de lui-même : le lien public ne fonctionne plus. */
 async function onTunnelExit(s: Session, reason: string): Promise<void> {
-  if (!s.tunnel) {
-    return; // Arrêt normal, avec la session.
+  const tunnel = s.tunnel;
+  if (!tunnel) {
+    return; // Fermé volontairement, ou avec la session.
   }
-  if (s.publicUrl === s.tunnel.url) {
+  if (s.publicUrl === tunnel.url) {
     s.publicUrl = undefined;
   }
   s.tunnel = undefined;
   if (session !== s) {
     return;
   }
+  setTunnelState(s, { status: 'error', provider: tunnel.provider, error: `arrêté : ${reason}` });
   const retry = 'Rouvrir le tunnel';
   const choice = await vscode.window.showWarningMessage(
     `Prompt Share : le tunnel s'est arrêté (${reason}). Les invités à distance ne peuvent plus rejoindre la session.`,
     retry,
   );
   if (choice === retry) {
-    await startTunnelCommand();
+    await startTunnel(tunnel.provider);
   }
 }
 
+/** Palette : choix du service, puis ouverture. */
 async function startTunnelCommand(): Promise<void> {
-  const result = await startTunnel();
-  if (!result.error && result.link) {
-    chatView?.postState();
+  const preferred = preferredTunnel();
+  const items: (vscode.QuickPickItem & { provider: TunnelProvider })[] = [
+    { provider: 'cloudflare', label: '$(cloud) Cloudflare', description: 'sans compte', detail: 'Nouvelle adresse à chaque fois, pas de page d’avertissement. Port 7844, parfois bloqué en entreprise.' },
+    { provider: 'ngrok', label: '$(globe) ngrok', description: 'compte gratuit', detail: 'Adresse liée au compte, page d’avertissement dans les navigateurs. Port 443, passe presque partout.' },
+  ];
+  items.sort((x, y) => (x.provider === preferred ? -1 : y.provider === preferred ? 1 : 0));
+  const picked = await vscode.window.showQuickPick(items, { title: 'Ouvrir un tunnel public', placeHolder: 'Service du tunnel' });
+  if (picked) {
+    await startTunnel(picked.provider);
   }
 }
 
@@ -932,8 +992,11 @@ function updateStatusBar(participants = participantCount, pending = { count: not
     return;
   }
   if (session) {
-    statusBar.text = `$(broadcast) Prompt Share · ${participants}`;
-    statusBar.tooltip = `Vous hébergez une session (${participants} participant(s)). Cliquer pour ouvrir le chat.`;
+    const tunnel = session.tunnelState;
+    statusBar.text = `$(broadcast) Prompt Share · ${participants}${tunnel.status === 'on' ? ' $(globe)' : tunnel.status === 'starting' ? ' $(sync~spin)' : ''}`;
+    statusBar.tooltip =
+      `Vous hébergez une session (${participants} participant(s)). Cliquer pour ouvrir le chat.` +
+      (tunnel.status === 'on' ? `\nTunnel ${TunnelManager.label(tunnel.provider)} : ${tunnel.url}` : '\nPas de tunnel public : seuls les invités de cette machine peuvent rejoindre.');
   } else if (guest) {
     statusBar.text = '$(plug) Prompt Share';
     statusBar.tooltip = `Connecté à la session de ${new URL(guest.link).host}. Cliquer pour ouvrir le chat.`;

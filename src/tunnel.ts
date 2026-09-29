@@ -4,6 +4,7 @@ import * as https from 'https';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { TunnelProviderId } from './protocol';
 
 /**
  * Tunnel public vers le serveur local de la session, pour inviter des personnes
@@ -14,7 +15,7 @@ import * as vscode from 'vscode';
  * il est téléchargé depuis sa source officielle avec l'accord de l'hôte.
  */
 
-export type TunnelProvider = 'cloudflare' | 'ngrok';
+export type TunnelProvider = TunnelProviderId;
 
 /** Le service est injoignable depuis ce réseau (pare-feu) : un autre fournisseur peut passer. */
 export class TunnelUnreachableError extends Error {}

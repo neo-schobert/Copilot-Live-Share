@@ -161,12 +161,18 @@ async function main() {
   const backend = new FakeBackend();
   const policy: SessionPolicy = { reviewGuestQuestions: false, guestQuestionsPerHour: 0 };
   const reviews: PendingReview[] = [];
+  const tunnelCalls: string[] = [];
   const room = new ChatRoom(backend, {
     historyLength: () => 20,
     policy: () => policy,
     appRefusal: (port) => (port === PORT ? 'Le serveur de la session est déjà partagé.' : undefined),
     onAppsChanged: (apps) => server.closeRelays((port) => !apps.some((a) => a.port === port)),
     onReviewRequested: (pending) => reviews.push(pending),
+    onTunnelRequested: async (provider) => {
+      tunnelCalls.push(`start:${provider}`);
+      return { publicUrl: 'https://x.trycloudflare.com', localUrl: `http://127.0.0.1:${PORT}`, copied: true, tunnel: 'Cloudflare' };
+    },
+    onTunnelStop: () => tunnelCalls.push('stop'),
     onInviteRequested: async (publicUrl, copy) => ({
       publicUrl: publicUrl ?? '',
       localUrl: `http://127.0.0.1:${PORT}`,
@@ -587,6 +593,25 @@ async function main() {
   forwarder.dispose();
   app.close();
   ok("Application de l'hôte partagée : ouverte chez l'invité via le relais (gros transfert, 8 requêtes parallèles), hôte seul, port non partagé refusé");
+
+  // 11 quinquies. Tunnel : service choisi par l'hôte, état envoyé à l'hôte seulement, arrêt
+  bob2.send({ type: 'startTunnel', provider: 'ngrok' });
+  await bob2.waitFor((m) => m.type === 'error' && m.message.includes('ouvrir un tunnel'));
+  bob2.send({ type: 'stopTunnel' });
+  await bob2.waitFor((m) => m.type === 'error' && m.message.includes('fermer le tunnel'));
+  host.send({ type: 'startTunnel', provider: 'ngrok' });
+  const tunnelInvite = await host.waitFor((m) => m.type === 'invite' && m.tunnel === 'Cloudflare');
+  assert.ok(tunnelInvite.type === 'invite' && tunnelInvite.copied);
+  room.setTunnelState({ status: 'on', provider: 'ngrok', url: 'https://x.ngrok-free.app', since: Date.now() });
+  await host.waitFor((m) => m.type === 'tunnel' && m.tunnel.status === 'on' && m.tunnel.provider === 'ngrok');
+  const host2 = await Client.join('hote', HOST);
+  await host2.waitFor((m) => m.type === 'tunnel' && m.tunnel.url === 'https://x.ngrok-free.app');
+  host.send({ type: 'stopTunnel' });
+  await sleep(50);
+  assert.deepEqual(tunnelCalls, ['start:ngrok', 'stop']);
+  assert.ok(![alice, bob2].some((c) => c.messages.some((m) => m.type === 'tunnel')), "l'état du tunnel n'est envoyé qu'à l'hôte");
+  host2.ws.close();
+  ok("Tunnel : service choisi transmis, état envoyé à l'hôte seul (et aux nouvelles pages de l'hôte), ouverture et arrêt réservés à l'hôte");
 
   // 12. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");

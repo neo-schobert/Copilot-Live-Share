@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Tunnel : choix de Cloudflare ou ngrok à l'ouverture (le dernier est présélectionné), état affiché dans « Inviter » (service, adresse, heure) avec « Copier le lien » et « Arrêter », globe dans la barre d'état, commande « Close Public Tunnel ».
+- Si le service choisi échoue, l'extension propose l'autre, dans les deux sens.
+
 ## 0.1.2
 
 - Bouton « Ouvrir un tunnel » : tunnel Cloudflare (sans compte) ou ngrok, outil téléchargé depuis sa source officielle avec accord, jeton ngrok demandé une fois, lien d'invitation copié. Repli proposé vers ngrok si Cloudflare est bloqué par le réseau.

@@ -71,7 +71,21 @@
           </button>
           <div id="invite-pop" class="popover invite-pop" hidden>
             <div class="section-title">Inviter des participants</div>
-            <button id="tunnel-btn" type="button" class="primary tunnel-btn"><i class="codicon codicon-globe"></i><span>Ouvrir un tunnel et copier le lien</span></button>
+            <div id="tunnel-choose" class="tunnel-choose">
+              <div class="tunnel-options" role="radiogroup" aria-label="Service du tunnel">
+                <label class="tunnel-option"><input type="radio" name="tunnel-provider" value="cloudflare"><span><strong>Cloudflare</strong><small>Sans compte · nouvelle adresse à chaque fois</small></span></label>
+                <label class="tunnel-option"><input type="radio" name="tunnel-provider" value="ngrok"><span><strong>ngrok</strong><small>Compte gratuit · passe les pare-feu</small></span></label>
+              </div>
+              <button id="tunnel-btn" type="button" class="primary tunnel-btn"><i class="codicon codicon-globe"></i><span>Ouvrir le tunnel et copier le lien</span></button>
+            </div>
+            <div id="tunnel-on" class="tunnel-on" hidden>
+              <div class="tunnel-head"><span class="tunnel-dot" aria-hidden="true"></span><strong id="tunnel-title"></strong><span id="tunnel-since" class="tunnel-since"></span></div>
+              <code id="tunnel-url" class="tunnel-url"></code>
+              <div class="tunnel-actions">
+                <button id="tunnel-copy" type="button" class="primary"><i class="codicon codicon-copy"></i>Copier le lien</button>
+                <button id="tunnel-stop" type="button" class="secondary"><i class="codicon codicon-debug-disconnect"></i>Arrêter</button>
+              </div>
+            </div>
             <p id="tunnel-status" class="hint" hidden></p>
             <p id="invite-hint" class="hint"></p>
             <form id="invite-form" class="invite-form">

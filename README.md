@@ -98,7 +98,8 @@ Pendant une session, hébergée ou rejointe depuis VS Code, une notification app
 | **Prompt Share: Host a Session** | Démarre une session et ouvre le chat. |
 | **Prompt Share: Join a Session** | Demande un lien d'invitation et rejoint la session. |
 | **Prompt Share: Open Chat** | Ouvre la vue du chat. |
-| **Prompt Share: Open Public Tunnel** | Ouvre un tunnel public (Cloudflare ou ngrok) et copie le lien d'invitation. |
+| **Prompt Share: Open Public Tunnel** | Ouvre un tunnel public (Cloudflare ou ngrok, au choix) et copie le lien d'invitation. |
+| **Prompt Share: Close Public Tunnel** | Ferme le tunnel public. |
 | **Prompt Share: Share Local App…** | Partage une application locale (port) avec les participants. |
 | **Prompt Share: Open Conversation in Editor Tab** | Ouvre une discussion dans un onglet d'éditeur (déplaçable, divisible). |
 | **Prompt Share: Leave Session** | Quitte la session rejointe, ou arrête la session hébergée. |
@@ -174,14 +175,14 @@ Cette intégration utilise une API de VS Code encore expérimentale (`chatSessio
 
 Le serveur n'écoute que sur `127.0.0.1` : il n'est pas accessible depuis le réseau tant que l'hôte n'ouvre pas de tunnel.
 
-**En un clic** : **Inviter** → **Ouvrir un tunnel et copier le lien** (ou **Prompt Share: Open Public Tunnel**). L'extension :
+**En un clic** : **Inviter** → choisissez **Cloudflare** ou **ngrok** → **Ouvrir le tunnel et copier le lien** (ou **Prompt Share: Open Public Tunnel**, qui demande le service). L'extension :
 
-1. cherche l'outil du tunnel (`promptShare.tunnelProvider`) dans le PATH, puis dans son propre dossier ;
+1. cherche l'outil du service choisi dans le PATH, puis dans son propre dossier ;
 2. s'il manque, propose de le **télécharger depuis sa source officielle** (GitHub de Cloudflare, ou distribution de ngrok), sans installation système ;
 3. pour ngrok, demande une fois le **jeton** du compte gratuit (enregistré dans la configuration de ngrok) ;
 4. ouvre le tunnel et **copie le lien d'invitation**.
 
-Le tunnel se ferme avec la session. S'il s'arrête avant, une notification propose de le rouvrir.
+Une fois ouvert, **Inviter** affiche l'état du tunnel (service, adresse, heure d'ouverture), avec **Copier le lien** et **Arrêter** (deux clics : le lien cesse de fonctionner et les invités à distance sont déconnectés). La barre d'état montre aussi un globe tant qu'il est ouvert, et **Prompt Share: Close Public Tunnel** le ferme depuis la palette. Le tunnel se ferme avec la session ; s'il s'arrête de lui-même, une notification propose de le rouvrir. Le dernier service choisi est présélectionné la fois suivante.
 
 | | Cloudflare (par défaut) | ngrok |
 |---|---|---|
@@ -191,7 +192,7 @@ Le tunnel se ferme avec la session. S'il s'arrête avant, une notification propo
 | Limites | 200 requêtes simultanées, sans garantie de disponibilité ([doc](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)) | 1 Go et 20 000 requêtes par mois ([doc](https://ngrok.com/docs/pricing-limits/free-plan-limits)) |
 | Réseaux filtrés | port 7844 souvent bloqué en entreprise | port 443, passe presque partout |
 
-Si Cloudflare est injoignable depuis le réseau, l'extension propose de passer à ngrok (une fois, ou toujours).
+Si le service choisi échoue (réseau filtré, compte…), l'extension affiche la raison et propose d'essayer l'autre.
 
 **Avec votre propre tunnel** : lancez-le vers le port de la session (`ngrok http 3717`, `cloudflared tunnel --url http://127.0.0.1:3717`…), puis collez son adresse dans **Inviter**.
 
@@ -236,7 +237,7 @@ L'hôte peut rendre accessible aux participants une application qui tourne sur s
 | `promptShare.wslSandbox` | `true` | Sous Windows, isole les commandes dans WSL avec bubblewrap si disponibles. |
 | `promptShare.wslDistro` | `""` | Distribution WSL du bac à sable (vide : distribution par défaut). |
 | `promptShare.nativeChat` | `true` | Affiche les discussions dans le panneau Chat natif (API expérimentale, voir plus haut). |
-| `promptShare.tunnelProvider` | `cloudflare` | Service du bouton « Ouvrir un tunnel » : `cloudflare` (sans compte) ou `ngrok` (compte gratuit, adresse liée au compte). |
+| `promptShare.tunnelProvider` | `cloudflare` | Service présélectionné dans **Inviter** (le dernier choisi y est mémorisé) : `cloudflare` (sans compte) ou `ngrok` (compte gratuit, adresse liée au compte). |
 | `promptShare.notifications` | `decisions` | Notifications de VS Code : `decisions` (quand une décision vous attend), `all` (aussi les nouvelles questions et les réponses à vos questions), `off`. |
 | `promptShare.reviewGuestQuestions` | `true` | Les questions des invités attendent l'accord de l'hôte avant d'être envoyées au modèle. |
 | `promptShare.guestQuestionsPerHour` | `60` | Nombre maximal de questions d'invités envoyées au modèle par heure, pour toute la session (`0` : pas de limite). |
@@ -283,4 +284,5 @@ test/vscode/         Tests d'intégration dans un vrai VS Code (confinement, cha
 - `npm run check-types` : vérification TypeScript stricte (extension et client)
 - `npm test` : lance le vrai serveur avec un modèle simulé et vérifie l'authentification, la diffusion identique à plusieurs clients, l'ordre FIFO, l'annulation, les discussions (historiques séparés, renommage, suppression), le choix du modèle, les actions d'outils, les règles de validation (auteur / hôte / hors projet), les questions de l'agent, la reconnexion et l'arrêt de session.
 - `npm run test:view` : construit le VSIX du Marketplace et lance deux VS Code isolés ; l'un héberge une session, l'autre la rejoint depuis sa vue, sans navigateur.
+- `npm run test:tunnel` (facultatif, demande Internet) : ouvre un vrai tunnel depuis la page de l'hôte, vérifie son état et le lien, puis le ferme. ngrok par défaut (jeton déjà configuré) ; `SCC_TUNNEL=cloudflare` pour Cloudflare.
 - `npm run test:vscode` : lance un VS Code isolé (profil temporaire) sur un projet piégé (`.env`, `.git`, liens vers `/etc` et hors du projet) et vérifie le confinement de l'agent et du bac à sable, en mode Linux puis en mode WSL simulé (faux `wsl.exe`). Il vérifie aussi qu'un onglet du chat natif suit en direct les questions d'un invité. Nécessite la commande `code` et un affichage.
