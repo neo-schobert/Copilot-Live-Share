@@ -8,6 +8,7 @@ import {
   ClientMessage,
   CLOSE_CODES,
   ContextEntry,
+  ContextUsage,
   Conversation,
   DEFAULT_CONVERSATION_TITLE,
   LIMITS,
@@ -19,6 +20,7 @@ import {
   SessionOption,
   SessionPolicy,
   SharedApp,
+  SummaryEntry,
   TunnelProviderId,
   TunnelState,
   ToolActivity,
@@ -53,6 +55,8 @@ export interface ModelRequest {
   authorClientId: string;
   /** Attente des décisions humaines pendant la réponse. */
   interaction: ToolInteraction;
+  /** Sans outils (compactage : simple résumé). */
+  noTools?: boolean;
 }
 
 /**
@@ -115,6 +119,8 @@ export interface PendingQuestion {
 export interface ModelBackend {
   /** Lance une requête. Doit lever une Error au message lisible par les participants en cas d'échec. */
   ask(request: ModelRequest, signal: AbortSignal): Promise<ModelResponse>;
+  /** Taille de ces messages en tokens du modèle (jauge du contexte). Absent ou undefined : inconnue. */
+  measure?(turns: ModelTurn[], modelId?: string): Promise<ContextUsage | undefined>;
 }
 
 /** Identité utilisée pour les questions posées depuis VS Code (panneau Chat natif). */
@@ -170,7 +176,19 @@ interface QueuedQuestion extends QueueItem {
 interface ConversationState extends Conversation {
   /** Titre encore automatique : il prendra le texte de la première question. */
   autoTitle: boolean;
+  /** Numéro de la dernière mesure du contexte lancée (les mesures plus anciennes sont ignorées). */
+  measuring?: number;
 }
+
+const SUMMARY_PREFIX = '[Résumé des échanges précédents de cette discussion, fait par compactage]';
+
+const COMPACT_PROMPT = [
+  'Tu compactes une discussion de programmation partagée entre plusieurs personnes.',
+  'Résume les échanges ci-dessous pour qu’un assistant puisse poursuivre la discussion sans eux :',
+  'objectifs, décisions prises, fichiers et code concernés (chemins, noms de fonctions), problèmes rencontrés et solutions,',
+  'questions en suspens, et qui a demandé quoi (pseudos).',
+  'Sois factuel et concis (400 mots au plus), en Markdown, dans la langue de la discussion. Ne réponds à aucune question.',
+].join('\n');
 
 const SYSTEM_PROMPT = [
   'Tu es un assistant de programmation dans un chat partagé entre plusieurs personnes.',
@@ -328,6 +346,20 @@ export class ChatRoom implements ConnectionHandler {
           void this.options.onTunnelRequested(msg.provider).then((result) => conn.send({ type: 'invite', ...result }));
         }
         break;
+      case 'compact': {
+        const refusal = state.isHost ? this.compact(msg.conversationId, state.name, state.clientId) : "Seul l'hôte peut compacter une discussion (requête au modèle).";
+        if (refusal) {
+          fail(refusal);
+        }
+        break;
+      }
+      case 'fork': {
+        const refusal = this.fork(msg.conversationId, msg.upToEntryId, state.name, state.clientId);
+        if (refusal) {
+          fail(refusal);
+        }
+        break;
+      }
       case 'setSessionOption':
         if (!state.isHost) {
           fail("Seul l'hôte peut changer les réglages de la session.");
@@ -413,6 +445,7 @@ export class ChatRoom implements ConnectionHandler {
       return false;
     }
     this.pushEntry({ kind: 'context', id: newId(), conversationId, timestamp: Date.now(), ...context });
+    void this.measureContext(conversationId);
     return true;
   }
 
@@ -506,6 +539,89 @@ export class ChatRoom implements ConnectionHandler {
       this.pump();
     }
     return true;
+  }
+
+  /**
+   * Met en file le compactage d'une discussion : le modèle résume ses échanges, et ce
+   * résumé remplace, pour la suite, l'historique envoyé au modèle. Renvoie un motif de refus.
+   */
+  compact(conversationId: string, author: string, clientId: string): string | undefined {
+    const conv = this.findConversation(conversationId);
+    if (!conv) {
+      return "Cette discussion n'existe plus.";
+    }
+    if ([...this.queue, ...(this.current ? [this.current.item] : [])].some((q) => q.kind === 'compact' && q.conversationId === conversationId)) {
+      return 'Compactage déjà en cours pour cette discussion.';
+    }
+    if (!this.historyUnits(conversationId).units.length) {
+      return 'Rien à compacter : aucun échange depuis le dernier résumé.';
+    }
+    this.queue.push({ entryId: newId(), conversationId, clientId, author, text: '', kind: 'compact' });
+    this.broadcastQueue();
+    this.pump();
+    return undefined;
+  }
+
+  /**
+   * Copie une discussion jusqu'à une entrée (incluse, avec sa réponse s'il s'agit d'une
+   * question) dans une nouvelle discussion. Les questions sans réponse ne sont pas copiées.
+   */
+  fork(conversationId: string, upToEntryId: string | undefined, author: string, clientId: string): string | undefined {
+    const source = this.findConversation(conversationId);
+    if (!source) {
+      return "Cette discussion n'existe plus.";
+    }
+    if (this.conversations.length >= LIMITS.maxConversations) {
+      return `Nombre maximal de discussions atteint (${LIMITS.maxConversations}).`;
+    }
+    const entries = this.entriesOf(conversationId);
+    let end = upToEntryId ? entries.findIndex((e) => e.id === upToEntryId) : entries.length - 1;
+    if (end < 0) {
+      return "Ce message n'existe plus.";
+    }
+    const cut = entries[end];
+    if (cut.kind === 'user') {
+      const answerIndex = entries.findIndex((e) => e.kind === 'assistant' && e.replyTo === cut.id);
+      end = Math.max(end, answerIndex);
+    }
+    const answered = new Set(
+      entries.filter((e): e is AssistantEntry => e.kind === 'assistant' && e.status !== 'streaming').map((e) => e.replyTo),
+    );
+    const ids = new Map<string, string>();
+    const copies: ChatEntry[] = [];
+    for (const e of entries.slice(0, end + 1)) {
+      if (e.kind === 'system' || (e.kind === 'user' && !answered.has(e.id)) || (e.kind === 'assistant' && (e.status === 'streaming' || !ids.has(e.replyTo)))) {
+        continue;
+      }
+      const id = newId();
+      ids.set(e.id, id);
+      const copy = structuredClone(e);
+      copy.id = id;
+      if (copy.kind === 'assistant') {
+        copy.replyTo = ids.get(e.kind === 'assistant' ? e.replyTo : '')!;
+      }
+      copies.push(copy);
+    }
+    const conv: ConversationState = {
+      id: newId(),
+      title: sanitizeLine(`${source.title} (fork)`, LIMITS.maxTitleLength),
+      createdAt: Date.now(),
+      createdBy: author,
+      createdByClientId: clientId,
+      autoTitle: false,
+      forkedFrom: source.id,
+    };
+    for (const copy of copies) {
+      copy.conversationId = conv.id;
+    }
+    this.conversations.push(conv);
+    // Les entrées d'abord : la page de l'auteur ouvre la discussion dès son annonce.
+    for (const copy of copies) {
+      this.pushEntry(copy);
+    }
+    this.broadcastConversation(conv);
+    void this.measureContext(conv.id);
+    return undefined;
   }
 
   /** Met à jour l'état du tunnel et le transmet aux pages de l'hôte. */
@@ -622,8 +738,15 @@ export class ChatRoom implements ConnectionHandler {
 
   /** Met à jour la liste des modèles proposés et la diffuse. */
   setModels(models: ModelsState): void {
+    const changedDefault = models.defaultId !== this.models.defaultId;
     this.models = models;
     this.broadcast({ type: 'models', models });
+    // La jauge dépend du modèle par défaut (taille maximale, tokenizer).
+    if (changedDefault) {
+      for (const conv of this.conversations) {
+        void this.measureContext(conv.id);
+      }
+    }
   }
 
   /** Prévient les clients, annule la réponse en cours et libère l'état. La fermeture des sockets revient au serveur. */
@@ -808,6 +931,7 @@ export class ChatRoom implements ConnectionHandler {
     };
     this.conversations.push(conv);
     this.broadcastConversation(conv);
+    void this.measureContext(conv.id);
     return conv;
   }
 
@@ -850,7 +974,9 @@ export class ChatRoom implements ConnectionHandler {
     }
     const abort = new AbortController();
     this.current = { item, abort };
-    void this.answer(item, abort.signal).finally(() => {
+    const run = item.kind === 'compact' ? this.runCompaction(item, abort.signal) : this.answer(item, abort.signal);
+    void run.finally(() => {
+      void this.measureContext(item.conversationId);
       this.current = undefined;
       if (!this.disposed) {
         this.broadcastQueue();
@@ -962,7 +1088,37 @@ export class ChatRoom implements ConnectionHandler {
    * réponse), puis la question.
    */
   private buildTurns(question: QueuedQuestion): ModelTurn[] {
-    const entries = this.entries.filter((e) => e.conversationId === question.conversationId);
+    return mergeConsecutive([...this.historyTurns(question.conversationId, question.entryId), { role: 'user', content: `${question.author}: ${question.text}` }]);
+  }
+
+  /**
+   * Consigne, dernier résumé (compactage) et N derniers échanges : ce que le modèle reçoit
+   * avant la question. `excludeEntryId` : la question en cours, à ne pas compter comme échange.
+   */
+  private historyTurns(conversationId: string, excludeEntryId?: string): ModelTurn[] {
+    const { units, summary } = this.historyUnits(conversationId, excludeEntryId);
+    const limit = Math.max(0, Math.floor(this.options.historyLength()));
+    const recent = limit === 0 ? [] : units.slice(-limit);
+    const extra = this.options.extraInstructions?.();
+    return [
+      { role: 'user', content: extra ? `${SYSTEM_PROMPT}\n\n${extra}` : SYSTEM_PROMPT },
+      ...(summary ? [{ role: 'user' as const, content: `${SUMMARY_PREFIX}\n${summary.text}` }] : []),
+      ...recent.flat(),
+    ];
+  }
+
+  /** Échanges terminés depuis le dernier résumé (une « unité » = question + réponse, ou contexte partagé). */
+  private historyUnits(conversationId: string, excludeEntryId?: string): { units: ModelTurn[][]; summary?: SummaryEntry } {
+    const all = this.entries.filter((e) => e.conversationId === conversationId);
+    let start = 0;
+    let summary: SummaryEntry | undefined;
+    all.forEach((e, i) => {
+      if (e.kind === 'summary') {
+        summary = e;
+        start = i + 1;
+      }
+    });
+    const entries = all.slice(start);
     const answers = new Map<string, AssistantEntry>();
     for (const e of entries) {
       if (e.kind === 'assistant') {
@@ -975,7 +1131,7 @@ export class ChatRoom implements ConnectionHandler {
     for (const e of entries) {
       if (e.kind === 'context') {
         units.push([{ role: 'user', content: formatContext(e) }]);
-      } else if (e.kind === 'user' && e.id !== question.entryId) {
+      } else if (e.kind === 'user' && e.id !== excludeEntryId) {
         const answer = answers.get(e.id);
         if (!answer || answer.status === 'streaming' || answer.status === 'error' || !answer.text) {
           continue;
@@ -988,23 +1144,94 @@ export class ChatRoom implements ConnectionHandler {
       }
     }
 
-    const limit = Math.max(0, Math.floor(this.options.historyLength()));
-    const recent = limit === 0 ? [] : units.slice(-limit);
-    const extra = this.options.extraInstructions?.();
-    const turns: ModelTurn[] = [
-      { role: 'user', content: extra ? `${SYSTEM_PROMPT}\n\n${extra}` : SYSTEM_PROMPT },
-      ...recent.flat(),
-      { role: 'user', content: `${question.author}: ${question.text}` },
-    ];
-    return mergeConsecutive(turns);
+    return { units, summary };
+  }
+
+  /** Compactage : le modèle résume les échanges depuis le dernier résumé, sans outils. */
+  private async runCompaction(item: QueuedQuestion, signal: AbortSignal): Promise<void> {
+    const { units, summary } = this.historyUnits(item.conversationId);
+    const transcript = units
+      .flat()
+      .map((t) => (t.role === 'assistant' ? `Assistant : ${t.content}` : t.content))
+      .join('\n\n');
+    const before = this.findConversation(item.conversationId)?.context?.tokens;
+    const content = [COMPACT_PROMPT, summary ? `Résumé précédent (à intégrer) :\n${summary.text}` : '', `Échanges :\n${transcript}`]
+      .filter(Boolean)
+      .join('\n\n');
+    try {
+      const response = await this.backend.ask(
+        {
+          turns: [{ role: 'user', content }],
+          modelId: this.models.defaultId ?? undefined,
+          author: item.author,
+          authorClientId: item.clientId,
+          interaction: { approval: async () => ({ decision: 'deny', by: '' }), answer: async () => ({ text: '', by: '' }) },
+          noTools: true,
+        },
+        signal,
+      );
+      let text = '';
+      for await (const event of response.events) {
+        if (signal.aborted || this.disposed) {
+          return;
+        }
+        if (event.type === 'text') {
+          text += event.text;
+        }
+      }
+      if (!text.trim() || !this.findConversation(item.conversationId)) {
+        throw new Error('résumé vide');
+      }
+      this.pushEntry({
+        kind: 'summary',
+        id: newId(),
+        conversationId: item.conversationId,
+        timestamp: Date.now(),
+        author: item.author,
+        text: text.trim(),
+        model: response.modelName,
+        before,
+      });
+    } catch (err) {
+      if (!signal.aborted && this.findConversation(item.conversationId)) {
+        this.pushEntry({
+          kind: 'system',
+          id: newId(),
+          conversationId: item.conversationId,
+          timestamp: Date.now(),
+          level: 'error',
+          text: `Compactage impossible : ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  }
+
+  /** Mesure le contexte de la prochaine question de la discussion (jauge), si le modèle le permet. */
+  private async measureContext(conversationId: string): Promise<void> {
+    const conv = this.findConversation(conversationId);
+    if (!conv || !this.backend.measure || this.disposed) {
+      return;
+    }
+    const run = (conv.measuring ?? 0) + 1;
+    conv.measuring = run;
+    try {
+      const usage = await this.backend.measure(mergeConsecutive(this.historyTurns(conversationId)), this.models.defaultId ?? undefined);
+      if (usage && conv.measuring === run && this.findConversation(conversationId) && !this.disposed) {
+        conv.context = usage;
+        this.broadcastConversation(conv);
+      }
+    } catch {
+      // Mesure indisponible : la jauge garde sa dernière valeur.
+    }
   }
 
   private queueState(): QueueState {
-    const strip = ({ entryId, conversationId, clientId, author }: QueueItem): QueueItem => ({
+    const strip = ({ entryId, conversationId, clientId, author, kind }: QueueItem): QueueItem => ({
       entryId,
       conversationId,
       clientId,
       author,
+      ...(kind ? { kind } : {}),
     });
     return {
       current: this.current ? strip(this.current.item) : null,
@@ -1108,6 +1335,12 @@ function parseClientMessage(data: string): ClientMessage | undefined {
         : undefined;
     case 'stopTunnel':
       return { type: 'stopTunnel' };
+    case 'compact':
+      return str(m.conversationId) ? { type: 'compact', conversationId: m.conversationId } : undefined;
+    case 'fork':
+      return str(m.conversationId) && (m.upToEntryId === undefined || str(m.upToEntryId))
+        ? { type: 'fork', conversationId: m.conversationId, upToEntryId: m.upToEntryId as string | undefined }
+        : undefined;
     case 'setSessionOption':
       return (m.option === 'guestModelChoice' || m.option === 'reviewGuestQuestions') && typeof m.value === 'boolean'
         ? { type: 'setSessionOption', option: m.option, value: m.value }
@@ -1132,8 +1365,8 @@ function sanitizeLine(raw: string, maxLength: number): string {
   return clean.length > maxLength ? `${clean.slice(0, maxLength - 1).trimEnd()}…` : clean;
 }
 
-function publicConversation({ id, title, createdAt, createdBy, createdByClientId }: ConversationState): Conversation {
-  return { id, title, createdAt, createdBy, createdByClientId };
+function publicConversation({ id, title, createdAt, createdBy, createdByClientId, context, forkedFrom }: ConversationState): Conversation {
+  return { id, title, createdAt, createdBy, createdByClientId, ...(context ? { context } : {}), ...(forkedFrom ? { forkedFrom } : {}) };
 }
 
 function formatContext(e: ContextEntry): string {

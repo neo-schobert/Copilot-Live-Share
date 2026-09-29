@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import type { PreparedCall, WorkspaceTools } from './agentTools';
-import type { ModelBackend, ModelEvent, ModelRequest, ModelResponse } from './chatRoom';
-import type { ModelInfo, ToolActivity } from './protocol';
+import type { ModelBackend, ModelEvent, ModelRequest, ModelResponse, ModelTurn } from './chatRoom';
+import type { ContextUsage, ModelInfo, ToolActivity } from './protocol';
 
 /** Nombre maximal d'allers-retours modèle ↔ outils pour une question. */
 const MAX_TOOL_ROUNDS = 25;
@@ -30,6 +30,19 @@ export class CopilotBackend implements ModelBackend {
     return { modelName: model.name, events: this.run(model, messages, request, signal) };
   }
 
+  /** Tokens de ces messages (et des définitions d'outils, envoyées avec chaque requête). */
+  async measure(turns: ModelTurn[], modelId?: string): Promise<ContextUsage | undefined> {
+    const model = modelId ? await selectById(modelId) : await selectModel();
+    if (!model.maxInputTokens) {
+      return undefined;
+    }
+    const counts = await Promise.all([
+      ...turns.map((t) => model.countTokens(t.content)),
+      model.countTokens(JSON.stringify(this.tools.definitions())),
+    ]);
+    return { tokens: counts.reduce((a, b) => a + b, 0), max: model.maxInputTokens, model: model.name };
+  }
+
   private async *run(
     initialModel: vscode.LanguageModelChat,
     messages: vscode.LanguageModelChatMessage[],
@@ -39,7 +52,7 @@ export class CopilotBackend implements ModelBackend {
     const cts = new vscode.CancellationTokenSource();
     const onAbort = () => cts.cancel();
     signal.addEventListener('abort', onAbort, { once: true });
-    let tools = this.tools.definitions();
+    let tools = request.noTools ? [] : this.tools.definitions();
     let model = initialModel;
 
     try {

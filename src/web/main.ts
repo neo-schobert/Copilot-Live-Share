@@ -10,6 +10,7 @@ import {
   ServerMessage,
   SessionPolicy,
   SharedApp,
+  SummaryEntry,
   ToolActivity,
   TunnelProviderId,
   TunnelState,
@@ -72,6 +73,15 @@ const homeStatus = $<HTMLElement>('home-status');
 const leaveBtn = $<HTMLButtonElement>('leave');
 const policyNote = $<HTMLElement>('policy-note');
 const openTabBtn = $<HTMLButtonElement>('open-tab');
+const contextBtn = $<HTMLButtonElement>('context-btn');
+const contextRing = $<HTMLElement>('context-ring');
+const contextPct = $<HTMLElement>('context-pct');
+const contextPop = $<HTMLElement>('context-pop');
+const contextFill = $<HTMLElement>('context-fill');
+const contextDetail = $<HTMLElement>('context-detail');
+const contextWarn = $<HTMLElement>('context-warn');
+const compactBtn = $<HTMLButtonElement>('compact-btn');
+const compactHint = $<HTMLElement>('compact-hint');
 const tunnelBtn = $<HTMLButtonElement>('tunnel-btn');
 const tunnelStatus = $<HTMLElement>('tunnel-status');
 const tunnelChoose = $<HTMLElement>('tunnel-choose');
@@ -346,6 +356,7 @@ function endSession(reason: string): void {
   updateComposer();
   updateActivity();
   renderApps();
+  renderContext();
   rerenderActive();
 }
 
@@ -399,6 +410,7 @@ function handle(msg: ServerMessage): void {
       } else {
         renderConversations();
         renderTitle();
+        renderContext();
         renderParticipants();
       }
       break;
@@ -541,6 +553,7 @@ function handle(msg: ServerMessage): void {
       queue = msg.queue;
       updateActivity();
       renderConversations();
+      renderContext();
       break;
     case 'models':
       models = msg.models;
@@ -577,6 +590,7 @@ function openConversation(id: string, force = false): void {
   rerenderActive();
   renderConversations();
   renderTitle();
+  renderContext();
   renderParticipants();
   renderPresence();
   updateActivity();
@@ -697,7 +711,7 @@ function renderConversations(): void {
       const meta = document.createElement('span');
       meta.className = 'conv-meta';
       meta.textContent =
-        conv.id === answering ? 'L’assistant répond…' : waiting.has(conv.id) ? 'En attente…' : `${conv.createdBy} · ${formatTime(conv.createdAt)}`;
+        conv.id === answering ? (queue.current?.kind === 'compact' ? 'Compactage…' : 'L’assistant répond…') : waiting.has(conv.id) ? 'En attente…' : `${conv.createdBy} · ${formatTime(conv.createdAt)}`;
       const writers = typingIn(conv.id);
       if (writers.length && conv.id !== answering) {
         meta.textContent = `${nameList(writers)} ${writers.length > 1 ? 'écrivent' : 'écrit'}…`;
@@ -860,6 +874,9 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
       el.append(codeBlock(entry.code, entry.languageId, where));
       break;
     }
+    case 'summary':
+      renderSummary(entry, el);
+      break;
     case 'system': {
       el.classList.toggle('error', entry.level === 'error');
       el.textContent = entry.text;
@@ -888,12 +905,42 @@ function reviewBar(entry: UserEntry): HTMLElement {
   return bar;
 }
 
+/** Discussion compactée : le résumé remplace, pour le modèle, les échanges précédents. */
+function renderSummary(entry: SummaryEntry, el: HTMLElement): void {
+  const head = turnHead(assistantAvatar(), `Discussion compactée par ${entry.author}`, entry.timestamp);
+  if (entry.model) {
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = entry.model;
+    head.append(meta);
+  }
+  const card = document.createElement('details');
+  card.className = 'summary-card';
+  const label = document.createElement('summary');
+  label.textContent = 'Résumé envoyé au modèle à la place des échanges précédents (qui restent affichés ici)';
+  const body = document.createElement('div');
+  body.className = 'body';
+  body.append(renderMarkdown(entry.text));
+  card.append(label, body);
+  el.append(head, card);
+}
+
 function renderAssistant(entry: AssistantEntry, el: HTMLElement): void {
   const head = turnHead(assistantAvatar(), 'Assistant', entry.timestamp);
   const meta = document.createElement('span');
   meta.className = 'meta';
   meta.textContent = `${entry.model ? `${entry.model} · ` : ''}pour ${entry.replyToAuthor}`;
   head.append(meta);
+  if (entry.status !== 'streaming' && !ended) {
+    const fork = document.createElement('button');
+    fork.type = 'button';
+    fork.className = 'icon-btn fork-btn';
+    fork.title = 'Forker à partir d’ici : copie la discussion jusqu’à cette réponse dans une nouvelle discussion';
+    fork.setAttribute('aria-label', fork.title);
+    fork.append(icon('repo-forked'));
+    fork.addEventListener('click', () => send({ type: 'fork', conversationId: entry.conversationId, upToEntryId: entry.id }));
+    head.append(fork);
+  }
   el.append(head);
 
   const bodyEl = document.createElement('div');
@@ -1506,7 +1553,7 @@ function updateActivity(): void {
     const who = current.clientId === me?.clientId ? 'vous' : current.author;
     const conv = conversations.find((c) => c.id === current.conversationId);
     const where = current.conversationId === activeId || !conv ? '' : ` dans « ${conv.title} »`;
-    parts.push(`L’assistant répond à ${who}${where}`);
+    parts.push(current.kind === 'compact' ? `Compactage de la discussion${where}…` : `L’assistant répond à ${who}${where}`);
   }
   const mine = queue.pending.findIndex((q) => q.clientId === me?.clientId);
   if (mine >= 0) {
@@ -1611,6 +1658,65 @@ function renderPolicy(): void {
   policyNote.textContent = rules.length ? `${text} Règles : ${rules.join(', ')}.` : text;
   policyNote.hidden = !me;
 }
+
+// ---- Contexte de la discussion (jauge) et compactage ----
+
+const RING = 2 * Math.PI * 6;
+
+function formatTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toLocaleString('fr-FR', { maximumFractionDigits: n >= 100_000 ? 0 : 1 })} k` : String(n);
+}
+
+/** Jauge de la discussion affichée : tokens envoyés au modèle à la prochaine question / maximum du modèle. */
+function renderContext(): void {
+  const conv = conversations.find((c) => c.id === activeId);
+  const usage = conv?.context;
+  contextBtn.hidden = !usage || ended;
+  if (!usage) {
+    toggleContext(false);
+    return;
+  }
+  const ratio = Math.min(1, usage.tokens / usage.max);
+  const pct = Math.round(ratio * 100);
+  const level = pct >= 90 ? 'danger' : pct >= 75 ? 'warn' : '';
+  contextBtn.className = `context-gauge ${level}`;
+  contextRing.setAttribute('stroke-dasharray', `${Math.max(0.5, ratio * RING)} ${RING}`);
+  contextPct.textContent = `${pct} %`;
+  contextBtn.title = `Contexte : ${formatTokens(usage.tokens)} / ${formatTokens(usage.max)} tokens (${pct} %)`;
+  contextFill.parentElement!.className = `context-bar ${level}`;
+  contextFill.style.width = `${Math.max(1, pct)}%`;
+  contextDetail.textContent = `${formatTokens(usage.tokens)} / ${formatTokens(usage.max)} tokens (${pct} %) · ${usage.model}`;
+  contextWarn.hidden = pct < 75;
+  const compacting = [queue.current, ...queue.pending].some((q) => q?.kind === 'compact' && q.conversationId === conv!.id);
+  compactBtn.hidden = !me?.isHost;
+  compactBtn.disabled = compacting;
+  compactBtn.lastElementChild!.textContent = compacting ? 'Compactage en cours…' : 'Compacter la discussion';
+  compactHint.textContent = me?.isHost
+    ? 'Le modèle résume les échanges ; le résumé remplace l’historique envoyé ensuite (une requête sur votre compte).'
+    : 'Seul l’hôte peut compacter : le résumé est une requête au modèle, sur son compte.';
+}
+
+function toggleContext(open = contextPop.hidden): void {
+  contextPop.hidden = !open;
+  contextBtn.setAttribute('aria-expanded', String(open));
+}
+
+contextBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleContext();
+});
+
+document.addEventListener('click', (e) => {
+  if (!contextPop.hidden && !contextPop.contains(e.target as Node)) {
+    toggleContext(false);
+  }
+});
+
+compactBtn.addEventListener('click', () => {
+  if (activeId) {
+    send({ type: 'compact', conversationId: activeId });
+  }
+});
 
 function updateComposer(): void {
   const online = !!ws && ws.isOpen && !!me && !ended && !!activeId;

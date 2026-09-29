@@ -684,6 +684,43 @@ button.person-where { color: var(--link); }
 .avatar-stack.small .avatar { width: 16px; height: 16px; font-size: 9px; margin-left: -4px; box-shadow: 0 0 0 2px var(--bg); }
 .avatar-stack.small .avatar:first-child { margin-left: 0; }
 .conv.active .avatar-stack.small .avatar, .conv:hover .avatar-stack.small .avatar { box-shadow: none; }
+/* ---- Jauge du contexte ---- */
+.context-wrap { position: relative; flex: none; }
+.context-gauge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.context-gauge:hover { background: var(--hover); color: var(--text); }
+.context-gauge svg { width: 14px; height: 14px; transform: rotate(-90deg); }
+.context-gauge circle { fill: none; stroke-width: 2.5; }
+.context-gauge .track { stroke: var(--border); }
+.context-gauge .ring { stroke: var(--muted); stroke-linecap: round; transition: stroke-dasharray 0.3s; }
+.context-gauge.warn .ring, .context-bar.warn span { stroke: var(--warn); background: var(--warn); }
+.context-gauge.danger .ring, .context-bar.danger span { stroke: var(--danger); background: var(--danger); }
+.context-gauge.warn, .context-gauge.danger { color: var(--text-strong); }
+.popover.context-pop { top: auto; bottom: calc(100% + 6px); right: 0; width: 290px; display: grid; gap: 8px; }
+.context-pop .hint { margin: 0; font-size: 12px; color: var(--muted); }
+.context-pop .hint.warn { color: var(--warn); }
+.context-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.context-bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+.context-detail { margin: 0; font-size: 12px; color: var(--text-strong); }
+.compact-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+
+/* ---- Résumé (discussion compactée) et fork ---- */
+.turn-summary .summary-card { border: 1px dashed var(--border); border-radius: 6px; padding: 6px 10px; }
+.turn-summary summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.turn-summary .body { margin-top: 6px; }
+.fork-btn { width: 22px; height: 22px; margin-left: 2px; opacity: 0.6; }
+.turn:hover .fork-btn, .fork-btn:focus-visible { opacity: 1; }
+@media (hover: none) { .fork-btn { opacity: 1; } }
+
 .policy-note { margin: 0; font-size: 11px; color: var(--muted); text-align: center; overflow-wrap: anywhere; }
 .review-bar {
   display: flex;
@@ -788,7 +825,8 @@ button.person-where { color: var(--link); }
   .app { grid-template-columns: minmax(0, 1fr); }
   /* Fenêtres « Inviter » et « Participants » : pleine largeur sous la barre du haut. */
   .popover, .invite-pop { position: fixed; left: 8px; right: 8px; top: 40px; width: auto; max-width: none; }
-  .popover.apps-pop { width: auto; }
+  .popover.apps-pop, .popover.context-pop { width: auto; }
+  .popover.context-pop { top: auto; bottom: 110px; right: 8px; }
   .topbar { gap: 4px; }
   .drawer-toggle { display: inline-grid; }
   .sidebar {

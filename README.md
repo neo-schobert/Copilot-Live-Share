@@ -206,6 +206,12 @@ Si le service choisi échoue (réseau filtré, compte…), l'extension affiche l
 
 **Partager le lien** : envoyez le lien copié (il contient le token). Toute personne qui possède ce lien peut rejoindre le chat et poser des questions. Pour révoquer l'accès, arrêtez la session et redémarrez-en une : un nouveau token est généré.
 
+## Contexte, compactage et fork
+
+- **Jauge du contexte** : sous la zone de saisie, un anneau et un pourcentage indiquent la taille de ce que le modèle reçoit avec chaque question de la discussion (consigne et outils, dernier résumé, échanges récents), en tokens du modèle, par rapport à son maximum. Un clic affiche le détail. Elle passe à l'orange à 75 %, au rouge à 90 %.
+- **Compacter** (hôte, depuis la jauge) : le modèle résume les échanges de la discussion (objectifs, décisions, fichiers, questions en suspens, qui a demandé quoi). Ce résumé remplace ensuite l'historique envoyé au modèle ; les messages restent affichés, et le résumé apparaît dans la discussion (« Discussion compactée par … »). Le compactage passe par la file d'attente et coûte une requête sur le compte de l'hôte.
+- **Forker** (tout le monde, icône sur chaque réponse) : copie la discussion jusqu'à cette réponse dans une nouvelle discussion (« … (fork) »), pour explorer une autre piste sans toucher à l'originale. Les questions sans réponse ne sont pas copiées.
+
 ## Partager une application locale
 
 L'hôte peut rendre accessible aux participants une application qui tourne sur sa machine (serveur de dev sur `localhost:8080`, API, site…) : bouton **Applications** en haut du chat → port et nom → **Partager** (ou **Prompt Share: Share Local App…**).

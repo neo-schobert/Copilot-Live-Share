@@ -29,8 +29,20 @@ class FakeBackend implements ModelBackend {
   readonly modelIds: (string | undefined)[] = [];
 
   readonly outcomes: string[] = [];
+  readonly compactions: string[] = [];
 
-  async ask({ turns, modelId, interaction, author, authorClientId }: ModelRequest, signal: AbortSignal) {
+  async measure(turns: ModelTurn[]) {
+    return { tokens: Math.ceil(turns.reduce((n, t) => n + t.content.length, 0) / 4), max: 100_000, model: 'fake-model' };
+  }
+
+  async ask({ turns, modelId, interaction, author, authorClientId, noTools }: ModelRequest, signal: AbortSignal) {
+    if (noTools && turns[0].content.startsWith('Tu compactes')) {
+      this.compactions.push(turns[0].content);
+      async function* summary(): AsyncGenerator<ModelEvent> {
+        yield { type: 'text', text: 'RÉSUMÉ-TEST : alice a posé des questions.' };
+      }
+      return { modelName: 'fake-model', events: summary() };
+    }
     this.calls.push(turns);
     this.modelIds.push(modelId);
     const question = turns[turns.length - 1].content.split('\n\n').pop() ?? '';
@@ -488,6 +500,41 @@ async function main() {
   assert.equal(welcome.you.clientId, 'bob-client-id');
   assert.ok(welcome.history.length >= 6);
   ok('Reconnexion : même identité et historique complet');
+
+  // 10 ter. Contexte (jauge), compactage et fork
+  await waitIdle();
+  const measured = await host.waitFor((m) => m.type === 'conversation' && m.conversation.id === alice.conv && !!m.conversation.context);
+  assert.ok(measured.type === 'conversation' && measured.conversation.context!.max === 100_000 && measured.conversation.context!.tokens > 0);
+  alice.send({ type: 'compact', conversationId: alice.conv });
+  await alice.waitFor((m) => m.type === 'error' && m.message.includes("Seul l'hôte peut compacter"));
+  const beforeCompact = backend.calls.length;
+  host.send({ type: 'compact', conversationId: alice.conv });
+  const summaryMsg = await alice.waitFor((m) => m.type === 'entry' && m.entry.kind === 'summary');
+  assert.ok(summaryMsg.type === 'entry' && summaryMsg.entry.kind === 'summary' && summaryMsg.entry.author === 'hote');
+  assert.equal(backend.calls.length, beforeCompact, 'le compactage ne compte pas comme une question');
+  assert.match(backend.compactions[0], /Stp modifie encore|Question modèle/, 'le transcript contient les échanges');
+  await waitIdle();
+  host.send({ type: 'compact', conversationId: alice.conv });
+  await host.waitFor((m) => m.type === 'error' && m.message.includes('Rien à compacter'));
+  alice.ask('Après compactage');
+  await alice.waitFor((m) => m.type === 'entryUpdate' && m.status === 'done' && backend.calls.length > beforeCompact);
+  const afterTurns = backend.calls[backend.calls.length - 1].map((t) => t.content).join('\n');
+  assert.ok(afterTurns.includes('RÉSUMÉ-TEST'), 'le résumé est envoyé au modèle');
+  assert.ok(!afterTurns.includes('Stp modifie encore'), 'les échanges résumés ne sont plus envoyés');
+  assert.ok(afterTurns.includes('Après compactage'));
+  await waitIdle();
+  const convEntries = room.entriesOf(alice.conv);
+  const cutAnswer = convEntries.find((e) => e.kind === 'assistant')!;
+  alice.send({ type: 'fork', conversationId: alice.conv, upToEntryId: cutAnswer.id });
+  const forked = await alice.waitFor((m) => m.type === 'conversation' && m.conversation.forkedFrom === alice.conv);
+  assert.ok(forked.type === 'conversation' && forked.conversation.title.endsWith('(fork)') && forked.conversation.createdByClientId === 'alice-client-id');
+  const copied = room.entriesOf(forked.conversation.id);
+  assert.equal(copied.filter((e) => e.kind === 'assistant').length, 1, 'copie jusqu’à la réponse choisie');
+  const copiedAnswer = copied.find((e) => e.kind === 'assistant')!;
+  assert.ok(copiedAnswer.kind === 'assistant' && copied.some((e) => e.kind === 'user' && e.id === copiedAnswer.replyTo), 'réponse reliée à la question copiée');
+  assert.ok(copied.every((e) => !convEntries.some((o) => o.id === e.id)), 'nouveaux identifiants');
+  assert.equal(room.entriesOf(alice.conv).length, convEntries.length, 'discussion d’origine intacte');
+  ok('Contexte mesuré après chaque échange ; compactage (hôte seul) : le résumé remplace l’historique envoyé ; fork jusqu’à une réponse, discussion d’origine intacte');
 
   // 11 bis. Questions des invités soumises à l'hôte avant l'envoi au modèle
   policy.reviewGuestQuestions = true;

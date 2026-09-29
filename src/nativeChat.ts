@@ -115,7 +115,7 @@ export class NativeChatBridge implements vscode.Disposable {
       return undefined;
     }
     const e = msg.entry;
-    if (e.kind === 'user' || e.kind === 'context' || (e.kind === 'assistant' && !this.ownedQuestions.has(e.replyTo))) {
+    if (e.kind === 'user' || e.kind === 'context' || e.kind === 'summary' || (e.kind === 'assistant' && !this.ownedQuestions.has(e.replyTo))) {
       return e.conversationId;
     }
     return undefined;
@@ -241,7 +241,10 @@ export class NativeChatBridge implements vscode.Disposable {
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn2)[] = [];
     const pushQuestion = (e: ChatEntry) => history.push(requestTurn(this.promptOf(e)));
     for (const e of entries) {
-      if (e.kind === 'context') {
+      if (e.kind === 'summary') {
+        history.push(requestTurn(`📦 Discussion compactée par ${e.author}`));
+        history.push(responseTurn(`_Résumé envoyé au modèle à la place des échanges précédents :_\n\n${e.text}`));
+      } else if (e.kind === 'context') {
         pushQuestion(e);
         history.push(responseTurn('_Contexte ajouté à la discussion._'));
       } else if (e.kind === 'user' && e.id !== streamingQuestion) {

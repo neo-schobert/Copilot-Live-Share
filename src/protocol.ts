@@ -25,6 +25,18 @@ export interface Conversation {
   createdBy: string;
   /** Id client du créateur, pour que son navigateur ouvre la discussion créée. */
   createdByClientId: string;
+  /** Contexte envoyé au modèle à la prochaine question (mesuré après chaque échange). */
+  context?: ContextUsage;
+  /** Discussion d'origine, pour une discussion forkée. */
+  forkedFrom?: string;
+}
+
+/** Taille du contexte d'une discussion, en tokens du modèle. */
+export interface ContextUsage {
+  tokens: number;
+  /** Maximum de tokens en entrée du modèle. */
+  max: number;
+  model: string;
 }
 
 interface BaseEntry {
@@ -164,7 +176,21 @@ export interface SystemEntry extends BaseEntry {
   text: string;
 }
 
-export type ChatEntry = UserEntry | AssistantEntry | ContextEntry | SystemEntry;
+/**
+ * Résumé des échanges précédents (discussion compactée) : il remplace, pour le modèle,
+ * tout ce qui le précède dans la discussion. Les messages restent affichés.
+ */
+export interface SummaryEntry extends BaseEntry {
+  kind: 'summary';
+  /** Qui a demandé le compactage. */
+  author: string;
+  text: string;
+  model?: string;
+  /** Tokens du contexte avant et après le compactage, si mesurés. */
+  before?: number;
+}
+
+export type ChatEntry = UserEntry | AssistantEntry | ContextEntry | SystemEntry | SummaryEntry;
 
 export interface ModelInfo {
   id: string;
@@ -186,6 +212,8 @@ export interface QueueItem {
   conversationId: string;
   clientId: string;
   author: string;
+  /** Compactage de la discussion plutôt qu'une question. */
+  kind?: 'compact';
 }
 
 /** File unique pour toute la session : une seule question traitée à la fois. */
@@ -230,6 +258,10 @@ export type ClientMessage =
   | { type: 'startTunnel'; provider?: TunnelProviderId }
   /** Réservé à l'hôte : ferme le tunnel public. */
   | { type: 'stopTunnel' }
+  /** Réservé à l'hôte : résume les échanges de la discussion pour alléger le contexte. */
+  | { type: 'compact'; conversationId: string }
+  /** Copie la discussion jusqu'à cette entrée (incluse) dans une nouvelle discussion. */
+  | { type: 'fork'; conversationId: string; upToEntryId?: string }
   /** Réservé à l'hôte : réglage de la session modifié depuis le chat. */
   | { type: 'setSessionOption'; option: SessionOption; value: boolean };
 

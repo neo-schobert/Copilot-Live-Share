@@ -145,6 +145,21 @@
               <i id="model-chevron" class="codicon codicon-chevron-down"></i>
             </label>
             <span class="spacer"></span>
+            <div class="context-wrap">
+              <button id="context-btn" class="context-gauge" type="button" aria-expanded="false" aria-controls="context-pop" hidden>
+                <svg viewBox="0 0 16 16" aria-hidden="true"><circle class="track" cx="8" cy="8" r="6"></circle><circle id="context-ring" class="ring" cx="8" cy="8" r="6"></circle></svg>
+                <span id="context-pct"></span>
+              </button>
+              <div id="context-pop" class="popover context-pop" hidden>
+                <div class="section-title">Contexte de la discussion</div>
+                <div class="context-bar"><span id="context-fill"></span></div>
+                <p id="context-detail" class="context-detail"></p>
+                <p class="hint">Consigne, dernier résumé et échanges récents : ce que le modèle reçoit avec chaque question de cette discussion.</p>
+                <p id="context-warn" class="hint warn" hidden>Le contexte approche de la limite du modèle : compactez pour garder des réponses précises.</p>
+                <button id="compact-btn" type="button" class="secondary compact-btn"><i class="codicon codicon-fold"></i><span>Compacter la discussion</span></button>
+                <p id="compact-hint" class="hint"></p>
+              </div>
+            </div>
             <button id="cancel" class="icon-btn stop" type="button" title="Arrêter la réponse" hidden><i class="codicon codicon-debug-stop"></i></button>
             <button id="ask-send" class="icon-btn send" type="submit" title="Envoyer (Entrée)"><i class="codicon codicon-send"></i></button>
           </div>

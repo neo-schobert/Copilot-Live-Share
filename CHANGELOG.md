@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+- Jauge du contexte de chaque discussion (tokens envoyés au modèle / maximum du modèle), avec le détail au clic.
+- Compacter une discussion (hôte) : le modèle la résume, et le résumé remplace l'historique envoyé ensuite.
+- Forker une discussion à partir d'une réponse, dans une nouvelle discussion.
+
 ## 0.1.4
 
 - Choix du modèle : quand il est impossible (modèle fixé par l'hôte, un seul modèle…), le menu affiche un cadenas et un clic en donne la raison, au lieu de sembler bloqué.
