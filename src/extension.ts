@@ -3,8 +3,9 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
 import { PROPOSAL_SCHEME, ProposalContentProvider, WorkspaceTools } from './agentTools';
-import type { ApprovalDecision, SessionPolicy } from './protocol';
-import { ChatRoom, InviteResult, LOCAL_HOST_CLIENT_ID, PendingApproval, PendingQuestion, PendingReview } from './chatRoom';
+import type { ApprovalDecision, ServerMessage, SessionPolicy } from './protocol';
+import { NotificationLevel, SessionNotifier } from './notifications';
+import { ChatRoom, InviteResult, LOCAL_HOST_CLIENT_ID, PendingQuestion } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
 import { ChatController, ChatViewProvider, ConnectionTarget, inviteTarget, ViewState } from './chatView';
 import { NativeChatBridge } from './nativeChat';
@@ -50,8 +51,17 @@ let proposals: ProposalContentProvider;
 let tools: WorkspaceTools;
 /** Détection du bac à sable des commandes (bubblewrap, ou WSL sous Windows). */
 let sandboxReady: Promise<unknown> = Promise.resolve();
-const log = (message: string) => output?.appendLine(message);
+/** Dernières lignes du journal (diagnostic des tests d'intégration). */
+const recentLogs: string[] = [];
+const log = (message: string) => {
+  output?.appendLine(message);
+  recentLogs.push(message);
+  recentLogs.splice(0, recentLogs.length - 100);
+};
 let chatView: ChatViewProvider | undefined;
+let notifier: SessionNotifier;
+/** Dernier nombre de participants connu (barre d'état). */
+let participantCount = 0;
 /** Derniers évènements de la vue (diagnostic, tests). */
 const viewEvents: string[] = [];
 /** Session rejointe (invité) depuis la vue, avec sa cible de connexion. */
@@ -66,11 +76,20 @@ export interface PromptShareApi {
   /** Résolue quand la détection du bac à sable est terminée. */
   readonly sandboxReady: Promise<unknown>;
   /** Session hébergée : lien d'invitation local et pseudos des participants connectés. */
-  readonly hostedSession: () => { inviteLink: string; participants: string[] } | undefined;
+  readonly hostedSession: () => { inviteLink: string; participants: string[]; awaitingReview: string[] } | undefined;
   /** Rejoint une session comme le ferait l'accueil de la vue. */
   readonly join: (link: string, name: string) => Promise<void>;
   readonly viewState: () => ViewState;
+  /** Discussions ouvertes dans un onglet d'éditeur. */
+  readonly openTabs: () => string[];
+  readonly openTab: (conversationId: string) => void;
+  readonly conversations: () => { id: string; title: string }[];
+  /** Invité : envoie un message à la session, comme le ferait la page. */
+  readonly sendToSession: (msg: object) => boolean;
+  /** Nombre de décisions qui attendent ce participant (pastille). */
+  readonly pendingDecisions: () => number;
   readonly viewEvents: () => string[];
+  readonly logs: () => string[];
 }
 
 export function activate(context: vscode.ExtensionContext): PromptShareApi {
@@ -85,6 +104,17 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
     log(m);
     viewEvents.push(m);
   });
+  notifier = createNotifier();
+  chatView.onServerMessage = (data) => {
+    // Invité dans VS Code : les messages de la session passent par la vue et les onglets.
+    if (guest && !session) {
+      try {
+        notifier.feed(JSON.parse(data) as ServerMessage);
+      } catch {
+        // Message illisible : ignoré.
+      }
+    }
+  };
   updateStatusBar(0);
 
   log(`Extension activée : ${describeEnvironment(context)}`);
@@ -107,6 +137,7 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
     vscode.commands.registerCommand('promptShare.leave', () => viewController(context).leave(false)),
     vscode.commands.registerCommand('promptShare.copyInviteLink', withSession(copyInviteLink)),
     vscode.commands.registerCommand('promptShare.openChat', () => chatView?.reveal()),
+    vscode.commands.registerCommand('promptShare.openConversationTab', openConversationTabCommand),
     vscode.commands.registerCommand('promptShare.shareSelection', withSession(shareSelection)),
     vscode.commands.registerCommand('promptShare.cancelResponse', withSession(cancelResponse)),
     vscode.commands.registerCommand('promptShare.stopSession', withSession(stopSession)),
@@ -154,6 +185,12 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
   return {
     tools,
     nativeChatActive: () => !!session?.nativeChat,
+    logs: () => [...recentLogs],
+    openTabs: () => chatView?.openTabs ?? [],
+    openTab: (id) => openConversationTab(id),
+    conversations: () => conversationsOfSession(),
+    sendToSession: (msg) => !!chatView?.sendToSession(msg),
+    pendingDecisions: () => notifier.pendingCount,
     get sandboxReady() {
       return sandboxReady;
     },
@@ -161,6 +198,7 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
       session && {
         inviteLink: inviteLink(session, session.localUrl) ?? '',
         participants: session.room.participantList.map((p) => p.name),
+        awaitingReview: session.room.awaitingReviewIds,
       },
     join: async (link, name) => {
       await chatView?.reveal();
@@ -322,6 +360,7 @@ async function joinSession(name: string, link: string): Promise<void> {
     return;
   }
   saveName(name);
+  notifier.reset();
   guest = { link, target };
   viewStatus = {};
   log(`Session rejointe : ${new URL(link).host}`);
@@ -349,6 +388,7 @@ function viewController(context: vscode.ExtensionContext): ChatController {
     leave: async (ended) => {
       if (guest) {
         guest = undefined;
+        notifier.reset();
         viewStatus = {};
         updateStatusBar(0);
         chatView?.reset();
@@ -432,13 +472,13 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     hostName: hostName(),
     onParticipantsChanged: (p) => updateStatusBar(p.length),
     extraInstructions: () => tools.instructions(),
-    onApprovalRequested: (pending) => void notifyApproval(pending),
     onQuestionAsked: (pending) => void askLocalHost(pending),
     onShowDiff: (_entryId, toolId) => void tools.showDiff(toolId),
     onInviteRequested: inviteFromChat,
     policy: sessionPolicy,
-    onReviewRequested: (pending) => void notifyReview(pending),
   });
+  notifier.reset();
+  room.subscribe((msg) => notifier.feed(msg));
   const server = new ChatServer(
     {
       port,
@@ -478,72 +518,6 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   chatView?.postState();
   void refreshModels();
   void showSessionNotification(session, 'Session démarrée');
-}
-
-/**
- * Notifie l'hôte d'une action à valider. La notification n'est pas modale : la
- * décision peut aussi venir de la page web ou du chat natif, la première l'emporte.
- */
-async function notifyApproval(pending: PendingApproval): Promise<void> {
-  const room = session?.room;
-  const { tool, entryId, author } = pending;
-  const allow = 'Autoriser';
-  const allowSession = 'Autoriser pour la session';
-  const diff = 'Voir les modifications';
-  const deny = 'Refuser';
-  const buttons = [allow, ...(tool.approval.hostOnly ? [] : [allowSession]), ...(tool.approval.canShowDiff ? [diff] : []), deny];
-  const scope = tool.approval.hostOnly ? ' (hors du projet — vous seul pouvez décider)' : '';
-  for (;;) {
-    const choice = await vscode.window.showWarningMessage(
-      `Prompt Share — ${author} : ${tool.title}${scope}\n${tool.approval.preview.split('\n').slice(0, 6).join('\n')}`,
-      ...buttons,
-    );
-    if (!room || !room.pendingApproval(entryId, tool.id)) {
-      return; // Déjà décidé ailleurs ou session terminée.
-    }
-    if (choice === diff) {
-      await tools.showDiff(tool.id);
-      continue;
-    }
-    const decision: ApprovalDecision | undefined =
-      choice === allow ? 'once' : choice === allowSession ? 'session' : choice === deny ? 'deny' : undefined;
-    if (decision) {
-      room.resolveApproval(entryId, tool.id, decision, hostName());
-    }
-    return;
-  }
-}
-
-/**
- * Question d'invité à accepter avant son envoi au modèle. Non modale : l'hôte peut aussi
- * décider depuis le chat ; la première décision l'emporte.
- */
-async function notifyReview(pending: PendingReview): Promise<void> {
-  const room = session?.room;
-  const { entryId, author, text, modelName } = pending;
-  const accept = 'Envoyer au modèle';
-  const reject = 'Refuser';
-  const open = 'Ouvrir le chat';
-  const excerpt = text.length > 200 ? `${text.slice(0, 199)}…` : text;
-  for (;;) {
-    const choice = await vscode.window.showInformationMessage(
-      `Prompt Share — question de ${author}${modelName ? ` (modèle ${modelName})` : ''} : « ${excerpt} »`,
-      accept,
-      reject,
-      open,
-    );
-    if (!room || !room.awaitingReviewOf(entryId)) {
-      return; // Déjà décidé ailleurs ou session terminée.
-    }
-    if (choice === open) {
-      await chatView?.reveal();
-      continue;
-    }
-    if (choice === accept || choice === reject) {
-      room.reviewQuestion(entryId, choice === accept, hostName());
-    }
-    return;
-  }
 }
 
 /** Question de l'agent posée à l'hôte depuis le chat natif : réponse dans VS Code. */
@@ -774,6 +748,7 @@ async function stopSession(): Promise<void> {
     return;
   }
   session = undefined;
+  notifier.reset();
   tools.resetSession();
   await vscode.commands.executeCommand('setContext', 'promptShare.active', false);
   await s.stop();
@@ -797,7 +772,8 @@ function withSession(fn: (s: Session) => unknown): () => Promise<void> {
 }
 
 /** Bouton de la barre d'état, toujours visible : ouvre le chat (accueil, session hébergée ou rejointe). */
-function updateStatusBar(participants: number): void {
+function updateStatusBar(participants = participantCount, pending = { count: notifier?.pendingCount ?? 0, summary: '' }): void {
+  participantCount = participants;
   if (!statusBar) {
     return;
   }
@@ -808,12 +784,89 @@ function updateStatusBar(participants: number): void {
     statusBar.text = '$(plug) Prompt Share';
     statusBar.tooltip = `Connecté à la session de ${new URL(guest.link).host}. Cliquer pour ouvrir le chat.`;
   } else {
-    statusBar.text = '$(copilot) Prompt Share';
+    statusBar.text = '$(comment-discussion) Prompt Share';
     statusBar.tooltip = 'Héberger ou rejoindre une session Prompt Share';
+  }
+  // Décisions en attente : visibles même quand le chat est fermé.
+  if ((session || guest) && pending.count) {
+    statusBar.text += ` $(bell-dot) ${pending.count}`;
+    statusBar.tooltip += `\nEn attente de votre décision : ${pending.summary || pending.count}.`;
+    statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+  } else {
+    statusBar.backgroundColor = undefined;
   }
   statusBar.show();
   // Utilisé par le menu de la vue (bouton « Quitter ») et la palette.
   void vscode.commands.executeCommand('setContext', 'promptShare.connected', !!session || !!guest);
+}
+
+/** Notifications et décisions en attente, pour l'hôte (salle locale) ou un invité (messages relayés). */
+function createNotifier(): SessionNotifier {
+  return new SessionNotifier(
+    () =>
+      session
+        ? { isHost: true, clientIds: [chatView!.clientId, LOCAL_HOST_CLIENT_ID] }
+        : guest
+          ? { isHost: false, clientIds: [chatView!.clientId] }
+          : undefined,
+    {
+      approve: (entryId, toolId, decision) => {
+        if (session) {
+          session.room.resolveApproval(entryId, toolId, decision, hostName());
+        } else {
+          chatView?.sendToSession({ type: 'approve', entryId, toolId, decision });
+        }
+      },
+      review: (entryId, accept) => {
+        if (session) {
+          session.room.reviewQuestion(entryId, accept, hostName());
+        } else {
+          chatView?.sendToSession({ type: 'reviewQuestion', entryId, accept });
+        }
+      },
+      answer: (entryId, toolId, text) => {
+        if (session) {
+          session.room.answerQuestion(entryId, toolId, text, hostName());
+        } else {
+          chatView?.sendToSession({ type: 'answer', entryId, toolId, text });
+        }
+      },
+      open: (conversationId) => openConversationTab(conversationId),
+      showDiff: (toolId) => void tools.showDiff(toolId),
+    },
+    () => vscode.workspace.getConfiguration(CONFIG).get<NotificationLevel>('notifications', 'decisions'),
+    (count, summary) => {
+      chatView?.setBadge(count, summary);
+      updateStatusBar(participantCount, { count, summary });
+    },
+    // L'hôte répond déjà aux questions nées du chat natif (sélecteur dans VS Code).
+    (tool) => tool.question?.requesterClientId === LOCAL_HOST_CLIENT_ID,
+  );
+}
+
+function conversationsOfSession() {
+  return session ? session.room.conversationList : notifier.conversations;
+}
+
+/** Ouvre une discussion dans un onglet d'éditeur (déplaçable, à côté des autres). */
+function openConversationTab(conversationId: string): void {
+  const conv = conversationsOfSession().find((c) => c.id === conversationId);
+  chatView?.openTab(conversationId, conv?.title);
+}
+
+async function openConversationTabCommand(): Promise<void> {
+  const list = conversationsOfSession();
+  if (!session && !guest) {
+    void vscode.window.showInformationMessage('Prompt Share : hébergez ou rejoignez d’abord une session.');
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    list.map((c) => ({ label: c.title, description: `par ${c.createdBy}`, id: c.id })),
+    { title: 'Ouvrir une discussion dans un onglet', placeHolder: 'Discussion' },
+  );
+  if (picked) {
+    openConversationTab(picked.id);
+  }
 }
 
 function hostName(): string {

@@ -14,6 +14,16 @@ const ROLE = process.env.SCC_VIEW_ROLE as 'host' | 'guest';
 const GUEST_NAME = 'Invité VS Code';
 const log: string[] = [];
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const QUESTION = 'Question de test depuis VS Code';
+const sync = (name: string) => path.join(SYNC, name);
+const flag = (name: string) => fs.writeFileSync(sync(name), 'ok');
+const flagged = (name: string) => fs.existsSync(sync(name)) || undefined;
+
+/** Onglets d'éditeur Prompt Share (webviews) ouverts dans cette fenêtre. */
+const chatTabs = () =>
+  vscode.window.tabGroups.all
+    .flatMap((g) => g.tabs)
+    .filter((t) => t.input instanceof vscode.TabInputWebview && t.input.viewType.includes('promptShare.chat'));
 
 function ok(message: string): void {
   log.push(`✓ [${ROLE}] ${message}`);
@@ -55,19 +65,57 @@ export async function run(): Promise<void> {
         return p.includes(GUEST_NAME) ? p : undefined;
       });
       ok(`participants vus par l'hôte : ${names.join(', ')}`);
+
+      // Question de l'invité : décision en attente (pastille, barre d'état, notification).
+      await until("décision en attente pour l'hôte", () => api.pendingDecisions() === 1 || undefined, 30_000);
+      const [questionId] = await until('question en attente', () => {
+        const ids = api.hostedSession()?.awaitingReview ?? [];
+        return ids.length ? ids : undefined;
+      });
+      ok("question de l'invité : 1 décision en attente pour l'hôte (pastille et barre d'état)");
+
+      // Discussion ouverte dans un onglet d'éditeur, titré comme la discussion.
+      const conv = api.conversations()[0];
+      api.openTab(conv.id);
+      const tab = await until("onglet de l'hôte titré", () => chatTabs().find((t) => t.label === QUESTION), 30_000);
+      if (api.openTabs().join() !== conv.id) throw new Error(`onglets : ${api.openTabs().join()}`);
+      ok(`discussion ouverte dans un onglet d'éditeur (« ${tab.label} », groupe ${tab.group.viewColumn})`);
+      api.openTab(conv.id);
+      await sleep(500);
+      if (chatTabs().length !== 1) throw new Error('onglet dupliqué');
+
+      await vscode.commands.executeCommand('promptShare.reviewQuestion', questionId, false);
+      await until('plus de décision en attente', () => api.pendingDecisions() === 0 || undefined, 10_000);
+      ok('question refusée : la décision disparaît de la pastille');
+      flag('refused.txt');
+
+      await until("onglet de l'invité", () => flagged('guest-tab.txt'));
+      const after = api.hostedSession()?.participants ?? [];
+      if (after.length !== 2) throw new Error(`participants après l'ouverture des onglets : ${after.join(', ')}`);
+      ok(`vue et onglets d'un même participant : toujours ${after.length} participants (${after.join(', ')})`);
       fs.writeFileSync(doneFile, 'ok');
     } else {
       const link = await until("lien d'invitation de l'hôte", () => (fs.existsSync(linkFile) ? fs.readFileSync(linkFile, 'utf8') : undefined));
       await api.join(link, GUEST_NAME);
       if (api.viewState().mode !== 'guest') throw new Error(`vue en mode ${api.viewState().mode}`);
       ok('lien collé, vue en mode invité');
+      const conv = await until('discussions de la session', () => api.conversations()[0], 30_000);
+      await until('question envoyée', () => api.sendToSession({ type: 'ask', conversationId: conv.id, text: QUESTION }) || undefined, 30_000);
+      ok("question envoyée à l'hôte");
+      await until("refus de l'hôte", () => flagged('refused.txt'));
+      api.openTab(conv.id);
+      const tab = await until("onglet de l'invité titré", () => chatTabs().find((t) => t.label === QUESTION), 30_000);
+      ok(`invité : discussion ouverte dans un onglet d'éditeur (« ${tab.label} »)`);
+      await sleep(1500); // Laisse l'onglet se connecter avant la vérification de l'hôte.
+      flag('guest-tab.txt');
       await until("confirmation de l'hôte", () => fs.existsSync(doneFile) || undefined);
       ok("l'hôte voit ce participant : session rejointe depuis VS Code, sans navigateur");
     }
     log.push('RESULT: PASS');
   } catch (err) {
     const api = vscode.extensions.getExtension('neo-schobert.prompt-share')?.exports as PromptShareApi | undefined;
-    log.push(`✗ [${ROLE}] ${(err as Error).message}`, `  · évènements de la vue : ${api?.viewEvents().join(' | ') || 'aucun'}`, 'RESULT: FAIL');
+    log.push(`✗ [${ROLE}] ${(err as Error).message}`, `  · évènements de la vue : ${api?.viewEvents().join(' | ') || 'aucun'}`,
+      `  · journal : ${api?.logs().slice(-12).join(' | ') || 'vide'}`, 'RESULT: FAIL');
   }
   fs.writeFileSync(OUT, log.join('\n'));
 }

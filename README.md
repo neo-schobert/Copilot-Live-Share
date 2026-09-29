@@ -75,6 +75,22 @@ La première question déclenche en général une demande de **consentement** de
 
 L'icône de sortie en haut du chat quitte la session.
 
+### Plusieurs discussions côte à côte
+
+Dans VS Code, le bouton **Ouvrir dans un onglet** (en haut du chat) ouvre la discussion affichée dans un **onglet d'éditeur**, comme les onglets du Chat de VS Code. Ces onglets se glissent, se divisent (côte à côte ou l'un sous l'autre), et se détachent dans une nouvelle fenêtre. Chaque onglet suit une seule discussion, en temps réel, et prend son titre. On peut aussi ouvrir une discussion avec **Prompt Share: Open Conversation in Editor Tab** (palette, ou icône dans la barre de titre de la vue).
+
+Vue et onglets comptent pour un seul participant. Les onglets se ferment quand on quitte la session ou quand la discussion est supprimée.
+
+### Notifications
+
+Pendant une session, hébergée ou rejointe depuis VS Code, une notification apparaît quand une décision vous attend, avec ses boutons :
+
+- **hôte** : question d'un invité à accepter (**Envoyer au modèle** / **Refuser**), action de l'agent à valider (**Autoriser**, **Voir les modifications**…) ;
+- **invité** : action de l'agent à valider pour votre propre demande ;
+- **tout le monde** : question de l'agent (réponses proposées, **Répondre…**).
+
+**Ouvrir** affiche la discussion dans un onglet. Une décision prise ailleurs (chat, autre participant) fait disparaître la demande. Le nombre de décisions en attente reste visible en **pastille** sur l'icône Prompt Share et dans la **barre d'état**, même si la notification a été fermée. Le réglage `promptShare.notifications` passe à `all` pour être prévenu aussi de chaque nouvelle question et de chaque réponse à vos questions, ou à `off`.
+
 ### Commandes
 
 | Commande | Effet |
@@ -82,6 +98,7 @@ L'icône de sortie en haut du chat quitte la session.
 | **Prompt Share: Host a Session** | Démarre une session et ouvre le chat. |
 | **Prompt Share: Join a Session** | Demande un lien d'invitation et rejoint la session. |
 | **Prompt Share: Open Chat** | Ouvre la vue du chat. |
+| **Prompt Share: Open Conversation in Editor Tab** | Ouvre une discussion dans un onglet d'éditeur (déplaçable, divisible). |
 | **Prompt Share: Leave Session** | Quitte la session rejointe, ou arrête la session hébergée. |
 | **Prompt Share: Copy Invite Link** | Copie le lien d'invitation (même chose que le bouton **Inviter** du chat). |
 | **Prompt Share: Share Selection** | Envoie la sélection (ou le fichier entier) comme « contexte partagé », dans la discussion ouverte dans le chat de l'hôte. Aussi dans le menu contextuel de l'éditeur. |
@@ -197,6 +214,7 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 | `promptShare.wslSandbox` | `true` | Sous Windows, isole les commandes dans WSL avec bubblewrap si disponibles. |
 | `promptShare.wslDistro` | `""` | Distribution WSL du bac à sable (vide : distribution par défaut). |
 | `promptShare.nativeChat` | `true` | Affiche les discussions dans le panneau Chat natif (API expérimentale, voir plus haut). |
+| `promptShare.notifications` | `decisions` | Notifications de VS Code : `decisions` (quand une décision vous attend), `all` (aussi les nouvelles questions et les réponses à vos questions), `off`. |
 | `promptShare.reviewGuestQuestions` | `true` | Les questions des invités attendent l'accord de l'hôte avant d'être envoyées au modèle. |
 | `promptShare.guestQuestionsPerHour` | `60` | Nombre maximal de questions d'invités envoyées au modèle par heure, pour toute la session (`0` : pas de limite). |
 | `promptShare.allowGuestModelChoice` | `false` | Autorise les invités à choisir un autre modèle que celui par défaut, y compris des modèles premium décomptés du quota de l'hôte. L'hôte peut toujours choisir. |

@@ -21,8 +21,9 @@ fs.writeFileSync(path.join(ws, '.env'), 'API_KEY=SECRET123\n');
 fs.writeFileSync(path.join(ws, '.git', 'config'), '[remote]\nurl=https://token@github.com/x\n');
 fs.writeFileSync(path.join(tmp, 'outside.txt'), 'hors du projet\n');
 // Sous Windows, « Start Session » demanderait de rouvrir le projet dans WSL (fenêtre modale).
+// Port dédié : le port par défaut peut être pris par une vraie session ouverte sur la machine.
 fs.mkdirSync(path.join(ws, '.vscode'));
-fs.writeFileSync(path.join(ws, '.vscode', 'settings.json'), '{ "promptShare.wslMode": "off" }\n');
+fs.writeFileSync(path.join(ws, '.vscode', 'settings.json'), '{ "promptShare.wslMode": "off", "promptShare.port": 37171 }\n');
 // Liens symboliques : sous Windows, leur création peut exiger des droits (mode développeur) ; le test s'adapte.
 const systemDir = process.platform === 'win32' ? process.env.SystemRoot ?? 'C:\\Windows' : '/etc';
 for (const [target, name] of [

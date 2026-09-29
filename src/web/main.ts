@@ -64,13 +64,16 @@ const homeLink = $<HTMLInputElement>('home-link');
 const homeStatus = $<HTMLElement>('home-status');
 const leaveBtn = $<HTMLButtonElement>('leave');
 const policyNote = $<HTMLElement>('policy-note');
+const openTabBtn = $<HTMLButtonElement>('open-tab');
 const inviteWarn = Object.assign(document.createElement('p'), { className: 'hint warn' });
 
 // ---- État ----
 
 const params = new URLSearchParams(location.search);
 const token = params.get('token') ?? '';
-const clientId = loadClientId();
+let clientId = loadClientId();
+/** Dans un onglet d'éditeur de VS Code : la seule discussion affichée. */
+let panelConversation: string | undefined;
 
 let myName = '';
 let me: Participant | undefined;
@@ -153,6 +156,10 @@ interface ExtensionState {
   status?: string;
   error?: boolean;
   busy?: boolean;
+  /** Identifiant partagé par la vue et les onglets de cette fenêtre : un seul participant. */
+  clientId?: string;
+  /** Onglet d'éditeur consacré à une discussion. */
+  panel?: { conversationId: string };
 }
 
 function onExtensionMessage(data: unknown): void {
@@ -166,6 +173,13 @@ function onExtensionMessage(data: unknown): void {
   homeStatus.classList.toggle('error', !!msg.error);
   homeHost.disabled = !!msg.busy;
   homeJoinForm.querySelector('button')!.disabled = !!msg.busy;
+  if (msg.clientId && /^[A-Za-z0-9_-]{8,64}$/.test(msg.clientId)) {
+    clientId = msg.clientId;
+  }
+  if (msg.panel) {
+    panelConversation = msg.panel.conversationId;
+    document.documentElement.classList.add('single-conv');
+  }
   if (msg.mode === 'idle') {
     return;
   }
@@ -178,7 +192,8 @@ function onExtensionMessage(data: unknown): void {
   myName = msg.name;
   homeScreen.hidden = true;
   app.hidden = false;
-  leaveBtn.hidden = false;
+  leaveBtn.hidden = !!panelConversation;
+  openTabBtn.hidden = !!panelConversation;
   connect();
   askInput.focus();
 }
@@ -193,6 +208,18 @@ homeJoinForm.addEventListener('submit', (e) => {
 });
 
 leaveBtn.addEventListener('click', () => vscodeApi?.postMessage({ type: 'scc-leave' }));
+
+openTabBtn.addEventListener('click', () => {
+  const conv = conversations.find((c) => c.id === activeId);
+  if (conv) {
+    vscodeApi?.postMessage({ type: 'scc-open-tab', conversationId: conv.id, title: conv.title });
+  }
+});
+
+/** Onglet d'éditeur : demande à l'extension de le fermer (discussion supprimée, session terminée). */
+function closePanel(): void {
+  vscodeApi?.postMessage({ type: 'scc-close-panel' });
+}
 
 // ---- WebSocket ----
 
@@ -274,8 +301,8 @@ function endSession(reason: string): void {
     const back = document.createElement('button');
     back.className = 'secondary';
     back.type = 'button';
-    back.textContent = 'Retour à l’accueil';
-    back.addEventListener('click', () => vscodeApi?.postMessage({ type: 'scc-leave', ended: true }));
+    back.textContent = panelConversation ? 'Fermer l’onglet' : 'Retour à l’accueil';
+    back.addEventListener('click', () => (panelConversation ? closePanel() : vscodeApi?.postMessage({ type: 'scc-leave', ended: true })));
     bannerEl.append(back);
     leaveBtn.hidden = true;
   }
@@ -306,9 +333,17 @@ function handle(msg: ServerMessage): void {
       queue = msg.queue;
       models = msg.models;
       policy = msg.policy;
-      const remembered = activeId ?? storage('session', 'scc.conv');
-      const known = conversations.some((c) => c.id === remembered);
-      openConversation(known ? remembered! : lastConversationId(), true);
+      if (panelConversation) {
+        if (!conversations.some((c) => c.id === panelConversation)) {
+          closePanel();
+          break;
+        }
+        openConversation(panelConversation, true);
+      } else {
+        const remembered = activeId ?? storage('session', 'scc.conv');
+        const known = conversations.some((c) => c.id === remembered);
+        openConversation(known ? remembered! : lastConversationId(), true);
+      }
       renderParticipants();
       renderModels();
       updateActivity();
@@ -324,7 +359,7 @@ function handle(msg: ServerMessage): void {
         conversations.push(msg.conversation);
       }
       // Discussion que je viens de créer, ou remplaçante de la dernière supprimée : on l'ouvre.
-      if (index < 0 && (msg.conversation.createdByClientId === clientId || activeId === null)) {
+      if (index < 0 && !panelConversation && (msg.conversation.createdByClientId === clientId || activeId === null)) {
         openConversation(msg.conversation.id);
       } else {
         renderConversations();
@@ -340,6 +375,10 @@ function handle(msg: ServerMessage): void {
         if (e.conversationId === msg.conversationId) {
           entries.delete(id);
         }
+      }
+      if (panelConversation === msg.conversationId) {
+        closePanel();
+        break;
       }
       if (activeId === msg.conversationId) {
         toast('Cette discussion a été supprimée par l’hôte.');
@@ -501,7 +540,7 @@ function openConversation(id: string, force = false): void {
 
 /** Participants (autres que moi) actuellement dans une discussion. */
 function presentIn(conversationId: string): Participant[] {
-  return participants.filter((p) => p.viewing === conversationId && p.clientId !== me?.clientId);
+  return participants.filter((p) => (p.viewingAll ?? [p.viewing]).includes(conversationId) && p.clientId !== me?.clientId);
 }
 
 function typingIn(conversationId: string): string[] {
@@ -582,6 +621,9 @@ function renderTitle(): void {
   convTitle.textContent = conv?.title ?? '';
   convTitle.title = conv ? `Créée par ${conv.createdBy} à ${formatTime(conv.createdAt)}` : '';
   document.title = conv ? `${conv.title} — Prompt Share` : 'Prompt Share';
+  if (panelConversation && conv) {
+    vscodeApi?.postMessage({ type: 'scc-title', title: conv.title });
+  }
 }
 
 function renderConversations(): void {

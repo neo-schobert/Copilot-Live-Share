@@ -10,6 +10,11 @@ export interface Participant {
   isHost: boolean;
   /** Discussion actuellement affichée par ce participant. */
   viewing: string | null;
+  /**
+   * Toutes les discussions affichées, quand le participant en a ouvert plusieurs
+   * (vue et onglets d'éditeur de VS Code, qui partagent son identifiant).
+   */
+  viewingAll?: string[];
 }
 
 /** Une discussion : un fil de messages avec son propre historique envoyé au modèle. */

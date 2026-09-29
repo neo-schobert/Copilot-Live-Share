@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- Discussions dans des onglets d'éditeur : à glisser, diviser ou détacher, comme le Chat de VS Code. Vue et onglets comptent pour un seul participant.
+- Notifications quand une décision vous attend (question d'invité à accepter, action à valider, question de l'agent), avec boutons ; pastille sur la vue et compteur dans la barre d'état. Réglage `promptShare.notifications`.
+- Invités dans VS Code : notifications pour les actions à valider et les questions de l'agent.
+- Limite par défaut portée à 60 questions d'invités par heure.
+
 ## 0.1.0
 
 - Vue « Prompt Share » dans la barre d'activité : héberger une session ou en rejoindre une depuis VS Code, sans navigateur.

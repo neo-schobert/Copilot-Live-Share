@@ -744,6 +744,10 @@ button.person-where { color: var(--link); }
   .mode-label { display: none; }
 }
 
+/* Onglet d'éditeur consacré à une seule discussion : pas de liste des discussions. */
+.single-conv .app { grid-template-columns: minmax(0, 1fr); }
+.single-conv .sidebar, .single-conv .drawer-toggle, .single-conv #rename { display: none !important; }
+
 @media (prefers-reduced-motion: reduce) {
   .typing span, .codicon-modifier-spin { animation: none !important; }
 }

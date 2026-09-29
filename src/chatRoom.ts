@@ -309,10 +309,19 @@ export class ChatRoom implements ConnectionHandler {
   // ---- API utilisée par l'extension ----
 
   get participantList(): Participant[] {
+    // Plusieurs connexions pour un même participant (vue et onglets de VS Code) : une seule entrée.
     const byId = new Map<string, Participant>();
     for (const c of this.clients.values()) {
-      if (c.joined) {
+      if (!c.joined) {
+        continue;
+      }
+      const known = byId.get(c.clientId);
+      if (!known) {
         byId.set(c.clientId, { clientId: c.clientId, name: c.name, isHost: c.isHost, viewing: c.viewing });
+      } else if (c.viewing) {
+        const all = new Set([...(known.viewingAll ?? (known.viewing ? [known.viewing] : [])), c.viewing]);
+        known.viewing ??= c.viewing;
+        known.viewingAll = [...all];
       }
     }
     return [...byId.values()];
@@ -449,6 +458,11 @@ export class ChatRoom implements ConnectionHandler {
   /** Discussion d'une entrée, si elle existe encore. */
   conversationOfEntry(entryId: string): string | undefined {
     return this.entries.find((e) => e.id === entryId)?.conversationId;
+  }
+
+  /** Questions d'invités en attente de l'accord de l'hôte. */
+  get awaitingReviewIds(): string[] {
+    return this.awaitingReview.map((q) => q.entryId);
   }
 
   /** Question d'invité en attente de l'accord de l'hôte (pour l'extension). */

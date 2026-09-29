@@ -2,7 +2,7 @@
   "name": "prompt-share",
   "displayName": "Prompt Share",
   "description": "Chat IA à plusieurs dans VS Code, avec les modèles GitHub Copilot de l'hôte : héberger ou rejoindre une session, agent confiné au projet, l'hôte garde la main. Projet indépendant, non affilié à GitHub ni à Microsoft.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "neo-schobert",
   "license": "MIT",
   "engines": {
@@ -36,6 +36,12 @@
         "title": "Leave Session",
         "category": "Prompt Share",
         "icon": "$(sign-out)"
+      },
+      {
+        "command": "promptShare.openConversationTab",
+        "title": "Open Conversation in Editor Tab",
+        "category": "Prompt Share",
+        "icon": "$(multiple-windows)"
       },
       {
         "command": "promptShare.startSession",
@@ -134,6 +140,10 @@
         {
           "command": "promptShare.leave",
           "when": "promptShare.connected"
+        },
+        {
+          "command": "promptShare.openConversationTab",
+          "when": "promptShare.connected"
         }
       ],
       "editor/context": [
@@ -144,6 +154,11 @@
         }
       ],
       "view/title": [
+        {
+          "command": "promptShare.openConversationTab",
+          "when": "view == promptShare.view && promptShare.connected",
+          "group": "navigation"
+        },
         {
           "command": "promptShare.leave",
           "when": "view == promptShare.view && promptShare.connected",
@@ -165,6 +180,17 @@
           "type": "string",
           "default": "",
           "description": "Famille du modèle Copilot utilisé par défaut (ex. « gpt-4o », « claude-sonnet-4 »). Vide : premier modèle Copilot disponible. Modifiable avec « Prompt Share: Select Default Model »."
+        },
+        "promptShare.notifications": {
+          "type": "string",
+          "enum": ["decisions", "all", "off"],
+          "enumDescriptions": [
+            "Quand une décision vous attend : question d'invité à accepter (hôte), action de l'agent à valider, question de l'agent.",
+            "Comme « decisions », plus chaque nouvelle question des autres participants et chaque réponse à vos questions.",
+            "Aucune notification (la pastille de la vue et la barre d'état signalent toujours les décisions en attente)."
+          ],
+          "default": "decisions",
+          "description": "Notifications de VS Code pendant une session, hébergée ou rejointe depuis VS Code."
         },
         "promptShare.reviewGuestQuestions": {
           "type": "boolean",
