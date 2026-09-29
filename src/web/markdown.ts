@@ -5,6 +5,16 @@
  * listes, citations, séparateurs, paragraphes, code inline, gras, italique, liens.
  */
 
+import { Lang } from '../i18n/core';
+import { webT } from '../i18n/web';
+
+/** Langue des libellés (bouton « copier ») : mise à jour par main.ts. */
+let lang: Lang = 'en';
+
+export function setMarkdownLang(value: Lang): void {
+  lang = value;
+}
+
 export function renderMarkdown(src: string): DocumentFragment {
   const frag = document.createDocumentFragment();
   const lines = src.replace(/\r\n?/g, '\n').split('\n');
@@ -50,8 +60,12 @@ export function codeBlock(code: string, language: string, title?: string): HTMLE
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'copy';
-  btn.title = 'Copier';
-  btn.innerHTML = '<i class="codicon codicon-copy"></i><span>Copier</span>';
+  btn.title = webT(lang, 'code.copy');
+  const copyIcon = document.createElement('i');
+  copyIcon.className = 'codicon codicon-copy';
+  const copyLabel = document.createElement('span');
+  copyLabel.textContent = btn.title;
+  btn.append(copyIcon, copyLabel);
   bar.append(label, btn);
   const pre = document.createElement('pre');
   const codeEl = document.createElement('code');

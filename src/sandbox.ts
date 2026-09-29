@@ -2,6 +2,8 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type { Lang } from './i18n/core';
+import { I18nError, roomT } from './i18n/room';
 
 /**
  * Bac à sable des commandes de l'agent, basé sur bubblewrap :
@@ -181,7 +183,7 @@ export interface WslInfo {
   distro: string;
   /** Racine de montage des lecteurs Windows, « /mnt/ » par défaut. */
   mountRoot: string;
-  /** Explication lisible pour l'hôte. */
+  /** Explication lisible pour l'hôte, dans la langue demandée à `inspectWsl` / `parseWslProbe`. */
   detail: string;
   runtime?: SandboxRuntime;
 }
@@ -198,8 +200,11 @@ function distroArgs(distro: string): string[] {
   return distro ? ['-d', distro] : [];
 }
 
-/** Examine WSL : présence, distribution, bubblewrap (WSL 2 requis) et environnement du bac à sable. */
-export async function inspectWsl(distro: string, extraReadOnly: string[] = [], launcher = wslLauncher()): Promise<WslInfo> {
+/**
+ * Examine WSL : présence, distribution, bubblewrap (WSL 2 requis) et environnement du bac à sable.
+ * `lang` : langue de `detail` (anglais par défaut).
+ */
+export async function inspectWsl(distro: string, extraReadOnly: string[] = [], launcher = wslLauncher(), lang: Lang = 'en'): Promise<WslInfo> {
   let out: string;
   try {
     out = await run(launcher, [...distroArgs(distro), '-e', 'sh', '-lc', WSL_PROBE], WSL_ENV(), 60_000);
@@ -208,14 +213,14 @@ export async function inspectWsl(distro: string, extraReadOnly: string[] = [], l
       status: 'absent',
       distro: '',
       mountRoot: '/mnt/',
-      detail: `WSL n'est pas installé ou aucune distribution n'est disponible (${(err as Error).message}). Pour isoler les commandes : « wsl --install » dans un terminal Windows.`,
+      detail: roomT(lang, 'wsl.absent', { error: (err as Error).message }),
     };
   }
-  return parseWslProbe(out, launcher, distro, extraReadOnly);
+  return parseWslProbe(out, launcher, distro, extraReadOnly, lang);
 }
 
-/** Analyse la sortie de la sonde WSL (fonction pure, testée sans Windows). */
-export function parseWslProbe(out: string, launcher: string, requestedDistro: string, extraReadOnly: string[] = []): WslInfo {
+/** Analyse la sortie de la sonde WSL (fonction pure, testée sans Windows). `lang` : langue de `detail`. */
+export function parseWslProbe(out: string, launcher: string, requestedDistro: string, extraReadOnly: string[] = [], lang: Lang = 'en'): WslInfo {
   const lines = out.split(/\r?\n/);
   const value = (tag: string) => lines.find((l) => l.startsWith(`${tag} `))?.slice(tag.length + 1).trim() ?? '';
   const distro = value('DISTRO') || requestedDistro;
@@ -223,16 +228,16 @@ export function parseWslProbe(out: string, launcher: string, requestedDistro: st
   // « /mnt/c/ » -> racine de montage « /mnt/ » (configurable dans wsl.conf).
   const mountRoot = value('MOUNT').replace(/c\/?$/i, '') || '/mnt/';
   const base = { distro, mountRoot };
-  const name = distro ? `« ${distro} »` : 'WSL';
+  const name = distro ? roomT(lang, 'wsl.distroName', { distro }) : 'WSL';
 
   if (lines.includes('NOBWRAP')) {
-    return { ...base, status: 'noBubblewrap', detail: `bubblewrap n'est pas installé dans ${name}.` };
+    return { ...base, status: 'noBubblewrap', detail: roomT(lang, 'wsl.noBubblewrap', { name }) };
   }
   if (lines.includes('BWRAPFAIL') || !value('BWRAP')) {
     return {
       ...base,
       status: 'bubblewrapFails',
-      detail: `bubblewrap ne fonctionne pas dans ${name} : WSL 2 est requis (« wsl --set-version ${distro || '<distribution>'} 2 »).`,
+      detail: roomT(lang, 'wsl.bubblewrapFails', { name, distro: distro || roomT(lang, 'wsl.distroPlaceholder') }),
     };
   }
 
@@ -255,7 +260,7 @@ export function parseWslProbe(out: string, launcher: string, requestedDistro: st
   return {
     ...base,
     status: 'ready',
-    detail: `bubblewrap disponible dans ${name}.`,
+    detail: roomT(lang, 'wsl.ready', { name }),
     runtime: {
       kind: 'wsl',
       description: `Linux (WSL${distro ? ` : ${distro}` : ''})`,
@@ -326,7 +331,7 @@ export function sandboxCommand(rt: SandboxRuntime, target: SandboxTarget, comman
   const map = (p: string) => {
     const mapped = rt.toSandbox(p);
     if (!mapped) {
-      throw new Error(`Chemin inaccessible depuis le bac à sable : ${p}`);
+      throw new I18nError('sandbox.error.unreachable', { path: p });
     }
     return mapped;
   };

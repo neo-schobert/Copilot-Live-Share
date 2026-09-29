@@ -5,6 +5,8 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { TunnelProviderId } from './protocol';
+import type { ExtensionKey } from './i18n/extension';
+import { t } from './i18n/vscode';
 
 /**
  * Tunnel public vers le serveur local de la session, pour inviter des personnes
@@ -26,9 +28,9 @@ export interface Tunnel {
   stop(): void;
 }
 
-const PROVIDERS: Record<TunnelProvider, { label: string; command: string; source: string }> = {
-  cloudflare: { label: 'Cloudflare (cloudflared)', command: 'cloudflared', source: 'github.com/cloudflare/cloudflared (dépôt officiel de Cloudflare)' },
-  ngrok: { label: 'ngrok', command: 'ngrok', source: 'bin.equinox.io (distribution officielle de ngrok)' },
+const PROVIDERS: Record<TunnelProvider, { label: string; command: string; source: ExtensionKey }> = {
+  cloudflare: { label: 'Cloudflare (cloudflared)', command: 'cloudflared', source: 'tunnel.source.cloudflare' },
+  ngrok: { label: 'ngrok', command: 'ngrok', source: 'tunnel.source.ngrok' },
 };
 
 const START_TIMEOUT_MS = 45_000;
@@ -59,7 +61,7 @@ export class TunnelManager {
     }
     const start = () =>
       vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `Prompt Share : ouverture du tunnel ${PROVIDERS[provider].label}…` },
+        { location: vscode.ProgressLocation.Notification, title: t('tunnel.progress.opening', { provider: PROVIDERS[provider].label }) },
         () => this.start(provider, exe, port, onExit),
       );
     try {
@@ -87,21 +89,20 @@ export class TunnelManager {
     const asset = downloadAsset(provider);
     if (!asset) {
       void vscode.window.showErrorMessage(
-        `Prompt Share : ${label} n'est pas disponible pour ${process.platform}/${process.arch}. Installez-le vous-même, puis réessayez.`,
+        t('tunnel.unavailable', { tool: label, platform: `${process.platform}/${process.arch}` }),
       );
       return undefined;
     }
-    const download = 'Télécharger';
+    const download = t('tunnel.download.button');
     const choice = await vscode.window.showInformationMessage(
-      `Prompt Share : ${label} est nécessaire pour ouvrir le tunnel. Le télécharger ?`,
+      t('tunnel.download.message', { tool: label }),
       {
         modal: true,
-        detail:
-          `Source : ${source}.\n${asset.url}\n\n` +
-          `Il sera placé dans le dossier de l'extension (${path.dirname(local)}), sans installation système. ` +
-          (provider === 'cloudflare'
-            ? 'Utiliser cloudflared vaut acceptation de la licence et des conditions de Cloudflare. Aucun compte n’est nécessaire.'
-            : 'ngrok demande ensuite un compte gratuit (jeton d’authentification).'),
+        detail: t(provider === 'cloudflare' ? 'tunnel.download.detail.cloudflare' : 'tunnel.download.detail.ngrok', {
+          source: t(source),
+          url: asset.url,
+          folder: path.dirname(local),
+        }),
       },
       download,
     );
@@ -109,11 +110,11 @@ export class TunnelManager {
       return undefined;
     }
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Prompt Share : téléchargement de ${label}…` },
+      { location: vscode.ProgressLocation.Notification, title: t('tunnel.progress.downloading', { tool: label }) },
       () => this.download(asset, local),
     );
     if (!(await runs(local, provider === 'ngrok' ? ['version'] : ['--version']))) {
-      throw new Error(`${label} téléchargé mais impossible à lancer (${local}).`);
+      throw new Error(t('tunnel.error.cannotRun', { tool: label, path: local }));
     }
     this.log(`Tunnel : ${label} téléchargé dans ${local}.`);
     return local;
@@ -153,13 +154,13 @@ export class TunnelManager {
 
   private async askNgrokToken(exe: string, rejected: boolean): Promise<boolean> {
     const dashboard = 'https://dashboard.ngrok.com/get-started/your-authtoken';
-    const open = 'Ouvrir la page du jeton';
-    const paste = 'J’ai mon jeton';
+    const open = t('ngrok.token.openPage');
+    const paste = t('ngrok.token.havePaste');
     const choice = await vscode.window.showInformationMessage(
-      rejected ? 'Prompt Share : ngrok a refusé le jeton d’authentification.' : 'Prompt Share : ngrok demande un compte gratuit.',
+      t(rejected ? 'ngrok.token.rejected' : 'ngrok.token.required'),
       {
         modal: true,
-        detail: 'Créez un compte (gratuit) ou connectez-vous sur ngrok.com, copiez votre « authtoken », puis collez-le ici. Il est enregistré dans la configuration de ngrok, pas par Prompt Share.',
+        detail: t('ngrok.token.detail'),
       },
       open,
       paste,
@@ -171,11 +172,11 @@ export class TunnelManager {
       await vscode.env.openExternal(vscode.Uri.parse(dashboard));
     }
     const token = await vscode.window.showInputBox({
-      title: 'Jeton d’authentification ngrok',
-      prompt: `Collez l'authtoken affiché sur ${dashboard}`,
+      title: t('ngrok.token.title'),
+      prompt: t('ngrok.token.prompt', { url: dashboard }),
       password: true,
       ignoreFocusOut: true,
-      validateInput: (v) => (/^[A-Za-z0-9_-]{20,}$/.test(v.trim()) ? undefined : 'Jeton invalide.'),
+      validateInput: (v) => (/^[A-Za-z0-9_-]{20,}$/.test(v.trim()) ? undefined : t('ngrok.token.invalid')),
     });
     if (!token) {
       return false;
@@ -200,14 +201,23 @@ export class TunnelManager {
       let url: string | undefined;
       let ready = false;
       let lastError = '';
-      const timer = setTimeout(() => fail(`le tunnel n'a pas démarré en ${START_TIMEOUT_MS / 1000} s${lastError ? ` (${lastError})` : ''}`), START_TIMEOUT_MS);
-      const fail = (reason: string) => {
+      const timer = setTimeout(
+        () =>
+          fail(
+            lastError
+              ? t('tunnel.error.timeoutDetail', { seconds: START_TIMEOUT_MS / 1000, error: lastError })
+              : t('tunnel.error.timeout', { seconds: START_TIMEOUT_MS / 1000 }),
+            true,
+          ),
+        START_TIMEOUT_MS,
+      );
+      const fail = (reason: string, timedOut = false) => {
         if (!ready) {
           ready = true;
           clearTimeout(timer);
           child.kill();
           // Cloudflare : le réseau bloque le port 7844 ou le protocole du tunnel (pare-feu d'entreprise…).
-          const unreachable = provider === 'cloudflare' && /edge|7844|i\/o timeout|dial|n'a pas démarré/i.test(reason);
+          const unreachable = provider === 'cloudflare' && (timedOut || /edge|7844|i\/o timeout|dial/i.test(reason));
           reject(unreachable ? new TunnelUnreachableError(reason) : new Error(reason));
         }
       };
@@ -257,7 +267,7 @@ export class TunnelManager {
       }
       child.on('error', (err) => fail(err.message));
       child.on('exit', (code) => {
-        const reason = lastError || `processus terminé (code ${code})`;
+        const reason = lastError || t('tunnel.error.exited', { code: String(code) });
         this.log(`Tunnel ${provider} arrêté : ${reason}`);
         if (ready) {
           onExit(reason);
@@ -327,7 +337,7 @@ function fetchToFile(url: string, target: string, redirects = 5): Promise<void> 
         res.resume();
         const next = new URL(res.headers.location, url);
         if (next.protocol !== 'https:') {
-          reject(new Error('redirection non sécurisée refusée'));
+          reject(new Error(t('download.error.insecureRedirect')));
           return;
         }
         fetchToFile(next.toString(), target, redirects - 1).then(resolve, reject);
@@ -335,7 +345,7 @@ function fetchToFile(url: string, target: string, redirects = 5): Promise<void> 
       }
       if (status !== 200) {
         res.resume();
-        reject(new Error(`téléchargement impossible (HTTP ${status})`));
+        reject(new Error(t('download.error.http', { status })));
         return;
       }
       const file = fs.createWriteStream(target, { mode: 0o755 });
@@ -345,7 +355,7 @@ function fetchToFile(url: string, target: string, redirects = 5): Promise<void> 
       res.on('error', reject);
     });
     req.on('error', reject);
-    req.setTimeout(120_000, () => req.destroy(new Error('délai de téléchargement dépassé')));
+    req.setTimeout(120_000, () => req.destroy(new Error(t('download.error.timeout'))));
   });
 }
 

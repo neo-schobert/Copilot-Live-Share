@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6
+
+- Interface en français, anglais et allemand : chat, notifications, fenêtres, barre d'état, commandes et réglages. Langue de VS Code ou du navigateur par défaut, sélecteur dans le chat et réglage `promptShare.language`.
+- Chaque participant reçoit les messages du serveur (refus, messages système, actions de l'agent) dans sa propre langue.
+- Les consignes envoyées au modèle sont en anglais ; il répond toujours dans la langue de l'auteur de la question.
+
 ## 0.1.5
 
 - Jauge du contexte de chaque discussion (tokens envoyés au modèle / maximum du modèle), avec le détail au clic.

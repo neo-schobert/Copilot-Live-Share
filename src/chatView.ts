@@ -2,6 +2,9 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { WebSocket } from 'ws';
+import type { Lang, LangPreference } from './i18n/core';
+import { conversationTitle } from './i18n/extension';
+import { t, uiLang } from './i18n/vscode';
 
 /**
  * Le chat dans VS Code, sous forme de vue (barre latérale « Prompt Share ») :
@@ -21,6 +24,9 @@ export interface ViewState {
   status?: string;
   error?: boolean;
   busy?: boolean;
+  /** Langue de l'interface, et préférence de l'utilisateur (sélecteur de langue). */
+  lang: Lang;
+  langPreference: LangPreference;
 }
 
 export interface ConnectionTarget {
@@ -38,6 +44,8 @@ export interface ChatController {
   leave(ended: boolean): Promise<void>;
   /** Ouvre une application partagée par l'hôte (relayée chez un invité). */
   openApp(port: number): Promise<void>;
+  /** Langue choisie depuis la page (réglage promptShare.language). */
+  setLanguage(preference: LangPreference): Promise<void>;
 }
 
 /** Code de fermeture relayé à la page quand la connexion est refusée (lien invalide, session arrêtée). */
@@ -54,7 +62,8 @@ type PageMessage =
   | { type: 'scc-open-tab'; conversationId: string; title?: string }
   | { type: 'scc-title'; title: string }
   | { type: 'scc-close-panel' }
-  | { type: 'scc-open-app'; port: number };
+  | { type: 'scc-open-app'; port: number }
+  | { type: 'scc-set-lang'; preference: LangPreference };
 
 /**
  * Une page de chat dans VS Code (la vue latérale, ou un onglet d'éditeur consacré à une
@@ -131,7 +140,7 @@ class ChatSurface {
     const post = (message: object) => void this.webview.postMessage({ ...message, id });
     const target = this.owner.controller.connectionTarget();
     if (!target) {
-      post({ type: 'scc-close', code: CLOSE_REFUSED, reason: 'Aucune session à rejoindre.' });
+      post({ type: 'scc-close', code: CLOSE_REFUSED, reason: t('view.noSession') });
       return;
     }
     let lastError = '';
@@ -161,8 +170,8 @@ class ChatSurface {
       finish(
         CLOSE_REFUSED,
         res.statusCode === 401
-          ? 'Accès refusé : lien d’invitation invalide ou session terminée.'
-          : `Impossible de rejoindre la session (réponse HTTP ${res.statusCode}) : vérifiez le lien et que l’hôte a bien ouvert son tunnel.`,
+          ? t('view.accessDenied')
+          : t('view.joinFailedHttp', { status: String(res.statusCode) }),
       );
     });
     ws.on('error', (err) => {
@@ -220,7 +229,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * Ouvre une discussion dans un onglet d'éditeur, qu'on peut déplacer, diviser ou détacher
    * comme les onglets du Chat de VS Code. Déjà ouverte : l'onglet passe au premier plan.
    */
-  openTab(conversationId: string, title = 'Discussion'): void {
+  openTab(conversationId: string, title?: string): void {
     const existing = this.panels.get(conversationId);
     if (existing) {
       existing.panel.reveal();
@@ -228,7 +237,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     const panel = vscode.window.createWebviewPanel(
       ChatViewProvider.panelType,
-      title,
+      conversationTitle(uiLang(), title),
       { viewColumn: vscode.ViewColumn.Active },
       { retainContextWhenHidden: true },
     );
@@ -308,11 +317,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'scc-close-panel':
         panel?.dispose();
         break;
+      case 'scc-set-lang':
+        if (['auto', 'fr', 'en', 'de'].includes(msg.preference)) {
+          void this.controller.setLanguage(msg.preference);
+        }
+        break;
       case 'scc-open-app':
         if (Number.isInteger(msg.port)) {
           void this.controller.openApp(msg.port).catch((err: Error) => {
             this.log(`Application partagée : ${err.message}`);
-            void vscode.window.showErrorMessage(`Prompt Share : impossible d'ouvrir l'application (${err.message}).`);
+            void vscode.window.showErrorMessage(t('app.openFailed', { error: err.message }));
           });
         }
         break;
@@ -345,11 +359,11 @@ export function inviteTarget(link: string): ConnectionTarget | string {
   try {
     url = new URL(link.trim());
   } catch {
-    return "Lien d'invitation invalide : collez le lien complet reçu de l'hôte (https://…/?token=…).";
+    return t('invite.invalidLink');
   }
   const token = url.searchParams.get('token');
   if (!/^https?:$/.test(url.protocol) || !token) {
-    return "Lien d'invitation invalide : il doit commencer par http(s):// et contenir « ?token=… ».";
+    return t('invite.invalidLinkFormat');
   }
   const ws = new URL(url.toString());
   ws.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';

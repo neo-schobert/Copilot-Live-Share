@@ -17,7 +17,10 @@ import {
   UserEntry,
   WS_PATH,
 } from '../protocol';
-import { codeBlock, renderMarkdown } from './markdown';
+import { codeBlock, renderMarkdown, setMarkdownLang } from './markdown';
+import { I18nText, isLang, Lang, LANG_NAMES, LANGS, LangPreference, Params, resolveLang } from '../i18n/core';
+import { RoomKey, roomT } from '../i18n/room';
+import { WebKey, webT } from '../i18n/web';
 import { openVsCode, openWebSocket, Transport, vscodeApi } from './transport';
 
 // ---- Éléments ----
@@ -134,7 +137,7 @@ const TUNNEL_LABELS: Record<TunnelProviderId, string> = { cloudflare: 'Cloudflar
 let queue: QueueState = { current: null, pending: [] };
 let models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
 /** Pourquoi le choix du modèle est impossible ('' : possible). */
-let lockReason = '';
+let lockReason: WebKey | '' = '';
 /** Modèle choisi par ce participant ; '' = modèle par défaut de la session. */
 let chosenModel = storage('local', 'scc.model') ?? '';
 /** Participants en train d'écrire : clientId -> discussion et échéance de l'indicateur. */
@@ -145,13 +148,104 @@ let lastTypingSent = 0;
 const dirty = new Set<string>();
 let frameRequested = false;
 
-const SUGGESTIONS = [
-  'Explique la structure de ce projet',
-  'Trouve les TODO et résume-les',
-  'Y a-t-il des erreurs à corriger ?',
-];
+const SUGGESTIONS: WebKey[] = ['suggestion.structure', 'suggestion.todo', 'suggestion.errors'];
+/** Libellé de l'indicateur de connexion (re-traduit au changement de langue). */
+let connectionLabel: { key: WebKey; params?: Params } = { key: 'connection.connecting' };
+/** Raison de la fin de session, affichée dans le bandeau (re-traduite au changement de langue). */
+let endReason: (() => string) | undefined;
+/** Rôle dans la session ouverte depuis VS Code (titre du bouton Quitter / Arrêter). */
+let sessionMode: 'host' | 'guest' | undefined;
+/** Dernière réponse à une demande de lien d'invitation (re-rendue au changement de langue). */
+let lastInvite: Extract<ServerMessage, { type: 'invite' }> | undefined;
 
 // ---- Démarrage ----
+
+// ---- Langue ----
+
+/** Préférence de langue : réglage de VS Code (webview) ou choix mémorisé par le navigateur. */
+let langPreference: LangPreference = ((): LangPreference => {
+  const stored = storage('local', 'scc.lang');
+  return stored && (stored === 'auto' || isLang(stored)) ? (stored as LangPreference) : 'auto';
+})();
+/** Langue automatique : celle de VS Code (webview), sinon du navigateur. */
+let autoLang: Lang = resolveLang(undefined, ...(navigator.languages ?? [navigator.language]));
+let lang: Lang = langPreference === 'auto' ? autoLang : langPreference;
+setMarkdownLang(lang);
+
+/** Texte de la page dans la langue courante. */
+function t(key: WebKey, params?: Params): string {
+  return webT(lang, key, params);
+}
+
+/** Titre affiché d'une discussion (titre vide : « Nouvelle discussion » dans la langue de la page). */
+function convTitleText(conv: Conversation): string {
+  return conv.title || tr({ key: 'conv.untitled' }, '');
+}
+
+/** Code de langue pour les dates et nombres. */
+function locale(): string {
+  return { fr: 'fr-FR', en: 'en-US', de: 'de-DE' }[lang];
+}
+
+/** Texte envoyé par le serveur à traduire ici (repli : texte brut, dans la langue de l'hôte). */
+function tr(text: I18nText | undefined, fallback: string): string {
+  return text ? roomT(lang, text.key as RoomKey, text.params) : fallback;
+}
+
+/** Textes fixes de la page : attributs data-i18n (contenu), -placeholder, -title, -aria-label. */
+function applyStaticI18n(): void {
+  document.documentElement.lang = lang;
+  for (const el of document.querySelectorAll<HTMLElement>('[data-i18n]')) {
+    el.textContent = t(el.dataset.i18n as WebKey);
+  }
+  for (const [attr, data] of [['placeholder', 'i18nPlaceholder'], ['title', 'i18nTitle'], ['aria-label', 'i18nAriaLabel']] as const) {
+    for (const el of document.querySelectorAll<HTMLElement>(`[data-${attr === 'aria-label' ? 'i18n-aria-label' : `i18n-${attr}`}]`)) {
+      el.setAttribute(attr, t(el.dataset[data] as WebKey));
+    }
+  }
+  for (const select of document.querySelectorAll<HTMLSelectElement>('select.lang-select')) {
+    select.replaceChildren(
+      new Option(t('lang.auto', { name: LANG_NAMES[autoLang] }), 'auto'),
+      ...LANGS.map((l) => new Option(LANG_NAMES[l], l)),
+    );
+    select.value = langPreference;
+  }
+}
+
+/** Change de langue : textes fixes, rendu complet, serveur (messages qui me sont adressés). */
+function setLanguage(preference: LangPreference, fromExtension = false): void {
+  const next = preference === 'auto' ? autoLang : preference;
+  const changed = preference !== langPreference || next !== lang;
+  langPreference = preference;
+  lang = next;
+  setMarkdownLang(lang);
+  if (!fromExtension) {
+    if (vscodeApi) {
+      vscodeApi.postMessage({ type: 'scc-set-lang', preference });
+    } else {
+      store('local', 'scc.lang', preference);
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  applyStaticI18n();
+  renderConnection();
+  send({ type: 'setLang', lang });
+  if (me || ended) {
+    renderAll();
+  }
+}
+
+document.addEventListener('change', (e) => {
+  const target = e.target as HTMLElement;
+  if (target instanceof HTMLSelectElement && target.classList.contains('lang-select')) {
+    setLanguage(target.value as LangPreference);
+  }
+});
+
+applyStaticI18n();
+renderConnection();
 
 nameInput.maxLength = LIMITS.maxNameLength;
 askInput.maxLength = LIMITS.maxQuestionLength;
@@ -202,6 +296,9 @@ interface ExtensionState {
   clientId?: string;
   /** Onglet d'éditeur consacré à une discussion. */
   panel?: { conversationId: string };
+  /** Langue de l'interface (réglage promptShare.language, sinon langue de VS Code). */
+  lang?: Lang;
+  langPreference?: LangPreference;
 }
 
 function onExtensionMessage(data: unknown): void {
@@ -215,6 +312,13 @@ function onExtensionMessage(data: unknown): void {
   homeStatus.classList.toggle('error', !!msg.error);
   homeHost.disabled = !!msg.busy;
   homeJoinForm.querySelector('button')!.disabled = !!msg.busy;
+  if (msg.lang) {
+    if (msg.langPreference === 'auto' || !msg.langPreference) {
+      autoLang = msg.lang;
+    }
+    setLanguage(msg.langPreference ?? 'auto', true);
+    applyStaticI18n();
+  }
   if (msg.clientId && /^[A-Za-z0-9_-]{8,64}$/.test(msg.clientId)) {
     clientId = msg.clientId;
   }
@@ -227,7 +331,8 @@ function onExtensionMessage(data: unknown): void {
   }
   // Session ouverte (hébergée ou rejointe) : on passe au chat, avec une seule connexion
   // (l'extension renvoie l'état à chaque changement ; la reconnexion a sa propre logique).
-  leaveBtn.title = msg.mode === 'host' ? 'Arrêter la session' : 'Quitter la session';
+  sessionMode = msg.mode;
+  renderLeaveTitle();
   if (homeScreen.hidden) {
     return;
   }
@@ -254,7 +359,7 @@ leaveBtn.addEventListener('click', () => vscodeApi?.postMessage({ type: 'scc-lea
 openTabBtn.addEventListener('click', () => {
   const conv = conversations.find((c) => c.id === activeId);
   if (conv) {
-    vscodeApi?.postMessage({ type: 'scc-open-tab', conversationId: conv.id, title: conv.title });
+    vscodeApi?.postMessage({ type: 'scc-open-tab', conversationId: conv.id, title: convTitleText(conv) });
   }
 });
 
@@ -269,11 +374,11 @@ function connect(): void {
   if (ended) {
     return;
   }
-  setConnection('connecting', me ? 'Reconnexion…' : 'Connexion…');
+  setConnection('connecting', me ? 'connection.reconnecting' : 'connection.connecting');
   const handlers = {
     onOpen: () => {
       reconnectDelay = 1000;
-      transport.send(JSON.stringify({ type: 'hello', name: myName, clientId }));
+      transport.send(JSON.stringify({ type: 'hello', name: myName, clientId, lang }));
     },
     onMessage: (data: string) => {
       let msg: ServerMessage;
@@ -290,16 +395,16 @@ function connect(): void {
       }
       ws = undefined;
       if (code === CLOSE_CODES.sessionEnded) {
-        endSession("L'hôte a arrêté la session.");
+        endSession(() => t('session.endedByHost'));
         return;
       }
       if (code === CLOSE_CODES.protocolError) {
-        endSession(`Connexion refusée par le serveur${reason ? ` : ${reason}` : ''}.`);
+        endSession(() => (reason ? t('session.refusedReason', { reason }) : t('session.refused')));
         return;
       }
       // Refus à la connexion (lien invalide, session arrêtée) : inutile de réessayer.
       if (code === 4401) {
-        endSession(reason || 'Accès refusé : lien invalide ou session terminée.');
+        endSession(() => reason || t('session.denied'));
         return;
       }
       scheduleReconnect();
@@ -317,7 +422,7 @@ function scheduleReconnect(): void {
   if (ended || reconnectTimer !== undefined) {
     return;
   }
-  setConnection('offline', `Déconnecté — nouvelle tentative dans ${Math.round(reconnectDelay / 1000)} s`);
+  setConnection('offline', 'connection.retry', { seconds: Math.round(reconnectDelay / 1000) });
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = undefined;
     connect();
@@ -329,7 +434,7 @@ function send(msg: object): boolean {
   return !!ws && ws.send(JSON.stringify(msg));
 }
 
-function endSession(reason: string): void {
+function endSession(reason: () => string): void {
   ended = true;
   if (reconnectTimer !== undefined) {
     clearTimeout(reconnectTimer);
@@ -337,18 +442,12 @@ function endSession(reason: string): void {
   }
   ws?.close();
   ws = undefined;
-  setConnection('offline', 'Session terminée');
-  bannerEl.textContent = `${reason} L'historique affiché n'est conservé nulle part : copiez ce dont vous avez besoin.`;
+  setConnection('offline', 'connection.ended');
+  endReason = reason;
+  renderBanner();
   if (vscodeApi) {
-    const back = document.createElement('button');
-    back.className = 'secondary';
-    back.type = 'button';
-    back.textContent = panelConversation ? 'Fermer l’onglet' : 'Retour à l’accueil';
-    back.addEventListener('click', () => (panelConversation ? closePanel() : vscodeApi?.postMessage({ type: 'scc-leave', ended: true })));
-    bannerEl.append(back);
     leaveBtn.hidden = true;
   }
-  bannerEl.hidden = false;
   queue = { current: null, pending: [] };
   participants = [];
   renderParticipants();
@@ -360,6 +459,27 @@ function endSession(reason: string): void {
   rerenderActive();
 }
 
+/** Bandeau de fin de session (raison, et retour à l'accueil dans VS Code). */
+function renderBanner(): void {
+  if (!endReason) {
+    return;
+  }
+  bannerEl.textContent = t('session.endedBanner', { reason: endReason() });
+  if (vscodeApi) {
+    const back = document.createElement('button');
+    back.className = 'secondary';
+    back.type = 'button';
+    back.textContent = panelConversation ? t('session.closeTab') : t('session.backHome');
+    back.addEventListener('click', () => (panelConversation ? closePanel() : vscodeApi?.postMessage({ type: 'scc-leave', ended: true })));
+    bannerEl.append(back);
+  }
+  bannerEl.hidden = false;
+}
+
+function renderLeaveTitle(): void {
+  leaveBtn.title = sessionMode === 'host' ? t('session.stop') : t('session.leave');
+}
+
 // ---- Messages serveur ----
 
 function handle(msg: ServerMessage): void {
@@ -367,7 +487,7 @@ function handle(msg: ServerMessage): void {
     case 'welcome': {
       me = msg.you;
       myName = msg.you.name;
-      setConnection('online', 'Connecté');
+      setConnection('online', 'connection.online');
       conversations = msg.conversations;
       entries.clear();
       for (const entry of msg.history) {
@@ -428,7 +548,7 @@ function handle(msg: ServerMessage): void {
         break;
       }
       if (activeId === msg.conversationId) {
-        toast('Cette discussion a été supprimée par l’hôte.');
+        toast(t('toast.convDeleted'));
         activeId = null;
         if (conversations.length) {
           openConversation(lastConversationId());
@@ -447,7 +567,7 @@ function handle(msg: ServerMessage): void {
       if (msg.entry.kind === 'user' && msg.entry.review === 'pending') {
         updateActivity();
         if (me?.isHost && msg.entry.conversationId !== activeId) {
-          toast(`${msg.entry.author} attend votre accord dans une autre discussion.`);
+          toast(t('toast.reviewElsewhere', { name: msg.entry.author }));
         }
       }
       if (msg.entry.conversationId === activeId) {
@@ -484,7 +604,7 @@ function handle(msg: ServerMessage): void {
         markDirty(entry.id);
         // Une décision attend ce participant dans une autre discussion : on le signale.
         if (entry.conversationId !== activeId && needsMe(entry, msg.tool)) {
-          toast('Une action de l’agent attend votre décision dans une autre discussion.');
+          toast(t('toast.actionElsewhere'));
         }
       }
       break;
@@ -495,6 +615,7 @@ function handle(msg: ServerMessage): void {
         entry.status = msg.status;
         entry.model = msg.model ?? entry.model;
         entry.error = msg.error;
+        entry.errorI18n = msg.errorI18n;
         markDirty(entry.id);
       }
       break;
@@ -506,7 +627,7 @@ function handle(msg: ServerMessage): void {
         entry.reviewedBy = msg.by;
         markDirty(entry.id);
         if (msg.review === 'rejected' && entry.clientId === me?.clientId) {
-          toast(`${msg.by} n’a pas envoyé votre question au modèle.`);
+          toast(t('toast.questionRejected', { name: msg.by }));
         }
       }
       updateActivity();
@@ -526,7 +647,7 @@ function handle(msg: ServerMessage): void {
       apps = msg.apps;
       renderApps();
       if (!me?.isHost && added.length) {
-        toast(`L’hôte partage « ${added[0].label} » : ouvrez-la depuis le bouton Applications.`);
+        toast(t('toast.appShared', { label: added[0].label }));
       }
       break;
     }
@@ -560,13 +681,15 @@ function handle(msg: ServerMessage): void {
       renderModels();
       break;
     case 'invite':
+      lastInvite = msg;
       renderInvite(msg);
       break;
     case 'error':
       toast(msg.message);
       break;
     case 'sessionEnded':
-      endSession(msg.reason);
+      // Seul motif aujourd'hui : l'hôte a arrêté la session ; chaque page l'affiche dans sa langue.
+      endSession(() => t('session.endedByHost'));
       break;
   }
 }
@@ -628,10 +751,19 @@ function expireTyping(): void {
 
 /** « Camille », « Camille et Léo », « Camille, Léo et 2 autres ». */
 function nameList(names: string[]): string {
-  if (names.length <= 2) {
-    return names.join(' et ');
+  if (names.length < 2) {
+    return names.join('');
   }
-  return `${names[0]}, ${names[1]} et ${names.length - 2} autre${names.length > 3 ? 's' : ''}`;
+  if (names.length === 2) {
+    return t('names.two', { a: names[0], b: names[1] });
+  }
+  const n = names.length - 2;
+  return t(n > 1 ? 'names.more.other' : 'names.more.one', { a: names[0], b: names[1], n });
+}
+
+/** « Camille écrit… », « Camille et Léo écrivent… ». */
+function typingText(writers: string[]): string {
+  return t(writers.length > 1 ? 'presence.typing.other' : 'presence.typing.one', { names: nameList(writers) });
 }
 
 /** Au-dessus de la saisie : qui est dans la discussion, et qui écrit. */
@@ -649,11 +781,11 @@ function renderPresence(): void {
   text.className = 'presence-text';
   if (writers.length) {
     text.classList.add('typing-text');
-    text.textContent = `${nameList(writers)} ${writers.length > 1 ? 'écrivent' : 'écrit'}…`;
+    text.textContent = typingText(writers);
   } else if (here.length) {
-    text.textContent = `${nameList(here.map((p) => p.name))} ${here.length > 1 ? 'sont' : 'est'} dans cette discussion`;
+    text.textContent = t(here.length > 1 ? 'presence.here.other' : 'presence.here.one', { names: nameList(here.map((p) => p.name)) });
   } else {
-    text.textContent = 'Personne d’autre dans cette discussion pour l’instant';
+    text.textContent = t('presence.alone');
   }
   presenceEl.replaceChildren(stack, text);
 }
@@ -665,6 +797,27 @@ askInput.addEventListener('input', () => {
     send({ type: 'typing', conversationId: activeId });
   }
 });
+
+/** Redessine toute la page (changement de langue). */
+function renderAll(): void {
+  renderLeaveTitle();
+  renderBanner();
+  if (lastInvite) {
+    renderInvite(lastInvite);
+  }
+  renderConversations();
+  renderTitle();
+  rerenderActive();
+  renderParticipants();
+  renderPresence();
+  renderModels();
+  renderPolicy();
+  renderApps();
+  renderTunnel();
+  renderContext();
+  updateActivity();
+  updateComposer();
+}
 
 function rerenderActive(): void {
   entryEls.clear();
@@ -681,11 +834,11 @@ function rerenderActive(): void {
 
 function renderTitle(): void {
   const conv = conversations.find((c) => c.id === activeId);
-  convTitle.textContent = conv?.title ?? '';
-  convTitle.title = conv ? `Créée par ${conv.createdBy} à ${formatTime(conv.createdAt)}` : '';
-  document.title = conv ? `${conv.title} — Prompt Share` : 'Prompt Share';
+  convTitle.textContent = conv ? convTitleText(conv) : '';
+  convTitle.title = conv ? t('conv.createdBy', { name: conv.createdBy, time: formatTime(conv.createdAt) }) : '';
+  document.title = conv ? `${convTitleText(conv)} — Prompt Share` : 'Prompt Share';
   if (panelConversation && conv) {
-    vscodeApi?.postMessage({ type: 'scc-title', title: conv.title });
+    vscodeApi?.postMessage({ type: 'scc-title', title: convTitleText(conv) });
   }
 }
 
@@ -707,14 +860,18 @@ function renderConversations(): void {
       text.className = 'conv-text';
       const title = document.createElement('span');
       title.className = 'conv-name';
-      title.textContent = conv.title;
+      title.textContent = convTitleText(conv);
       const meta = document.createElement('span');
       meta.className = 'conv-meta';
       meta.textContent =
-        conv.id === answering ? (queue.current?.kind === 'compact' ? 'Compactage…' : 'L’assistant répond…') : waiting.has(conv.id) ? 'En attente…' : `${conv.createdBy} · ${formatTime(conv.createdAt)}`;
+        conv.id === answering
+          ? t(queue.current?.kind === 'compact' ? 'conv.compacting' : 'conv.answering')
+          : waiting.has(conv.id)
+            ? t('conv.waiting')
+            : `${conv.createdBy} · ${formatTime(conv.createdAt)}`;
       const writers = typingIn(conv.id);
       if (writers.length && conv.id !== answering) {
-        meta.textContent = `${nameList(writers)} ${writers.length > 1 ? 'écrivent' : 'écrit'}…`;
+        meta.textContent = typingText(writers);
         meta.classList.add('typing-text');
       }
       text.append(title, meta);
@@ -740,7 +897,7 @@ function renderConversations(): void {
         const del = document.createElement('button');
         del.type = 'button';
         del.className = 'icon-btn conv-delete';
-        del.title = 'Supprimer la discussion';
+        del.title = t('conv.delete');
         del.append(icon('trash'));
         li.append(del);
       }
@@ -769,7 +926,7 @@ convList.addEventListener('click', (e) => {
     return;
   }
   del.dataset.confirm = '1';
-  del.textContent = 'Supprimer ?';
+  del.textContent = t('conv.deleteConfirm');
   del.classList.add('confirm');
   setTimeout(() => {
     if (del.isConnected) {
@@ -797,7 +954,7 @@ newConvBtn.addEventListener('click', () => {
     return;
   }
   if (!send({ type: 'createConversation' })) {
-    toast('Non connecté.');
+    toast(t('toast.offline'));
   }
   askInput.focus();
 });
@@ -853,7 +1010,7 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
   switch (entry.kind) {
     case 'user': {
       el.classList.toggle('mine', entry.clientId === me?.clientId);
-      el.append(turnHead(avatar(entry.author), entry.author, entry.timestamp, entry.isHost ? 'hôte' : undefined));
+      el.append(turnHead(avatar(entry.author), entry.author, entry.timestamp, entry.isHost ? t('badge.host') : undefined));
       const request = document.createElement('div');
       request.className = 'request body';
       request.append(renderMarkdown(entry.text));
@@ -861,7 +1018,7 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
       if (entry.review === 'pending') {
         el.append(reviewBar(entry));
       } else if (entry.review === 'rejected') {
-        el.append(note(`Non envoyée au modèle : refusée par ${entry.reviewedBy ?? 'l’hôte'}.`));
+        el.append(note(entry.reviewedBy ? t('review.rejectedBy', { name: entry.reviewedBy }) : t('review.rejectedByHost')));
       }
       break;
     }
@@ -870,7 +1027,7 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
       break;
     case 'context': {
       const where = entry.range ? `${entry.fileName} — ${entry.range}` : entry.fileName;
-      el.append(turnHead(avatar(entry.author), `${entry.author} a partagé du contexte`, entry.timestamp));
+      el.append(turnHead(avatar(entry.author), t('context.sharedBy', { name: entry.author }), entry.timestamp));
       el.append(codeBlock(entry.code, entry.languageId, where));
       break;
     }
@@ -879,7 +1036,7 @@ function renderEntry(entry: ChatEntry, el: HTMLElement): void {
       break;
     case 'system': {
       el.classList.toggle('error', entry.level === 'error');
-      el.textContent = entry.text;
+      el.textContent = tr(entry.i18n, entry.text);
       break;
     }
   }
@@ -893,13 +1050,13 @@ function reviewBar(entry: UserEntry): HTMLElement {
     bar.classList.add('attention');
     const label = document.createElement('span');
     label.className = 'waiting';
-    label.textContent = `Question de ${entry.author} : l’envoyer au modèle avec votre compte ?`;
+    label.textContent = t('review.prompt', { name: entry.author });
     const decide = (accept: boolean) => () => send({ type: 'reviewQuestion', entryId: entry.id, accept });
-    bar.append(icon('shield'), label, button('Envoyer au modèle', 'primary', decide(true)), button('Refuser', 'secondary', decide(false)));
+    bar.append(icon('shield'), label, button(t('review.send'), 'primary', decide(true)), button(t('review.deny'), 'secondary', decide(false)));
   } else {
     const waiting = document.createElement('span');
     waiting.className = 'waiting';
-    waiting.textContent = ended ? 'Non envoyée au modèle.' : 'En attente de l’accord de l’hôte…';
+    waiting.textContent = ended ? t('review.notSent') : t('review.waiting');
     bar.append(icon(ended ? 'circle-slash' : 'loading codicon-modifier-spin'), waiting);
   }
   return bar;
@@ -907,7 +1064,7 @@ function reviewBar(entry: UserEntry): HTMLElement {
 
 /** Discussion compactée : le résumé remplace, pour le modèle, les échanges précédents. */
 function renderSummary(entry: SummaryEntry, el: HTMLElement): void {
-  const head = turnHead(assistantAvatar(), `Discussion compactée par ${entry.author}`, entry.timestamp);
+  const head = turnHead(assistantAvatar(), t('summary.by', { name: entry.author }), entry.timestamp);
   if (entry.model) {
     const meta = document.createElement('span');
     meta.className = 'meta';
@@ -917,7 +1074,7 @@ function renderSummary(entry: SummaryEntry, el: HTMLElement): void {
   const card = document.createElement('details');
   card.className = 'summary-card';
   const label = document.createElement('summary');
-  label.textContent = 'Résumé envoyé au modèle à la place des échanges précédents (qui restent affichés ici)';
+  label.textContent = t('summary.label');
   const body = document.createElement('div');
   body.className = 'body';
   body.append(renderMarkdown(entry.text));
@@ -926,16 +1083,18 @@ function renderSummary(entry: SummaryEntry, el: HTMLElement): void {
 }
 
 function renderAssistant(entry: AssistantEntry, el: HTMLElement): void {
-  const head = turnHead(assistantAvatar(), 'Assistant', entry.timestamp);
+  const head = turnHead(assistantAvatar(), t('assistant.name'), entry.timestamp);
   const meta = document.createElement('span');
   meta.className = 'meta';
-  meta.textContent = `${entry.model ? `${entry.model} · ` : ''}pour ${entry.replyToAuthor}`;
+  meta.textContent = entry.model
+    ? t('assistant.modelFor', { model: entry.model, name: entry.replyToAuthor })
+    : t('assistant.for', { name: entry.replyToAuthor });
   head.append(meta);
   if (entry.status !== 'streaming' && !ended) {
     const fork = document.createElement('button');
     fork.type = 'button';
     fork.className = 'icon-btn fork-btn';
-    fork.title = 'Forker à partir d’ici : copie la discussion jusqu’à cette réponse dans une nouvelle discussion';
+    fork.title = t('assistant.fork');
     fork.setAttribute('aria-label', fork.title);
     fork.append(icon('repo-forked'));
     fork.addEventListener('click', () => send({ type: 'fork', conversationId: entry.conversationId, upToEntryId: entry.id }));
@@ -963,9 +1122,9 @@ function renderAssistant(entry: AssistantEntry, el: HTMLElement): void {
     bodyEl.append(typing);
   }
   if (entry.status === 'cancelled') {
-    bodyEl.append(note('Réponse arrêtée.'));
+    bodyEl.append(note(t('assistant.cancelled')));
   } else if (entry.status === 'error') {
-    bodyEl.append(note(entry.error ?? 'Erreur inconnue.', true));
+    bodyEl.append(note(tr(entry.errorI18n, entry.error ?? t('assistant.unknownError')), true));
   }
   el.append(bodyEl);
 }
@@ -993,18 +1152,20 @@ function renderTool(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
   text.className = 'tool-text';
   const title = document.createElement('span');
   title.className = 'tool-title';
-  title.textContent = tool.question ? tool.question.text : tool.title;
+  title.textContent = tool.question ? tool.question.text : tr(tool.titleI18n, tool.title);
   text.append(title);
   if (tool.answer) {
     const answer = document.createElement('span');
     answer.className = 'tool-detail answered';
-    answer.textContent = `« ${tool.answer} »${tool.answeredBy ? ` — ${tool.answeredBy}` : ''}`;
+    answer.textContent = tool.answeredBy
+      ? t('tool.answerBy', { answer: tool.answer, name: tool.answeredBy })
+      : t('tool.answer', { answer: tool.answer });
     text.append(answer);
   }
   if (tool.detail) {
     const detail = document.createElement('span');
     detail.className = 'tool-detail';
-    detail.textContent = tool.detail;
+    detail.textContent = tr(tool.detailI18n, tool.detail);
     text.append(detail);
   }
   row.append(text);
@@ -1039,12 +1200,12 @@ function approvalCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
   head.className = 'card-head';
   head.append(icon(approval.kind === 'command' ? 'terminal' : 'diff'));
   const title = document.createElement('span');
-  title.textContent = `${tool.title} ?`;
+  title.textContent = t('approval.title', { title: tr(tool.titleI18n, tool.title) });
   head.append(title);
   if (approval.hostOnly) {
     const scope = document.createElement('span');
     scope.className = 'scope';
-    scope.append(icon('warning'), document.createTextNode('Hors du projet'));
+    scope.append(icon('warning'), document.createTextNode(t('approval.outside')));
     head.append(scope);
   }
   card.append(head);
@@ -1059,13 +1220,13 @@ function approvalCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
   if (canDecide) {
     const decide = (decision: 'once' | 'session' | 'deny') => () =>
       send({ type: 'approve', entryId: entry.id, toolId: tool.id, decision });
-    foot.append(button('Autoriser', 'primary', decide('once')));
+    foot.append(button(t('approval.allow'), 'primary', decide('once')));
     if (me?.isHost && !approval.hostOnly) {
-      foot.append(button('Autoriser pour la session', 'secondary', decide('session')));
+      foot.append(button(t('approval.allowSession'), 'secondary', decide('session')));
     }
-    foot.append(button('Refuser', 'secondary', decide('deny')));
+    foot.append(button(t('approval.deny'), 'secondary', decide('deny')));
     if (me?.isHost && approval.canShowDiff) {
-      foot.append(button('Voir dans VS Code', 'link-btn', () => send({ type: 'showDiff', entryId: entry.id, toolId: tool.id })));
+      foot.append(button(t('approval.showDiff'), 'link-btn', () => send({ type: 'showDiff', entryId: entry.id, toolId: tool.id })));
     }
   } else {
     const waiting = document.createElement('span');
@@ -1073,8 +1234,8 @@ function approvalCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
     const requester = entries.get(entry.replyTo);
     waiting.textContent =
       approval.hostOnly || requester?.kind !== 'user'
-        ? "En attente de la validation de l'hôte…"
-        : `En attente de la validation de ${requester.author} ou de l'hôte…`;
+        ? t('approval.waitingHost')
+        : t('approval.waitingUser', { name: requester.author });
     foot.append(icon('loading codicon-modifier-spin'), waiting);
   }
   card.append(foot);
@@ -1095,7 +1256,7 @@ function questionCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
   title.textContent = question.text;
   const scope = document.createElement('span');
   scope.className = 'scope everyone';
-  scope.append(icon('organization'), document.createTextNode('Tout le monde peut répondre'));
+  scope.append(icon('organization'), document.createTextNode(t('question.everyone')));
   head.append(title, scope);
   card.append(head);
 
@@ -1113,9 +1274,9 @@ function questionCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
     const row = document.createElement('form');
     row.className = 'answer-row';
     const input = document.createElement('input');
-    input.placeholder = question.options.length ? 'Ou répondez librement…' : 'Votre réponse…';
+    input.placeholder = question.options.length ? t('question.freePlaceholder') : t('question.placeholder');
     input.maxLength = LIMITS.maxAnswerLength;
-    row.append(input, button('Répondre', 'primary', () => undefined, 'submit'));
+    row.append(input, button(t('question.reply'), 'primary', () => undefined, 'submit'));
     row.addEventListener('submit', (e) => {
       e.preventDefault();
       reply(input.value);
@@ -1124,7 +1285,7 @@ function questionCard(entry: AssistantEntry, tool: ToolActivity): HTMLElement {
   } else {
     const waiting = document.createElement('span');
     waiting.className = 'waiting';
-    waiting.textContent = 'En attente d’une réponse…';
+    waiting.textContent = t('question.waiting');
     foot.append(icon('loading codicon-modifier-spin'), waiting);
   }
   card.append(foot);
@@ -1211,13 +1372,13 @@ function welcome(): HTMLElement {
   const div = document.createElement('div');
   div.className = 'welcome';
   const title = document.createElement('h2');
-  title.textContent = 'Demandez à l’IA, ensemble';
+  title.textContent = t('welcome.title');
   const text = document.createElement('p');
-  text.textContent =
-    "L'agent explore le projet de l'hôte, propose des modifications et lance des commandes ; chaque action est soumise à validation.";
+  text.textContent = t('welcome.text');
   const suggestions = document.createElement('div');
   suggestions.className = 'suggestions';
-  for (const s of SUGGESTIONS) {
+  for (const key of SUGGESTIONS) {
+    const s = t(key);
     suggestions.append(
       button(s, '', () => {
         askInput.value = s;
@@ -1302,13 +1463,13 @@ function renderParticipants(): void {
       if (p.isHost) {
         const b = document.createElement('span');
         b.className = 'badge';
-        b.textContent = 'hôte';
+        b.textContent = t('badge.host');
         name.append(b);
       }
       if (p.clientId === me?.clientId) {
         const you = document.createElement('span');
         you.className = 'you';
-        you.textContent = 'vous';
+        you.textContent = t('people.you');
         name.append(you);
       }
       text.append(name);
@@ -1317,7 +1478,7 @@ function renderParticipants(): void {
         const here = where.id === activeId;
         const w = document.createElement(here ? 'span' : 'button');
         w.className = 'person-where';
-        w.textContent = here ? 'dans cette discussion' : `dans « ${where.title} »`;
+        w.textContent = here ? t('people.here') : t('people.in', { title: convTitleText(where) });
         if (!here) {
           w.addEventListener('click', () => {
             openConversation(where.id);
@@ -1378,19 +1539,20 @@ function renderTunnel(): void {
     radio.disabled = starting;
   }
   tunnelBtn.disabled = starting;
-  tunnelBtn.lastElementChild!.textContent = starting ? 'Ouverture…' : 'Ouvrir le tunnel et copier le lien';
+  tunnelBtn.lastElementChild!.textContent = starting ? t('tunnel.opening') : t('tunnel.open');
+  const provider = TUNNEL_LABELS[state.provider];
   if (on) {
-    tunnelTitle.textContent = `Tunnel ${TUNNEL_LABELS[state.provider]} actif`;
-    tunnelSince.textContent = state.since ? `depuis ${formatTime(state.since)}` : '';
+    tunnelTitle.textContent = t('tunnel.active', { provider });
+    tunnelSince.textContent = state.since ? t('tunnel.since', { time: formatTime(state.since) }) : '';
     tunnelUrl.textContent = state.url ?? '';
     resetTunnelStop();
   }
   tunnelStatus.classList.toggle('error', state.status === 'error');
   tunnelStatus.hidden = !starting && state.status !== 'error';
   tunnelStatus.textContent = starting
-    ? `Ouverture du tunnel ${TUNNEL_LABELS[state.provider]}… Répondez aux éventuelles questions dans VS Code (téléchargement, compte ngrok).`
+    ? t('tunnel.starting', { provider })
     : state.status === 'error'
-      ? `Tunnel ${TUNNEL_LABELS[state.provider]} : ${state.error ?? 'erreur'}`
+      ? t('tunnel.error', { provider, error: state.error ?? t('tunnel.errorUnknown') })
       : '';
 }
 
@@ -1407,13 +1569,13 @@ function resetTunnelStop(): void {
   clearTimeout(stopArmed);
   stopArmed = undefined;
   tunnelStop.classList.remove('confirm');
-  tunnelStop.lastChild!.textContent = 'Arrêter';
-  tunnelStop.title = 'Fermer le tunnel : le lien ne fonctionnera plus et les invités à distance seront déconnectés';
+  tunnelStop.lastChild!.textContent = t('tunnel.stop');
+  tunnelStop.title = t('tunnel.stopTitle');
 }
 tunnelStop.addEventListener('click', () => {
   if (stopArmed === undefined) {
     tunnelStop.classList.add('confirm');
-    tunnelStop.lastChild!.textContent = 'Confirmer l’arrêt';
+    tunnelStop.lastChild!.textContent = t('tunnel.stopConfirm');
     stopArmed = window.setTimeout(resetTunnelStop, 4000);
     return;
   }
@@ -1423,19 +1585,20 @@ tunnelStop.addEventListener('click', () => {
 
 function renderInvite(msg: Extract<ServerMessage, { type: 'invite' }>): void {
   const port = /:(\d+)/.exec(msg.localUrl)?.[1] ?? '3717';
+  // Texte traduit dont les paramètres {port} et {command} deviennent des éléments <code>.
+  const code: Record<string, string> = { port, command: `ngrok http ${port}` };
   inviteHint.replaceChildren(
-    document.createTextNode('Ou, avec votre propre tunnel, exposez le port '),
-    Object.assign(document.createElement('code'), { textContent: port }),
-    document.createTextNode(' avec '),
-    Object.assign(document.createElement('code'), { textContent: `ngrok http ${port}` }),
-    document.createTextNode(' ou le panneau Ports de VS Code (visibilité Public), puis collez l’URL publique :'),
+    ...webT(lang, 'invite.hint')
+      .split(/(\{\w+\})/)
+      .filter(Boolean)
+      .map((part) => {
+        const name = /^\{(\w+)\}$/.exec(part)?.[1];
+        return name && name in code
+          ? Object.assign(document.createElement('code'), { textContent: code[name] })
+          : document.createTextNode(part);
+      }),
   );
-  inviteHint.after(
-    Object.assign(inviteWarn, {
-      textContent:
-        'Le lien donne accès à la session : les invités utilisent votre compte GitHub Copilot et, par l’agent, lisent le projet. Ne l’envoyez qu’aux personnes avec qui vous travaillez.',
-    }),
-  );
+  inviteHint.after(Object.assign(inviteWarn, { textContent: t('invite.warn') }));
   if (!inviteUrl.value && msg.publicUrl) {
     inviteUrl.value = msg.publicUrl;
   }
@@ -1450,9 +1613,7 @@ function renderInvite(msg: Extract<ServerMessage, { type: 'invite' }>): void {
       inviteResult.append(
         Object.assign(document.createElement('span'), {
           className: msg.publicUrl ? 'ok' : 'warn',
-          textContent: msg.publicUrl
-            ? 'Lien copié dans le presse-papier : envoyez-le aux participants.'
-            : 'Lien local copié : il ne fonctionne que sur cette machine. Ajoutez l’URL du tunnel pour inviter d’autres personnes.',
+          textContent: msg.publicUrl ? t('invite.copied') : t('invite.copiedLocal'),
         }),
       );
     }
@@ -1494,9 +1655,9 @@ function renderModels(): void {
 
   const options: HTMLOptionElement[] = [];
   if (!models.available.length) {
-    options.push(new Option('Aucun modèle disponible', ''));
+    options.push(new Option(t('model.none'), ''));
   } else {
-    options.push(new Option(defaultModel ? `${defaultModel.name} (défaut)` : 'Modèle par défaut', ''));
+    options.push(new Option(defaultModel ? t('model.defaultNamed', { name: defaultModel.name }) : t('model.default'), ''));
     if (canChoose) {
       for (const m of models.available) {
         if (m.id !== models.defaultId) {
@@ -1510,16 +1671,16 @@ function renderModels(): void {
   lockReason = ended
     ? ''
     : !models.available.length
-      ? 'Aucun modèle Copilot disponible chez l’hôte pour le moment.'
+      ? 'model.lockNone'
       : !canChoose
-        ? 'L’hôte a fixé le modèle de la session : vos questions utilisent le modèle par défaut.'
+        ? 'model.lockHost'
         : models.available.length < 2
-          ? 'Un seul modèle est disponible chez l’hôte.'
+          ? 'model.lockSingle'
           : '';
   modelSelect.disabled = ended || !!lockReason;
   const picker = modelSelect.parentElement!;
   picker.classList.toggle('locked', !!lockReason);
-  picker.title = lockReason || 'Modèle utilisé pour vos questions';
+  picker.title = t(lockReason || 'model.title');
   modelChevron.className = `codicon codicon-${lockReason ? 'lock' : 'chevron-down'}`;
   renderHostOptions();
 }
@@ -1527,7 +1688,7 @@ function renderModels(): void {
 
 modelSelect.parentElement!.addEventListener('click', () => {
   if (lockReason) {
-    toast(me?.isHost || !lockReason.startsWith('L’hôte') ? lockReason : `${lockReason} Demandez-lui de l’autoriser.`);
+    toast(t(lockReason === 'model.lockHost' && !me?.isHost ? 'model.lockHostAsk' : lockReason));
   }
 });
 
@@ -1550,22 +1711,28 @@ function updateActivity(): void {
   const parts: string[] = [];
   const current = queue.current;
   if (current) {
-    const who = current.clientId === me?.clientId ? 'vous' : current.author;
+    const mine = current.clientId === me?.clientId;
     const conv = conversations.find((c) => c.id === current.conversationId);
-    const where = current.conversationId === activeId || !conv ? '' : ` dans « ${conv.title} »`;
-    parts.push(current.kind === 'compact' ? `Compactage de la discussion${where}…` : `L’assistant répond à ${who}${where}`);
+    const title = current.conversationId === activeId || !conv ? undefined : convTitleText(conv);
+    const key: WebKey =
+      current.kind === 'compact'
+        ? title ? 'activity.compactingIn' : 'activity.compacting'
+        : mine
+          ? title ? 'activity.answeringYouIn' : 'activity.answeringYou'
+          : title ? 'activity.answeringIn' : 'activity.answering';
+    parts.push(t(key, { name: current.author, title: title ?? '' }));
   }
   const mine = queue.pending.findIndex((q) => q.clientId === me?.clientId);
   if (mine >= 0) {
-    parts.push(`votre question est en position ${mine + 1} dans la file`);
+    parts.push(t('activity.position', { n: mine + 1 }));
   } else if (queue.pending.length) {
-    parts.push(`${queue.pending.length} question(s) en attente`);
+    parts.push(t('activity.pending', { n: queue.pending.length }));
   }
   const awaiting = [...entries.values()].filter((e): e is UserEntry => e.kind === 'user' && e.review === 'pending');
   if (me?.isHost && awaiting.length) {
-    parts.push(`${awaiting.length} question(s) d’invités attendent votre accord`);
+    parts.push(t('activity.awaitingHost', { n: awaiting.length }));
   } else if (awaiting.some((e) => e.clientId === me?.clientId)) {
-    parts.push('votre question attend l’accord de l’hôte');
+    parts.push(t('activity.awaitingMine'));
   }
   activityText.textContent = parts.join(' · ');
   activityEl.hidden = parts.length === 0;
@@ -1585,10 +1752,10 @@ function renderApps(): void {
   appsCount.textContent = String(apps.length);
   appsForm.hidden = !isHost;
   appsHint.textContent = isHost
-    ? 'Rendez une application locale (serveur de dev, site…) accessible aux participants : chez eux, elle s’ouvre sur localhost, comme chez vous. Seuls les participants de la session y ont accès.'
+    ? t('apps.hintHost')
     : vscodeApi
-      ? 'Applications de l’hôte : « Ouvrir » les rend accessibles sur votre localhost et les ouvre dans votre navigateur.'
-      : 'Pour ouvrir ces applications, rejoignez la session depuis VS Code avec l’extension Prompt Share : un navigateur seul ne peut pas les relayer.';
+      ? t('apps.hintVsCode')
+      : t('apps.hintBrowser');
   appsList.replaceChildren(
     ...apps.map((app) => {
       const li = document.createElement('li');
@@ -1599,11 +1766,11 @@ function renderApps(): void {
       port.className = 'app-port';
       port.textContent = `localhost:${app.port}`;
       name.append(port);
-      const open = button('Ouvrir', 'secondary', () => vscodeApi?.postMessage({ type: 'scc-open-app', port: app.port }));
+      const open = button(t('apps.open'), 'secondary', () => vscodeApi?.postMessage({ type: 'scc-open-app', port: app.port }));
       open.disabled = !vscodeApi;
       li.append(icon('browser'), name, open);
       if (isHost) {
-        li.append(button('Arrêter', 'secondary', () => send({ type: 'unshareApp', port: app.port })));
+        li.append(button(t('apps.stop'), 'secondary', () => send({ type: 'unshareApp', port: app.port })));
       }
       return li;
     }),
@@ -1637,7 +1804,7 @@ appsForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const port = Number(appsPort.value.trim());
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    toast('Port invalide (1 à 65535).');
+    toast(t('toast.invalidPort'));
     return;
   }
   if (send({ type: 'shareApp', port, label: appsLabel.value.trim() || undefined })) {
@@ -1649,13 +1816,11 @@ appsForm.addEventListener('submit', (e) => {
 /** Rappel permanent sous la saisie : quel compte répond, qui voit quoi, règles de l'hôte. */
 function renderPolicy(): void {
   const rules = [
-    policy.reviewGuestQuestions ? 'questions des invités validées par l’hôte' : undefined,
-    policy.guestQuestionsPerHour > 0 ? `${policy.guestQuestionsPerHour} questions d’invités par heure au plus` : undefined,
+    policy.reviewGuestQuestions ? t('policy.review') : undefined,
+    policy.guestQuestionsPerHour > 0 ? t('policy.rate', { n: policy.guestQuestionsPerHour }) : undefined,
   ].filter(Boolean);
-  const text = me?.isHost
-    ? 'Les questions des invités utilisent votre compte GitHub Copilot.'
-    : 'Réponses générées avec le compte GitHub Copilot de l’hôte. Vos messages sont visibles par tous les participants.';
-  policyNote.textContent = rules.length ? `${text} Règles : ${rules.join(', ')}.` : text;
+  const text = me?.isHost ? t('policy.host') : t('policy.guest');
+  policyNote.textContent = rules.length ? t('policy.withRules', { text, rules: rules.join(', ') }) : text;
   policyNote.hidden = !me;
 }
 
@@ -1664,7 +1829,9 @@ function renderPolicy(): void {
 const RING = 2 * Math.PI * 6;
 
 function formatTokens(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toLocaleString('fr-FR', { maximumFractionDigits: n >= 100_000 ? 0 : 1 })} k` : String(n);
+  return n >= 1000
+    ? t('context.kilo', { n: (n / 1000).toLocaleString(locale(), { maximumFractionDigits: n >= 100_000 ? 0 : 1 }) })
+    : n.toLocaleString(locale());
 }
 
 /** Jauge de la discussion affichée : tokens envoyés au modèle à la prochaine question / maximum du modèle. */
@@ -1681,19 +1848,19 @@ function renderContext(): void {
   const level = pct >= 90 ? 'danger' : pct >= 75 ? 'warn' : '';
   contextBtn.className = `context-gauge ${level}`;
   contextRing.setAttribute('stroke-dasharray', `${Math.max(0.5, ratio * RING)} ${RING}`);
-  contextPct.textContent = `${pct} %`;
-  contextBtn.title = `Contexte : ${formatTokens(usage.tokens)} / ${formatTokens(usage.max)} tokens (${pct} %)`;
+  contextPct.textContent = t('context.pct', { pct });
+  const used = formatTokens(usage.tokens);
+  const max = formatTokens(usage.max);
+  contextBtn.title = t('context.gauge', { used, max, pct });
   contextFill.parentElement!.className = `context-bar ${level}`;
   contextFill.style.width = `${Math.max(1, pct)}%`;
-  contextDetail.textContent = `${formatTokens(usage.tokens)} / ${formatTokens(usage.max)} tokens (${pct} %) · ${usage.model}`;
+  contextDetail.textContent = t('context.detail', { used, max, pct, model: usage.model });
   contextWarn.hidden = pct < 75;
   const compacting = [queue.current, ...queue.pending].some((q) => q?.kind === 'compact' && q.conversationId === conv!.id);
   compactBtn.hidden = !me?.isHost;
   compactBtn.disabled = compacting;
-  compactBtn.lastElementChild!.textContent = compacting ? 'Compactage en cours…' : 'Compacter la discussion';
-  compactHint.textContent = me?.isHost
-    ? 'Le modèle résume les échanges ; le résumé remplace l’historique envoyé ensuite (une requête sur votre compte).'
-    : 'Seul l’hôte peut compacter : le résumé est une requête au modèle, sur son compte.';
+  compactBtn.lastElementChild!.textContent = compacting ? t('context.compacting') : t('context.compact');
+  compactHint.textContent = me?.isHost ? t('context.hintHost') : t('context.hintGuest');
 }
 
 function toggleContext(open = contextPop.hidden): void {
@@ -1748,7 +1915,7 @@ function submitQuestion(): void {
   const canChoose = !!me?.isHost || models.guestsCanChoose;
   const msg = { type: 'ask', conversationId: activeId, text, modelId: (canChoose && chosenModel) || undefined };
   if (!send(msg)) {
-    toast('Non connecté : la question sera à renvoyer après la reconnexion.');
+    toast(t('toast.offlineQuestion'));
     return;
   }
   askInput.value = '';
@@ -1784,8 +1951,8 @@ messagesEl.addEventListener('click', (e) => {
   const label = btn.querySelector('span');
   void copyText(code).then((ok) => {
     if (label) {
-      label.textContent = ok ? 'Copié' : 'Échec';
-      setTimeout(() => (label.textContent = 'Copier'), 1500);
+      label.textContent = ok ? t('code.copied') : t('code.copyFailed');
+      setTimeout(() => (label.textContent = t('code.copy')), 1500);
     }
   });
 });
@@ -1810,14 +1977,19 @@ async function copyText(text: string): Promise<boolean> {
 
 // ---- Divers ----
 
-function setConnection(state: 'connecting' | 'online' | 'offline', label: string): void {
+function setConnection(state: 'connecting' | 'online' | 'offline', key: WebKey, params?: Params): void {
   connectionEl.dataset.state = state;
-  connectionEl.title = label;
+  connectionLabel = { key, params };
+  renderConnection();
   updateComposer();
 }
 
+function renderConnection(): void {
+  connectionEl.title = t(connectionLabel.key, connectionLabel.params);
+}
+
 function formatTime(timestamp: number): string {
-  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return new Date(timestamp).toLocaleTimeString(locale(), { hour: '2-digit', minute: '2-digit' });
 }
 
 let toastTimer: number | undefined;

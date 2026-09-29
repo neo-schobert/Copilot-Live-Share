@@ -14,16 +14,17 @@
     <div class="join-card">
       <div class="join-logo"><i class="codicon codicon-comment-discussion"></i></div>
       <h1>Prompt Share</h1>
-      <p>Un chat IA à plusieurs : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte avec ses modèles GitHub Copilot.</p>
-      <label for="home-name">Votre pseudo</label>
-      <input id="home-name" maxlength="32" autocomplete="nickname" placeholder="ex. Camille">
-      <button id="home-host" type="button" class="primary"><i class="codicon codicon-broadcast"></i>Héberger une session</button>
-      <div class="home-sep"><span>ou rejoindre celle de quelqu'un</span></div>
+      <p data-i18n="home.intro">Un chat IA à plusieurs : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte avec ses modèles GitHub Copilot.</p>
+      <label for="home-name" data-i18n="home.nameLabel">Votre pseudo</label>
+      <input id="home-name" maxlength="32" autocomplete="nickname" placeholder="ex. Camille" data-i18n-placeholder="home.namePlaceholder">
+      <button id="home-host" type="button" class="primary"><i class="codicon codicon-broadcast"></i><span data-i18n="home.host">Héberger une session</span></button>
+      <div class="home-sep"><span data-i18n="home.or">ou rejoindre celle de quelqu'un</span></div>
       <form id="home-join-form" class="home-join">
-        <input id="home-link" placeholder="Lien d'invitation (https://…/?token=…)" aria-label="Lien d'invitation">
-        <button type="submit" class="secondary"><i class="codicon codicon-plug"></i>Rejoindre</button>
+        <input id="home-link" placeholder="Lien d'invitation (https://…/?token=…)" aria-label="Lien d'invitation" data-i18n-placeholder="home.linkPlaceholder" data-i18n-aria-label="home.linkLabel">
+        <button type="submit" class="secondary"><i class="codicon codicon-plug"></i><span data-i18n="home.join">Rejoindre</span></button>
       </form>
       <p id="home-status" class="home-status" hidden></p>
+      <label class="lang-row"><i class="codicon codicon-globe" aria-hidden="true"></i><select class="lang-select" data-i18n-aria-label="lang.label" aria-label="Langue"></select></label>
     </div>
   </section>
 
@@ -31,96 +32,98 @@
     <form id="join-form" class="join-card" autocomplete="off">
       <div class="join-logo"><i class="codicon codicon-comment-discussion"></i></div>
       <h1>Prompt Share</h1>
-      <p>Un chat IA à plusieurs : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte avec ses modèles GitHub Copilot.</p>
-      <label for="name-input">Votre pseudo</label>
-      <input id="name-input" name="name" maxlength="32" required autofocus autocomplete="nickname" placeholder="ex. Camille">
-      <button type="submit" class="primary">Rejoindre la session</button>
+      <p data-i18n="home.intro">Un chat IA à plusieurs : posez vos questions ensemble, l'agent travaille dans le projet de l'hôte avec ses modèles GitHub Copilot.</p>
+      <label for="name-input" data-i18n="home.nameLabel">Votre pseudo</label>
+      <input id="name-input" name="name" maxlength="32" required autofocus autocomplete="nickname" placeholder="ex. Camille" data-i18n-placeholder="home.namePlaceholder">
+      <button type="submit" class="primary" data-i18n="join.submit">Rejoindre la session</button>
+      <label class="lang-row"><i class="codicon codicon-globe" aria-hidden="true"></i><select class="lang-select" data-i18n-aria-label="lang.label" aria-label="Langue"></select></label>
     </form>
   </section>
 
   <div id="app" class="app" hidden>
-    <nav id="convs" class="sidebar" aria-label="Discussions">
+    <nav id="convs" class="sidebar" aria-label="Discussions" data-i18n-aria-label="convs.title">
       <div class="sidebar-head">
-        <span class="section-title">Discussions</span>
-        <button id="new-conv" class="icon-btn" type="button" title="Nouvelle discussion"><i class="codicon codicon-add"></i></button>
+        <span class="section-title" data-i18n="convs.title">Discussions</span>
+        <button id="new-conv" class="icon-btn" type="button" title="Nouvelle discussion" data-i18n-title="convs.new"><i class="codicon codicon-add"></i></button>
       </div>
       <ul id="conv-list" class="conv-list"></ul>
       <div class="sidebar-foot">
         <i class="codicon codicon-shield"></i>
-        <span>Agent limité au projet de l'hôte</span>
+        <span data-i18n="convs.sandbox">Agent limité au projet de l'hôte</span>
       </div>
     </nav>
 
     <div class="main">
       <header class="topbar">
-        <button id="toggle-convs" class="icon-btn drawer-toggle" type="button" aria-controls="convs" aria-expanded="false" title="Discussions">
+        <button id="toggle-convs" class="icon-btn drawer-toggle" type="button" aria-controls="convs" aria-expanded="false" title="Discussions" data-i18n-title="convs.title">
           <i class="codicon codicon-layout-sidebar-left"></i><span id="unread-total" class="dot" hidden></span>
         </button>
         <div class="title-wrap">
           <h1 id="conv-title" class="conv-title"></h1>
           <form id="rename-form" class="rename-form" hidden>
-            <input id="rename-input" maxlength="60" aria-label="Titre de la discussion">
+            <input id="rename-input" maxlength="60" aria-label="Titre de la discussion" data-i18n-aria-label="conv.titleLabel">
           </form>
-          <button id="rename" class="icon-btn" type="button" title="Renommer"><i class="codicon codicon-edit"></i></button>
+          <button id="rename" class="icon-btn" type="button" title="Renommer" data-i18n-title="conv.rename"><i class="codicon codicon-edit"></i></button>
         </div>
         <span id="connection" class="connection" data-state="connecting" title="Connexion…"></span>
-        <button id="open-tab" class="icon-btn" type="button" title="Ouvrir la discussion dans un onglet (déplaçable, à côté des autres)" hidden><i class="codicon codicon-multiple-windows"></i></button>
+        <button id="open-tab" class="icon-btn" type="button" title="Ouvrir la discussion dans un onglet (déplaçable, à côté des autres)" data-i18n-title="conv.openTab" hidden><i class="codicon codicon-multiple-windows"></i></button>
         <div class="invite-wrap">
           <button id="invite-btn" class="invite-btn" type="button" aria-expanded="false" aria-controls="invite-pop" hidden>
-            <i class="codicon codicon-person-add"></i><span>Inviter</span>
+            <i class="codicon codicon-person-add"></i><span data-i18n="invite.button">Inviter</span>
           </button>
           <div id="invite-pop" class="popover invite-pop" hidden>
-            <div class="section-title">Inviter des participants</div>
+            <div class="section-title" data-i18n="invite.title">Inviter des participants</div>
             <div id="tunnel-choose" class="tunnel-choose">
-              <div class="tunnel-options" role="radiogroup" aria-label="Service du tunnel">
-                <label class="tunnel-option"><input type="radio" name="tunnel-provider" value="cloudflare"><span><strong>Cloudflare</strong><small>Sans compte · nouvelle adresse à chaque fois</small></span></label>
-                <label class="tunnel-option"><input type="radio" name="tunnel-provider" value="ngrok"><span><strong>ngrok</strong><small>Compte gratuit · passe les pare-feu</small></span></label>
+              <div class="tunnel-options" role="radiogroup" aria-label="Service du tunnel" data-i18n-aria-label="tunnel.providerLabel">
+                <label class="tunnel-option"><input type="radio" name="tunnel-provider" value="cloudflare"><span><strong>Cloudflare</strong><small data-i18n="tunnel.cloudflareHint">Sans compte · nouvelle adresse à chaque fois</small></span></label>
+                <label class="tunnel-option"><input type="radio" name="tunnel-provider" value="ngrok"><span><strong>ngrok</strong><small data-i18n="tunnel.ngrokHint">Compte gratuit · passe les pare-feu</small></span></label>
               </div>
-              <button id="tunnel-btn" type="button" class="primary tunnel-btn"><i class="codicon codicon-globe"></i><span>Ouvrir le tunnel et copier le lien</span></button>
+              <button id="tunnel-btn" type="button" class="primary tunnel-btn"><i class="codicon codicon-globe"></i><span data-i18n="tunnel.open">Ouvrir le tunnel et copier le lien</span></button>
             </div>
             <div id="tunnel-on" class="tunnel-on" hidden>
               <div class="tunnel-head"><span class="tunnel-dot" aria-hidden="true"></span><strong id="tunnel-title"></strong><span id="tunnel-since" class="tunnel-since"></span></div>
               <code id="tunnel-url" class="tunnel-url"></code>
               <div class="tunnel-actions">
-                <button id="tunnel-copy" type="button" class="primary"><i class="codicon codicon-copy"></i>Copier le lien</button>
-                <button id="tunnel-stop" type="button" class="secondary"><i class="codicon codicon-debug-disconnect"></i>Arrêter</button>
+                <button id="tunnel-copy" type="button" class="primary"><i class="codicon codicon-copy"></i><span data-i18n="invite.copyLink">Copier le lien</span></button>
+                <button id="tunnel-stop" type="button" class="secondary"><i class="codicon codicon-debug-disconnect"></i><span data-i18n="tunnel.stop">Arrêter</span></button>
               </div>
             </div>
             <p id="tunnel-status" class="hint" hidden></p>
             <p id="invite-hint" class="hint"></p>
             <form id="invite-form" class="invite-form">
-              <input id="invite-url" type="url" placeholder="https://xxxx.ngrok-free.app" aria-label="URL publique du tunnel">
-              <button type="submit" class="primary"><i class="codicon codicon-copy"></i>Copier le lien</button>
+              <input id="invite-url" type="url" placeholder="https://xxxx.ngrok-free.app" aria-label="URL publique du tunnel" data-i18n-aria-label="invite.urlLabel">
+              <button type="submit" class="primary"><i class="codicon codicon-copy"></i><span data-i18n="invite.copyLink">Copier le lien</span></button>
             </form>
             <div id="invite-result" class="invite-result" hidden></div>
           </div>
         </div>
         <div id="apps-wrap" class="apps-wrap" hidden>
-          <button id="apps-btn" class="icon-btn apps-btn" type="button" aria-expanded="false" aria-controls="apps-pop" title="Applications partagées"><i class="codicon codicon-browser"></i><span id="apps-count" class="apps-count" hidden></span></button>
+          <button id="apps-btn" class="icon-btn apps-btn" type="button" aria-expanded="false" aria-controls="apps-pop" title="Applications partagées" data-i18n-title="apps.title"><i class="codicon codicon-browser"></i><span id="apps-count" class="apps-count" hidden></span></button>
           <div id="apps-pop" class="popover apps-pop" hidden>
-            <div class="section-title">Applications partagées</div>
+            <div class="section-title" data-i18n="apps.title">Applications partagées</div>
             <p id="apps-hint" class="hint"></p>
             <ul id="apps-list" class="apps-list"></ul>
             <form id="apps-form" class="apps-form" hidden>
-              <input id="apps-port" inputmode="numeric" maxlength="5" placeholder="Port (ex. 8080)" aria-label="Port de l'application">
-              <input id="apps-label" maxlength="60" placeholder="Nom (facultatif)" aria-label="Nom affiché">
-              <button type="submit" class="primary">Partager</button>
+              <input id="apps-port" inputmode="numeric" maxlength="5" placeholder="Port (ex. 8080)" aria-label="Port de l'application" data-i18n-placeholder="apps.portPlaceholder" data-i18n-aria-label="apps.portLabel">
+              <input id="apps-label" maxlength="60" placeholder="Nom (facultatif)" aria-label="Nom affiché" data-i18n-placeholder="apps.labelPlaceholder" data-i18n-aria-label="apps.labelLabel">
+              <button type="submit" class="primary" data-i18n="apps.share">Partager</button>
             </form>
           </div>
         </div>
-        <button id="leave" class="icon-btn" type="button" title="Quitter la session" hidden><i class="codicon codicon-sign-out"></i></button>
+        <button id="leave" class="icon-btn" type="button" title="Quitter la session" data-i18n-title="session.leave" hidden><i class="codicon codicon-sign-out"></i></button>
         <div class="people-wrap">
-          <button id="toggle-people" class="people-btn" type="button" aria-expanded="false" aria-controls="people" title="Participants">
+          <button id="toggle-people" class="people-btn" type="button" aria-expanded="false" aria-controls="people" title="Participants" data-i18n-title="people.title">
             <span id="avatar-stack" class="avatar-stack"></span>
             <span id="people-count" class="people-count">0</span>
           </button>
           <div id="people" class="popover" hidden>
-            <div class="section-title">Participants</div>
+            <div class="section-title" data-i18n="people.title">Participants</div>
             <ul id="people-list"></ul>
+            <div class="people-lang"><label class="lang-row"><i class="codicon codicon-globe" aria-hidden="true"></i><select class="lang-select" data-i18n-aria-label="lang.label" aria-label="Langue"></select></label></div>
             <div id="host-options" class="host-options" hidden>
-              <div class="section-title">Réglages de la session</div>
-              <label class="host-option"><input id="opt-model-choice" type="checkbox"><span>Les invités choisissent leur modèle<small>Sinon, ils utilisent le modèle par défaut. Les modèles premium comptent dans votre quota.</small></span></label>
-              <label class="host-option"><input id="opt-review" type="checkbox"><span>Valider les questions des invités<small>Chaque question d’invité attend votre accord avant d’être envoyée au modèle.</small></span></label>
+              <div class="section-title" data-i18n="hostOptions.title">Réglages de la session</div>
+              <label class="host-option"><input id="opt-model-choice" type="checkbox"><span><span data-i18n="hostOptions.modelChoice">Les invités choisissent leur modèle</span><small data-i18n="hostOptions.modelChoiceHint">Sinon, ils utilisent le modèle par défaut. Les modèles premium comptent dans votre quota.</small></span></label>
+              <label class="host-option"><input id="opt-review" type="checkbox"><span><span data-i18n="hostOptions.review">Valider les questions des invités</span><small data-i18n="hostOptions.reviewHint">Chaque question d’invité attend votre accord avant d’être envoyée au modèle.</small></span></label>
             </div>
           </div>
         </div>
@@ -129,7 +132,7 @@
       <main id="messages" class="messages" aria-live="polite"></main>
 
       <footer class="composer">
-        <button id="jump" class="jump" type="button" title="Aller aux derniers messages" hidden><i class="codicon codicon-arrow-down"></i></button>
+        <button id="jump" class="jump" type="button" title="Aller aux derniers messages" data-i18n-title="composer.jump" hidden><i class="codicon codicon-arrow-down"></i></button>
         <div id="banner" class="banner" hidden></div>
         <div id="activity" class="activity" hidden>
           <i class="codicon codicon-loading codicon-modifier-spin"></i>
@@ -137,11 +140,11 @@
         </div>
         <div id="presence" class="presence" aria-live="polite"></div>
         <form id="ask-form" class="input-box">
-          <textarea id="ask-input" rows="1" maxlength="8000" placeholder="Posez votre question… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)"></textarea>
+          <textarea id="ask-input" rows="1" maxlength="8000" placeholder="Posez votre question… (Entrée pour envoyer, Maj+Entrée pour un saut de ligne)" data-i18n-placeholder="composer.placeholder"></textarea>
           <div class="input-toolbar">
-            <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation"><i class="codicon codicon-tools"></i><span class="mode-label">Agent</span></span>
-            <label class="model-picker" title="Modèle utilisé pour vos questions">
-              <select id="model-select" aria-label="Modèle"></select>
+            <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation" data-i18n-title="composer.modeTitle"><i class="codicon codicon-tools"></i><span class="mode-label" data-i18n="composer.mode">Agent</span></span>
+            <label class="model-picker" title="Modèle utilisé pour vos questions" data-i18n-title="model.title">
+              <select id="model-select" aria-label="Modèle" data-i18n-aria-label="model.label"></select>
               <i id="model-chevron" class="codicon codicon-chevron-down"></i>
             </label>
             <span class="spacer"></span>
@@ -151,17 +154,17 @@
                 <span id="context-pct"></span>
               </button>
               <div id="context-pop" class="popover context-pop" hidden>
-                <div class="section-title">Contexte de la discussion</div>
+                <div class="section-title" data-i18n="context.title">Contexte de la discussion</div>
                 <div class="context-bar"><span id="context-fill"></span></div>
                 <p id="context-detail" class="context-detail"></p>
-                <p class="hint">Consigne, dernier résumé et échanges récents : ce que le modèle reçoit avec chaque question de cette discussion.</p>
-                <p id="context-warn" class="hint warn" hidden>Le contexte approche de la limite du modèle : compactez pour garder des réponses précises.</p>
-                <button id="compact-btn" type="button" class="secondary compact-btn"><i class="codicon codicon-fold"></i><span>Compacter la discussion</span></button>
+                <p class="hint" data-i18n="context.explain">Consigne, dernier résumé et échanges récents : ce que le modèle reçoit avec chaque question de cette discussion.</p>
+                <p id="context-warn" class="hint warn" data-i18n="context.warn" hidden>Le contexte approche de la limite du modèle : compactez pour garder des réponses précises.</p>
+                <button id="compact-btn" type="button" class="secondary compact-btn"><i class="codicon codicon-fold"></i><span data-i18n="context.compact">Compacter la discussion</span></button>
                 <p id="compact-hint" class="hint"></p>
               </div>
             </div>
-            <button id="cancel" class="icon-btn stop" type="button" title="Arrêter la réponse" hidden><i class="codicon codicon-debug-stop"></i></button>
-            <button id="ask-send" class="icon-btn send" type="submit" title="Envoyer (Entrée)"><i class="codicon codicon-send"></i></button>
+            <button id="cancel" class="icon-btn stop" type="button" title="Arrêter la réponse" data-i18n-title="composer.cancel" hidden><i class="codicon codicon-debug-stop"></i></button>
+            <button id="ask-send" class="icon-btn send" type="submit" title="Envoyer (Entrée)" data-i18n-title="composer.send"><i class="codicon codicon-send"></i></button>
           </div>
         </form>
         <p id="policy-note" class="policy-note" hidden></p>

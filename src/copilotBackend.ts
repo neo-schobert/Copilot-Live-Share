@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import type { PreparedCall, WorkspaceTools } from './agentTools';
 import type { ModelBackend, ModelEvent, ModelRequest, ModelResponse, ModelTurn } from './chatRoom';
 import type { ContextUsage, ModelInfo, ToolActivity } from './protocol';
+import type { I18nText, Lang, Params } from './i18n/core';
+import { I18nError, isRoomKey, renderRoomText, roomT, roomText } from './i18n/room';
 
 /** Nombre maximal d'allers-retours modèle ↔ outils pour une question. */
 const MAX_TOOL_ROUNDS = 25;
@@ -49,6 +51,7 @@ export class CopilotBackend implements ModelBackend {
     request: ModelRequest,
     signal: AbortSignal,
   ): AsyncGenerator<ModelEvent> {
+    const lang: Lang = request.lang ?? 'en';
     const cts = new vscode.CancellationTokenSource();
     const onAbort = () => cts.cancel();
     signal.addEventListener('abort', onAbort, { once: true });
@@ -62,7 +65,7 @@ export class CopilotBackend implements ModelBackend {
           response = await model.sendRequest(
             messages,
             {
-              justification: 'Prompt Share envoie les questions des participants de la session partagée.',
+              justification: roomT(lang, 'model.justification'),
               tools: tools.length ? tools : undefined,
             },
             cts.token,
@@ -81,7 +84,7 @@ export class CopilotBackend implements ModelBackend {
           // Certains modèles n'acceptent pas les outils : on réessaie sans.
           if (tools.length && round === 0 && /tool/i.test(String((err as Error)?.message))) {
             tools = [];
-            yield { type: 'text', text: "_Ce modèle ne prend pas en charge les outils : réponse sans accès aux fichiers._\n\n" };
+            yield { type: 'text', text: `${roomT(lang, 'model.noToolsNote')}\n\n` };
             round--;
             continue;
           }
@@ -115,7 +118,7 @@ export class CopilotBackend implements ModelBackend {
         const results: vscode.LanguageModelToolResultPart[] = [];
         for (const call of calls) {
           const id = `t${++this.toolCounter}`;
-          const outcome = yield* this.runTool(id, call, request, signal);
+          const outcome = yield* this.runTool(id, call, request, signal, lang);
           results.push(new vscode.LanguageModelToolResultPart(call.callId, [new vscode.LanguageModelTextPart(outcome)]));
           if (signal.aborted) {
             return;
@@ -126,11 +129,11 @@ export class CopilotBackend implements ModelBackend {
         messages.push(
           vscode.LanguageModelChatMessage.User([
             ...results,
-            new vscode.LanguageModelTextPart(`Voici les résultats des outils ci-dessus. Continue ta réponse à la demande de ${request.author}.`),
+            new vscode.LanguageModelTextPart(`Here are the results of the tools above. Continue your answer to ${request.author}'s request.`),
           ]),
         );
       }
-      yield { type: 'text', text: `\n\n_Limite de ${MAX_TOOL_ROUNDS} étapes atteinte : reformulez ou découpez la demande._` };
+      yield { type: 'text', text: `\n\n${roomT(lang, 'model.stepLimit', { max: MAX_TOOL_ROUNDS })}` };
     } finally {
       signal.removeEventListener('abort', onAbort);
       cts.dispose();
@@ -143,39 +146,49 @@ export class CopilotBackend implements ModelBackend {
     call: vscode.LanguageModelToolCallPart,
     request: ModelRequest,
     signal: AbortSignal,
+    lang: Lang,
   ): AsyncGenerator<ModelEvent, string> {
     const activity = (tool: ToolActivity): ModelEvent => ({ type: 'tool', tool });
+    /** `detail` (langue de l'hôte) et `detailI18n` d'un texte traduisible. */
+    const detailOf = (text: I18nText | undefined): Pick<ToolActivity, 'detail' | 'detailI18n'> =>
+      text ? { detail: renderRoomText(lang, text), detailI18n: text } : {};
+    /** Détail d'une erreur : traduisible si c'est une I18nError, texte brut sinon. */
+    const errorDetail = (err: unknown): Pick<ToolActivity, 'detail' | 'detailI18n'> =>
+      err instanceof I18nError ? detailOf(err.i18n) : { detail: err instanceof Error ? err.message : String(err) };
     let prepared: PreparedCall;
     try {
       prepared = await this.tools.prepare(call.name, call.input);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      yield activity({ id, title: call.name, status: 'error', detail: message });
-      return `Erreur : ${message}`;
+      yield activity({ id, title: call.name, status: 'error', ...errorDetail(err) });
+      return `Error: ${message}`;
     }
     const title = prepared.title;
+    const titleI18n = prepared.titleI18n;
+    const named = { id, title, ...(titleI18n ? { titleI18n } : {}) };
 
     // Question de l'agent aux participants : visible par tous, le premier qui répond l'emporte.
     if (prepared.question) {
       const question = { ...prepared.question, requesterClientId: request.authorClientId, requesterName: request.author };
-      const tool = { id, title, status: 'awaitingAnswer' as const, question };
+      const tool = { ...named, status: 'awaitingAnswer' as const, question };
       yield activity(tool);
       const answer = await request.interaction.answer(tool);
       if (!answer.text) {
-        yield activity({ ...tool, status: 'rejected', detail: 'Sans réponse' });
-        return 'Pas de réponse (demande annulée). Termine sans supposer la réponse.';
+        yield activity({ ...tool, status: 'rejected', ...detailOf(roomText('tool.noAnswer')) });
+        return 'No answer (request cancelled). Finish without assuming the answer.';
       }
       yield activity({ ...tool, status: 'done', answer: answer.text, answeredBy: answer.by });
-      return `Réponse de ${answer.by} : ${answer.text}`;
+      return `Answer from ${answer.by}: ${answer.text}`;
     }
 
-    let detail: string | undefined;
+    /** Décision sur l'action validée : suffixe des clés du détail (voir `doneDetail`). */
+    let approvedAs: { kind: ApprovedKind; by: string } | undefined;
     const approval = prepared.approval;
     if (approval && this.tools.isGranted(approval)) {
-      detail = 'autorisé pour la session';
+      approvedAs = { kind: 'granted', by: '' };
     } else if (approval) {
       const request_ = { kind: approval.kind, preview: approval.preview, canShowDiff: approval.canShowDiff, hostOnly: approval.hostOnly };
-      const tool = { id, title, status: 'awaitingApproval' as const, approval: request_ };
+      const tool = { ...named, status: 'awaitingApproval' as const, approval: request_ };
       if (approval.diff) {
         this.tools.rememberDiff(id, approval.diff);
       }
@@ -183,30 +196,71 @@ export class CopilotBackend implements ModelBackend {
       const outcome = await request.interaction.approval(tool);
       this.tools.forgetDiff(id);
       if (outcome.decision === 'deny' || signal.aborted) {
-        yield activity({ ...tool, status: 'rejected', detail: outcome.by ? `Refusé par ${outcome.by}` : 'Annulé' });
-        return "L'action a été refusée. Ne la retente pas telle quelle ; explique ce que tu voulais faire ou propose une alternative.";
+        yield activity({
+          ...tool,
+          status: 'rejected',
+          ...detailOf(outcome.by ? roomText('tool.deniedBy', { by: outcome.by }) : roomText('tool.cancelled')),
+        });
+        return 'The action was denied. Do not retry it as is; explain what you wanted to do or suggest an alternative.';
       }
       if (outcome.decision === 'session') {
         this.tools.grant(approval.kind);
       }
-      detail = outcome.decision === 'session' ? `autorisé pour la session par ${outcome.by}` : `autorisé par ${outcome.by}`;
-      yield activity({ ...tool, status: 'running', detail });
+      approvedAs = { kind: outcome.decision === 'session' ? 'approvedSession' : 'approved', by: outcome.by };
+      yield activity({ ...tool, status: 'running', ...detailOf(approvalText(approvedAs)) });
     } else {
-      yield activity({ id, title, status: 'running' });
+      yield activity({ ...named, status: 'running' });
     }
 
     try {
-      const { result, summary } = await prepared.execute(signal);
-      yield activity({ id, title, status: 'done', detail: [summary, detail].filter(Boolean).join(' · ') || undefined, approval: approval && {
+      const { result, summary, summaryI18n } = await prepared.execute(signal);
+      const detail = doneDetail(lang, summary, summaryI18n, approvedAs);
+      yield activity({ ...named, status: 'done', ...detail, approval: approval && {
         kind: approval.kind, preview: approval.preview, canShowDiff: false, hostOnly: approval.hostOnly,
       } });
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      yield activity({ id, title, status: 'error', detail: message });
-      return `Erreur : ${message}`;
+      yield activity({ ...named, status: 'error', ...errorDetail(err) });
+      return `Error: ${message}`;
     }
   }
+}
+
+type ApprovedKind = 'granted' | 'approvedSession' | 'approved';
+
+function approvalText(approved: { kind: ApprovedKind; by: string }): I18nText {
+  return approved.kind === 'granted' ? roomText('tool.granted') : roomText(`tool.${approved.kind}`, { by: approved.by });
+}
+
+/**
+ * Détail d'une action terminée : résumé de l'outil, suivi de la décision de validation.
+ * Les clés composées « <clé du résumé>.<décision> » existent pour les résumés des outils
+ * validés (voir src/i18n/room.ts) ; sinon, texte brut dans la langue de l'hôte.
+ */
+function doneDetail(
+  lang: Lang,
+  summary: string | undefined,
+  summaryI18n: I18nText | undefined,
+  approved: { kind: ApprovedKind; by: string } | undefined,
+): Pick<ToolActivity, 'detail' | 'detailI18n'> {
+  let text: I18nText | undefined;
+  if (!approved) {
+    text = summaryI18n ?? (summary ? roomText('tool.summary.raw', { text: summary }) : undefined);
+  } else if (!summary && !summaryI18n) {
+    text = approvalText(approved);
+  } else {
+    const base = summaryI18n ?? roomText('tool.summary.raw', { text: summary! });
+    const combined = `${base.key}.${approved.kind}`;
+    const params: Params = { ...base.params, ...(approved.by ? { by: approved.by } : {}) };
+    if (isRoomKey(combined)) {
+      text = { key: combined, params };
+    } else {
+      const plain = [renderRoomText(lang, base), renderRoomText(lang, approvalText(approved))].join(' · ');
+      return { detail: plain };
+    }
+  }
+  return text ? { detail: renderRoomText(lang, text), detailI18n: text } : {};
 }
 
 function isAutoRoutingError(err: unknown): boolean {
@@ -239,7 +293,7 @@ export function defaultModelId(models: ModelInfo[]): string | null {
 async function selectById(id: string): Promise<vscode.LanguageModelChat> {
   const [model] = await vscode.lm.selectChatModels({ vendor: 'copilot', id });
   if (!model) {
-    throw new Error("Le modèle choisi n'est plus disponible chez l'hôte. Choisissez-en un autre.");
+    throw new I18nError('model.error.gone');
   }
   return model;
 }
@@ -253,29 +307,22 @@ async function selectModel(): Promise<vscode.LanguageModelChat> {
   if (family) {
     const available = await vscode.lm.selectChatModels({ vendor: 'copilot' });
     const families = [...new Set(available.map((m) => m.family))].join(', ');
-    throw new Error(
-      `Aucun modèle Copilot de la famille « ${family} ». ` +
-        (families ? `Familles disponibles : ${families}.` : 'Aucun modèle Copilot disponible.'),
-    );
+    throw families ? new I18nError('model.error.noFamily', { family, families }) : new I18nError('model.error.noFamilyNone', { family });
   }
-  throw new Error(
-    "Aucun modèle Copilot disponible chez l'hôte. Vérifiez que GitHub Copilot Chat est installé et connecté.",
-  );
+  throw new I18nError('model.error.none');
 }
 
 function toReadableError(err: unknown): Error {
   if (err instanceof vscode.LanguageModelError) {
     switch (err.code) {
       case vscode.LanguageModelError.NoPermissions().code:
-        return new Error(
-          "L'hôte n'a pas autorisé Prompt Share à utiliser les modèles Copilot (consentement refusé ou en attente dans VS Code).",
-        );
+        return new I18nError('model.error.noPermissions');
       case vscode.LanguageModelError.Blocked().code:
-        return new Error('Requête bloquée par Copilot (quota atteint ou limite de débit). Réessayez plus tard.');
+        return new I18nError('model.error.blocked');
       case vscode.LanguageModelError.NotFound().code:
-        return new Error("Le modèle Copilot demandé n'existe plus.");
+        return new I18nError('model.error.notFound');
     }
-    return new Error(`Erreur du modèle : ${err.message}`);
+    return new I18nError('model.error.other', { message: err.message });
   }
   return err instanceof Error ? err : new Error(String(err));
 }

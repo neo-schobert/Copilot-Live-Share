@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
+import { t, uiLang } from './i18n/vscode';
 import { inspectWsl, installBubblewrapInWsl, sandboxRuntime, windowsToWsl, WslInfo } from './sandbox';
 
 /**
@@ -71,31 +72,27 @@ async function windowsSetup(
   }
   const distro = config().get<string>('wslDistro', '').trim();
   let info = await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: 'Prompt Share : recherche de WSL…' },
-    () => inspectWsl(distro, config().get<string[]>('sandboxReadOnlyPaths', [])),
+    { location: vscode.ProgressLocation.Notification, title: t('wsl.progress.searching') },
+    () => inspectWsl(distro, config().get<string[]>('sandboxReadOnlyPaths', []), undefined, uiLang()),
   );
   log(`WSL : ${info.status}${info.distro ? `, distribution ${info.distro}` : ''}, montage ${info.mountRoot} — ${info.detail}`);
   if (info.status === 'absent') {
     return { outcome: 'continue', redetect: false };
   }
   if (info.status === 'bubblewrapFails') {
-    void vscode.window.showWarningMessage(`Prompt Share : ${info.detail} En attendant, chaque commande de l'agent devra être validée par vous.`);
+    void vscode.window.showWarningMessage(t('wsl.bubblewrapFails', { detail: info.detail }));
     return { outcome: 'continue', redetect: false };
   }
 
   let choice: 'reopen' | 'windows' = mode === 'reopen' ? 'reopen' : 'windows';
   if (mode === 'ask') {
-    const reopen = 'Rouvrir dans WSL';
-    const stay = 'Rester sous Windows';
+    const reopen = t('wsl.reopen.button');
+    const stay = t('wsl.stay.button');
     const answer = await vscode.window.showInformationMessage(
-      `Prompt Share : WSL est installé${info.distro ? ` (${info.distro})` : ''}. Rouvrir le projet dans WSL ?`,
+      info.distro ? t('wsl.reopen.messageDistro', { distro: info.distro }) : t('wsl.reopen.message'),
       {
         modal: true,
-        detail:
-          "Dans WSL, l'agent fonctionne exactement comme sous Linux : commandes isolées dans un bac à sable, outils Linux du projet. " +
-          "Sous Windows, les commandes isolées passent aussi par WSL, et les autres s'exécutent avec PowerShell.\n\n" +
-          (info.status === 'noBubblewrap' ? "bubblewrap (bac à sable) n'est pas encore installé dans la distribution : il vous sera proposé de l'installer.\n\n" : '') +
-          'Le paramètre « promptShare.wslMode » permet de ne plus poser la question.',
+        detail: t(info.status === 'noBubblewrap' ? 'wsl.reopen.detailNoBubblewrap' : 'wsl.reopen.detail'),
       },
       reopen,
       stay,
@@ -111,7 +108,7 @@ async function windowsSetup(
   if (info.status === 'noBubblewrap') {
     const installed = await offerWslBubblewrap(info, log);
     if (installed) {
-      info = await inspectWsl(distro, config().get<string[]>('sandboxReadOnlyPaths', []));
+      info = await inspectWsl(distro, config().get<string[]>('sandboxReadOnlyPaths', []), undefined, uiLang());
       log(info.detail);
       redetect = true;
     }
@@ -128,15 +125,12 @@ async function windowsSetup(
 }
 
 async function offerWslBubblewrap(info: WslInfo, log: (m: string) => void): Promise<boolean> {
-  const install = 'Installer';
+  const install = t('wsl.bubblewrap.install');
   const answer = await vscode.window.showWarningMessage(
-    `Prompt Share : installer bubblewrap dans ${info.distro || 'WSL'} ?`,
+    t('wsl.bubblewrap.message', { distro: info.distro || 'WSL' }),
     {
       modal: true,
-      detail:
-        "bubblewrap isole les commandes de l'agent (projet seul, sans réseau ni dossier personnel). " +
-        'Il sera installé avec le gestionnaire de paquets de la distribution, en root (wsl -u root). ' +
-        "Sans lui, chaque commande de l'agent devra être validée par vous.",
+      detail: t('wsl.bubblewrap.detail'),
     },
     install,
   );
@@ -145,13 +139,13 @@ async function offerWslBubblewrap(info: WslInfo, log: (m: string) => void): Prom
     return false;
   }
   const ok = await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `Prompt Share : installation de bubblewrap dans ${info.distro || 'WSL'}…` },
+    { location: vscode.ProgressLocation.Notification, title: t('wsl.bubblewrap.progress', { distro: info.distro || 'WSL' }) },
     () => installBubblewrapInWsl(info.distro, log),
   );
   if (ok) {
-    void vscode.window.showInformationMessage('Prompt Share : bubblewrap installé, les commandes de l’agent seront isolées.');
+    void vscode.window.showInformationMessage(t('wsl.bubblewrap.installed'));
   } else {
-    void vscode.window.showErrorMessage("Prompt Share : l'installation de bubblewrap a échoué (détails dans le canal de sortie « Prompt Share »).");
+    void vscode.window.showErrorMessage(t('wsl.bubblewrap.failed'));
   }
   return ok;
 }
@@ -164,10 +158,7 @@ async function reopenInWsl(
   log: (m: string) => void,
 ): Promise<boolean> {
   if (context.extensionMode === vscode.ExtensionMode.Development) {
-    void vscode.window.showWarningMessage(
-      "Prompt Share : en mode développement (F5), l'extension ne peut pas suivre le projet dans WSL. " +
-        'Ouvrez le dossier avec « WSL: Connect to WSL » puis relancez F5 depuis cette fenêtre. La session démarre sous Windows.',
-    );
+    void vscode.window.showWarningMessage(t('wsl.devMode'));
     return false;
   }
   const wslPath = windowsToWsl(folder.uri.fsPath, info.mountRoot, info.distro);
@@ -177,9 +168,9 @@ async function reopenInWsl(
   }
 
   if (!vscode.extensions.getExtension(WSL_EXTENSION)) {
-    const install = "Installer l'extension WSL";
+    const install = t('wsl.extension.install');
     const answer = await vscode.window.showInformationMessage(
-      "Prompt Share : l'extension « WSL » de VS Code (Microsoft) est nécessaire pour rouvrir le projet dans WSL.",
+      t('wsl.extension.required'),
       { modal: true },
       install,
     );
@@ -191,7 +182,7 @@ async function reopenInWsl(
       await vscode.commands.executeCommand('workbench.extensions.installExtension', WSL_EXTENSION);
     } catch (err) {
       log(`Échec de l'installation de l'extension WSL : ${String(err)}`);
-      void vscode.window.showErrorMessage("Prompt Share : impossible d'installer l'extension WSL. La session démarre sous Windows.");
+      void vscode.window.showErrorMessage(t('wsl.extension.failed'));
       return false;
     }
   }
@@ -234,10 +225,10 @@ function offerLinuxBubblewrap(log: (m: string) => void): void {
     log('bubblewrap absent et gestionnaire de paquets non reconnu : installez bubblewrap pour isoler les commandes.');
     return;
   }
-  const install = 'Installer dans un terminal';
+  const install = t('linux.bubblewrap.install');
   void vscode.window
     .showWarningMessage(
-      "Prompt Share : bubblewrap n'est pas installé, les commandes de l'agent ne peuvent pas être isolées (chacune devra être validée par vous).",
+      t('linux.bubblewrap.missing'),
       install,
     )
     .then((answer) => {
@@ -247,8 +238,6 @@ function offerLinuxBubblewrap(log: (m: string) => void): void {
       const terminal = vscode.window.createTerminal({ name: 'Prompt Share — bubblewrap' });
       terminal.show();
       terminal.sendText(command);
-      void vscode.window.showInformationMessage(
-        "Prompt Share : une fois l'installation terminée, arrêtez puis redémarrez la session pour activer le bac à sable.",
-      );
+      void vscode.window.showInformationMessage(t('linux.bubblewrap.restart'));
     });
 }

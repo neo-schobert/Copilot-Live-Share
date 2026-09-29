@@ -5,6 +5,8 @@ import * as vscode from 'vscode';
 import { PROPOSAL_SCHEME, ProposalContentProvider, WorkspaceTools } from './agentTools';
 import type { ApprovalDecision, ServerMessage, SessionPolicy, TunnelState } from './protocol';
 import { NotificationLevel, SessionNotifier } from './notifications';
+import { languagePreference, t, uiLang } from './i18n/vscode';
+import { conversationTitle } from './i18n/extension';
 import { ChatRoom, InviteResult, LOCAL_HOST_CLIENT_ID, PendingQuestion } from './chatRoom';
 import { CopilotBackend, defaultModelId, listCopilotModels } from './copilotBackend';
 import { ChatController, ChatViewProvider, ConnectionTarget, inviteTarget, ViewState } from './chatView';
@@ -43,7 +45,7 @@ class Session {
     this.tunnel = undefined;
     this.nativeChat?.dispose();
     this.nativeChat = undefined;
-    this.room.dispose("L'hôte a arrêté la session.");
+    this.room.dispose(t('session.stoppedByHost'));
     await this.server.stop('Session ended');
   }
 }
@@ -107,7 +109,7 @@ export interface PromptShareApi {
 export function activate(context: vscode.ExtensionContext): PromptShareApi {
   output = vscode.window.createOutputChannel('Prompt Share');
   proposals = new ProposalContentProvider();
-  tools = new WorkspaceTools(proposals, output);
+  tools = new WorkspaceTools(proposals, output, uiLang);
   sandboxReady = tools.initSandbox(log);
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'promptShare.openChat';
@@ -166,29 +168,33 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
     // Commandes internes, utilisées par les boutons du chat natif.
     vscode.commands.registerCommand('promptShare.resolveApproval', (entryId: string, toolId: string, decision: ApprovalDecision) => {
       if (!session?.room.resolveApproval(entryId, toolId, decision, hostName())) {
-        void vscode.window.showInformationMessage("Prompt Share : cette action n'attend plus de validation.");
+        void vscode.window.showInformationMessage(t('info.approvalGone'));
       }
     }),
     vscode.commands.registerCommand('promptShare.reviewQuestion', (entryId: string, accept: boolean) => {
       if (!session?.room.reviewQuestion(entryId, accept, hostName())) {
-        void vscode.window.showInformationMessage("Prompt Share : cette question n'attend plus votre accord.");
+        void vscode.window.showInformationMessage(t('info.reviewGone'));
       }
     }),
     vscode.commands.registerCommand('promptShare.showDiff', async (toolId: string) => {
       if (!(await tools.showDiff(toolId))) {
-        void vscode.window.showInformationMessage("Prompt Share : cette modification n'est plus en attente.");
+        void vscode.window.showInformationMessage(t('info.diffGone'));
       }
     }),
     vscode.commands.registerCommand('promptShare.answerQuestion', async (entryId: string, toolId: string, text?: string) => {
-      const answer = text ?? (await vscode.window.showInputBox({ title: "Réponse à l'agent", ignoreFocusOut: true }));
+      const answer = text ?? (await vscode.window.showInputBox({ title: t('notify.answerAgent.title'), ignoreFocusOut: true }));
       if (answer && !session?.room.answerQuestion(entryId, toolId, answer, hostName())) {
-        void vscode.window.showInformationMessage("Prompt Share : cette question n'attend plus de réponse.");
+        void vscode.window.showInformationMessage(t('info.questionGone'));
       }
     }),
     vscode.lm.onDidChangeChatModels(() => void refreshModels()),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration(`${CONFIG}.modelFamily`) || e.affectsConfiguration(`${CONFIG}.allowGuestModelChoice`)) {
         void refreshModels();
+      }
+      if (e.affectsConfiguration(`${CONFIG}.language`)) {
+        chatView?.postState();
+        updateStatusBar();
       }
       if (e.affectsConfiguration(`${CONFIG}.reviewGuestQuestions`) || e.affectsConfiguration(`${CONFIG}.guestQuestionsPerHour`)) {
         session?.room.broadcastPolicy();
@@ -240,31 +246,31 @@ export async function deactivate(): Promise<void> {
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
   if (session) {
-    void showSessionNotification(session, 'Une session est déjà en cours');
+    void showSessionNotification(session, true);
     return;
   }
   if (starting) {
-    void vscode.window.showInformationMessage('Prompt Share : démarrage de la session déjà en cours…');
+    void vscode.window.showInformationMessage(t('session.alreadyStarting'));
     return;
   }
   if (!(await acknowledgeHostNotice(context))) {
-    setViewStatus('Démarrage annulé.');
+    setViewStatus(t('view.status.cancelled'));
     return;
   }
   starting = true;
-  setViewStatus('Démarrage de la session…');
+  setViewStatus(t('view.status.starting'));
   log(`Start Session : ${describeEnvironment(context)}`);
   try {
     // Windows + WSL : proposition de rouvrir dans WSL, installation de ce qui manque.
     const setup = await prepareEnvironment(context, log);
     log(`Préparation de l'environnement : ${setup.outcome}${setup.redetect ? ' (nouvelle détection du bac à sable)' : ''}`);
     if (setup.outcome === 'cancelled') {
-      setViewStatus('Démarrage annulé.');
-      void vscode.window.showInformationMessage('Prompt Share : démarrage de la session annulé.');
+      setViewStatus(t('view.status.cancelled'));
+      void vscode.window.showInformationMessage(t('session.startCancelled'));
       return;
     }
     if (setup.outcome === 'reopening') {
-      setViewStatus('Réouverture du projet dans WSL…');
+      setViewStatus(t('view.status.reopeningWsl'));
       return;
     }
     // Bac à sable absent jusqu'ici (ex. bubblewrap installé entre-temps) : nouvelle détection.
@@ -274,12 +280,12 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     await createSession(context);
     const started = session as Session | undefined; // modifiée par createSession
     log(started ? `Session démarrée sur ${started.localUrl}` : 'Session non démarrée.');
-    setViewStatus(started ? undefined : 'La session n’a pas pu démarrer (détails dans le canal de sortie « Prompt Share »).', !started);
+    setViewStatus(started ? undefined : t('view.status.startFailed'), !started);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Erreur au démarrage de la session : ${err instanceof Error && err.stack ? err.stack : message}`);
-    setViewStatus(`Impossible de démarrer la session : ${message}`, true);
-    void showError(`impossible de démarrer la session (${message}).`);
+    setViewStatus(t('view.status.startError', { error: message }), true);
+    void showError(t('session.startError', { error: message }));
   } finally {
     starting = false;
     chatView?.postState();
@@ -304,25 +310,23 @@ async function acknowledgeHostNotice(context: vscode.ExtensionContext): Promise<
   }
   const { reviewGuestQuestions, guestQuestionsPerHour } = sessionPolicy();
   const safeguards = [
-    reviewGuestQuestions ? 'vous validez chaque question d’invité avant son envoi au modèle' : undefined,
-    guestQuestionsPerHour > 0 ? `les invités sont limités à ${guestQuestionsPerHour} questions par heure` : undefined,
+    reviewGuestQuestions ? t('notice.safeguard.review') : undefined,
+    guestQuestionsPerHour > 0 ? t('notice.safeguard.rate', { count: guestQuestionsPerHour }) : undefined,
   ].filter(Boolean);
-  const accept = 'J’ai compris, héberger';
-  const terms = 'Conditions de GitHub';
+  const accept = t('notice.accept');
+  const terms = t('notice.terms');
   for (;;) {
     const choice = await vscode.window.showWarningMessage(
-      'Prompt Share : avant d’héberger une session',
+      t('notice.title'),
       {
         modal: true,
         detail: [
-          '• Les questions des invités sont envoyées aux modèles GitHub Copilot avec votre compte et comptent dans votre quota, requêtes premium comprises.',
-          '• Vous restez responsable de l’usage de votre compte. Les conditions de GitHub réservent un compte à une seule personne et interdisent d’exploiter ou de revendre l’accès au service. Hébergez des sessions de travail avec des personnes de confiance, en restant présent : Prompt Share n’est pas un moyen de partager un abonnement.',
-          safeguards.length
-            ? `• Protections actives : ${safeguards.join(' ; ')} (réglages « promptShare »).`
-            : '• Attention : vous avez désactivé la validation des questions et la limite horaire (réglages « promptShare »).',
-          '• Par l’agent, les invités peuvent lire le projet ouvert (sauf les fichiers protégés : .env, clés, .git…). Ne donnez le lien d’invitation qu’aux personnes concernées.',
+          t('notice.quota'),
+          t('notice.responsibility'),
+          safeguards.length ? t('notice.safeguards', { list: safeguards.join(t('notice.safeguards.separator')) }) : t('notice.noSafeguards'),
+          t('notice.projectAccess'),
           '',
-          'Prompt Share est un projet indépendant, non affilié à GitHub ni à Microsoft.',
+          t('notice.independent'),
         ].join('\n'),
       },
       accept,
@@ -361,8 +365,8 @@ async function hostSession(context: vscode.ExtensionContext): Promise<void> {
 /** Rejoindre depuis la palette : demande le lien puis ouvre le chat. */
 async function joinFromCommand(): Promise<void> {
   const link = await vscode.window.showInputBox({
-    title: 'Rejoindre une session Prompt Share',
-    prompt: "Collez le lien d'invitation reçu de l'hôte.",
+    title: t('join.title'),
+    prompt: t('join.prompt'),
     placeHolder: 'https://xxxx.ngrok-free.app/?token=…',
     ignoreFocusOut: true,
   });
@@ -374,7 +378,7 @@ async function joinFromCommand(): Promise<void> {
 
 async function joinSession(name: string, link: string): Promise<void> {
   if (session) {
-    setViewStatus('Vous hébergez déjà une session : arrêtez-la avant d’en rejoindre une autre.', true);
+    setViewStatus(t('join.alreadyHosting'), true);
     return;
   }
   const target = inviteTarget(link);
@@ -397,8 +401,13 @@ function viewController(context: vscode.ExtensionContext): ChatController {
       mode: session ? 'host' : guest ? 'guest' : 'idle',
       name: hostName(),
       busy: starting,
+      lang: uiLang(),
+      langPreference: languagePreference(),
       ...viewStatus,
     }),
+    setLanguage: async (preference) => {
+      await vscode.workspace.getConfiguration(CONFIG).update('language', preference, vscode.ConfigurationTarget.Global);
+    },
     connectionTarget: () =>
       session
         ? { url: `ws://127.0.0.1:${session.server.port}/ws?token=${encodeURIComponent(session.hostToken)}`, headers: {} }
@@ -421,10 +430,10 @@ function viewController(context: vscode.ExtensionContext): ChatController {
         return;
       }
       if (session && !ended) {
-        const stop = 'Arrêter la session';
+        const stop = t('stop.button');
         const answer = await vscode.window.showWarningMessage(
-          'Arrêter la session partagée ?',
-          { modal: true, detail: 'Tous les participants seront déconnectés et l’historique sera perdu.' },
+          t('stop.confirm'),
+          { modal: true, detail: t('stop.detail') },
           stop,
         );
         if (answer !== stop) {
@@ -464,8 +473,8 @@ function describeEnvironment(context: vscode.ExtensionContext): string {
 
 /** Message d'erreur avec accès direct au journal. */
 async function showError(message: string): Promise<void> {
-  const logs = 'Voir le journal';
-  if ((await vscode.window.showErrorMessage(`Prompt Share : ${message}`, logs)) === logs) {
+  const logs = t('button.showLog');
+  if ((await vscode.window.showErrorMessage(t('error.prefixed', { message }), logs)) === logs) {
     output.show(true);
   }
 }
@@ -487,7 +496,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
       fs.readFile(file('dist', 'web', 'codicon.css')),
     ]);
   } catch (err) {
-    void vscode.window.showErrorMessage(`Prompt Share : fichiers de la page introuvables (${String(err)}). Lancez « npm run compile ».`);
+    void vscode.window.showErrorMessage(t('server.assetsMissing', { error: String(err) }));
     return;
   }
 
@@ -502,6 +511,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     onShowDiff: (_entryId, toolId) => void tools.showDiff(toolId),
     onInviteRequested: inviteFromChat,
     policy: sessionPolicy,
+    defaultLang: uiLang,
     onTunnelRequested: (provider) => startTunnel(provider),
     onSessionOption: (option, value) => {
       // Réglage utilisateur : la diffusion suit (onDidChangeConfiguration).
@@ -517,7 +527,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
         stopTunnel(session);
       }
     },
-    appRefusal: (p: number): string | undefined => (p === server.port ? 'C’est le port de la session elle-même : il est déjà partagé par le lien d’invitation.' : undefined),
+    appRefusal: (p: number) => (p === server.port ? { key: 'error.appSessionPort' } : undefined),
     onAppsChanged: (apps) => server.closeRelays((p: number) => !apps.some((a) => a.port === p)),
   });
   notifier.reset();
@@ -542,11 +552,9 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     await server.start();
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    const detail =
-      code === 'EADDRINUSE'
-        ? `le port ${port} est déjà utilisé. Changez le paramètre « promptShare.port ».`
-        : String(err);
-    void vscode.window.showErrorMessage(`Prompt Share : impossible de démarrer le serveur, ${detail}`);
+    void vscode.window.showErrorMessage(
+      code === 'EADDRINUSE' ? t('server.portInUse', { port }) : t('server.startFailed', { error: String(err) }),
+    );
     return;
   }
 
@@ -562,7 +570,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
   updateStatusBar(0);
   chatView?.postState();
   void refreshModels();
-  void showSessionNotification(session, 'Session démarrée');
+  void showSessionNotification(session, false);
 }
 
 /** Question de l'agent posée à l'hôte depuis le chat natif : réponse dans VS Code. */
@@ -571,11 +579,11 @@ async function askLocalHost(pending: PendingQuestion): Promise<void> {
   if (tool.question.requesterClientId !== LOCAL_HOST_CLIENT_ID) {
     return; // Question née d'une demande web : les participants répondent depuis la page.
   }
-  const free = '$(edit) Autre réponse…';
+  const free = `$(edit) ${t('agentQuestion.other')}`;
   let answer: string | undefined;
   if (tool.question.options.length) {
     const picked = await vscode.window.showQuickPick([...tool.question.options, free], {
-      title: `Prompt Share — question de l'agent`,
+      title: t('agentQuestion.title'),
       placeHolder: tool.question.text,
       ignoreFocusOut: true,
     });
@@ -584,7 +592,7 @@ async function askLocalHost(pending: PendingQuestion): Promise<void> {
       return;
     }
   }
-  answer ??= await vscode.window.showInputBox({ title: "Prompt Share — question de l'agent", prompt: tool.question.text, ignoreFocusOut: true });
+  answer ??= await vscode.window.showInputBox({ title: t('agentQuestion.title'), prompt: tool.question.text, ignoreFocusOut: true });
   if (answer) {
     session?.room.answerQuestion(entryId, tool.id, answer, hostName());
   }
@@ -615,9 +623,7 @@ async function refreshModels(): Promise<void> {
 async function selectDefaultModel(): Promise<void> {
   const models = await listCopilotModels();
   if (!models.length) {
-    void vscode.window.showErrorMessage(
-      'Prompt Share : aucun modèle Copilot disponible. Vérifiez que GitHub Copilot Chat est installé et connecté.',
-    );
+    void vscode.window.showErrorMessage(t('model.none'));
     return;
   }
   const currentId = defaultModelId(models);
@@ -627,7 +633,7 @@ async function selectDefaultModel(): Promise<void> {
       description: m.family,
       model: m,
     })),
-    { title: 'Modèle par défaut de la session partagée', placeHolder: 'Utilisé quand un participant ne choisit pas de modèle' },
+    { title: t('model.pick.title'), placeHolder: t('model.pick.placeholder') },
   );
   if (!picked) {
     return;
@@ -639,14 +645,14 @@ async function selectDefaultModel(): Promise<void> {
       ? vscode.ConfigurationTarget.Workspace
       : vscode.ConfigurationTarget.Global;
   await config.update('modelFamily', picked.model.family, target);
-  vscode.window.setStatusBarMessage(`Prompt Share : modèle par défaut → ${picked.model.name}`, 3000);
+  vscode.window.setStatusBarMessage(t('model.changed', { name: picked.model.name }), 3000);
 }
 
-async function showSessionNotification(s: Session, title: string): Promise<void> {
-  const copy = "Copier le lien d'invitation";
-  const open = 'Ouvrir le chat';
+async function showSessionNotification(s: Session, alreadyRunning: boolean): Promise<void> {
+  const copy = t('invite.copy.button');
+  const open = t('button.openChat');
   const choice = await vscode.window.showInformationMessage(
-    `Prompt Share : ${title} sur ${s.localUrl}. Pour inviter, exposez ce port avec un tunnel puis utilisez « Inviter » dans le chat.`,
+    t(alreadyRunning ? 'session.alreadyRunning' : 'session.started', { url: s.localUrl }),
     copy,
     open,
   );
@@ -659,11 +665,11 @@ async function showSessionNotification(s: Session, title: string): Promise<void>
 
 async function copyInviteLink(s: Session): Promise<void> {
   const input = await vscode.window.showInputBox({
-    title: "Lien d'invitation",
-    prompt: `URL publique du tunnel vers le port ${s.server.port} (ngrok, port forwarding VS Code…). Laissez l'URL locale pour tester sur cette machine.`,
+    title: t('invite.title'),
+    prompt: t('invite.prompt', { port: s.server.port }),
     value: s.publicUrl ?? s.localUrl,
     ignoreFocusOut: true,
-    validateInput: (v) => (parseHttpUrl(v) ? undefined : 'URL http(s) invalide'),
+    validateInput: (v) => (parseHttpUrl(v) ? undefined : t('invite.invalidUrl')),
   });
   if (input === undefined) {
     return;
@@ -674,7 +680,7 @@ async function copyInviteLink(s: Session): Promise<void> {
   }
   s.publicUrl = input.trim();
   await vscode.env.clipboard.writeText(link);
-  void vscode.window.showInformationMessage("Prompt Share : lien d'invitation copié. Toute personne qui l'a peut rejoindre le chat.");
+  void vscode.window.showInformationMessage(t('invite.copied'));
 }
 
 /** Lien d'invitation pour une URL de base (tunnel ou locale), ou undefined si l'URL est invalide. */
@@ -694,7 +700,7 @@ function inviteLink(s: Session, base: string): string | undefined {
 async function inviteFromChat(publicUrl: string | undefined, copy: boolean): Promise<InviteResult> {
   const s = session;
   if (!s) {
-    return { publicUrl: '', localUrl: '', copied: false, error: 'Aucune session en cours.' };
+    return { publicUrl: '', localUrl: '', copied: false, error: t('session.noneRunning') };
   }
   const base = publicUrl?.trim() || s.publicUrl || '';
   const result: InviteResult = { publicUrl: base, localUrl: s.localUrl, copied: false };
@@ -709,7 +715,7 @@ async function inviteFromChat(publicUrl: string | undefined, copy: boolean): Pro
   }
   const link = inviteLink(s, base);
   if (!link) {
-    return { ...result, error: 'URL invalide : collez une adresse http(s), par exemple https://xxxx.ngrok-free.app' };
+    return { ...result, error: t('invite.invalidUrlExample') };
   }
   result.link = link;
   if (copy) {
@@ -738,7 +744,7 @@ function setTunnelState(s: Session, state: Omit<TunnelState, 'provider'> & { pro
 async function startTunnel(requested?: TunnelProvider): Promise<InviteResult> {
   const s = session;
   if (!s) {
-    return { publicUrl: '', localUrl: '', copied: false, error: 'Aucune session en cours.' };
+    return { publicUrl: '', localUrl: '', copied: false, error: t('session.noneRunning') };
   }
   const provider = requested ?? preferredTunnel();
   if (provider !== preferredTunnel()) {
@@ -749,7 +755,7 @@ async function startTunnel(requested?: TunnelProvider): Promise<InviteResult> {
     return { ...(await inviteFromChat(s.tunnel.url, true)), tunnel: TunnelManager.label(provider) };
   }
   if (s.tunnelState.status === 'starting') {
-    return { publicUrl: '', localUrl: s.localUrl, copied: false, error: 'Ouverture du tunnel déjà en cours.' };
+    return { publicUrl: '', localUrl: s.localUrl, copied: false, error: t('tunnel.alreadyStarting') };
   }
   if (s.tunnel) {
     stopTunnel(s, false); // Changement de service.
@@ -759,16 +765,16 @@ async function startTunnel(requested?: TunnelProvider): Promise<InviteResult> {
     const tunnel = await openTunnelWithFallback(s, provider);
     if (session !== s) {
       tunnel?.stop();
-      return { publicUrl: '', localUrl: '', copied: false, error: 'La session est terminée.' };
+      return { publicUrl: '', localUrl: '', copied: false, error: t('session.ended') };
     }
     if (!tunnel) {
       setTunnelState(s, { status: 'off', provider });
-      return { publicUrl: '', localUrl: s.localUrl, copied: false, error: 'Ouverture du tunnel annulée.' };
+      return { publicUrl: '', localUrl: s.localUrl, copied: false, error: t('tunnel.cancelled') };
     }
     s.tunnel = tunnel;
     setTunnelState(s, { status: 'on', provider: tunnel.provider, url: tunnel.url, since: Date.now() });
     const label = TunnelManager.label(tunnel.provider);
-    void vscode.window.showInformationMessage(`Prompt Share : tunnel ${label} ouvert, lien d'invitation copié.`);
+    void vscode.window.showInformationMessage(t('tunnel.opened', { provider: label }));
     return { ...(await inviteFromChat(tunnel.url, true)), tunnel: label };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -776,8 +782,8 @@ async function startTunnel(requested?: TunnelProvider): Promise<InviteResult> {
     if (session === s) {
       setTunnelState(s, { status: 'error', provider, error: message });
     }
-    void showError(`impossible d'ouvrir le tunnel : ${message}`);
-    return { publicUrl: '', localUrl: s.localUrl, copied: false, error: `Tunnel impossible : ${message}` };
+    void showError(t('tunnel.openError', { error: message }));
+    return { publicUrl: '', localUrl: s.localUrl, copied: false, error: t('tunnel.failed', { error: message }) };
   }
 }
 
@@ -790,15 +796,12 @@ async function openTunnelWithFallback(s: Session, provider: TunnelProvider): Pro
     const other: TunnelProvider = provider === 'cloudflare' ? 'ngrok' : 'cloudflare';
     const reason = err instanceof Error ? err.message : String(err);
     log(`Tunnel ${provider} impossible : ${reason}`);
-    const tryOther = `Essayer ${TunnelManager.label(other)}`;
-    const hint =
-      err instanceof TunnelUnreachableError
-        ? 'Le réseau bloque probablement le port 7844 utilisé par Cloudflare (pare-feu d’entreprise ou d’école). ngrok passe par le port 443, comme un site web, mais demande un compte gratuit.'
-        : provider === 'ngrok'
-          ? 'Cloudflare ne demande pas de compte, mais passe par le port 7844, parfois bloqué par les réseaux d’entreprise.'
-          : 'ngrok passe par le port 443, comme un site web, mais demande un compte gratuit.';
+    const tryOther = t('tunnel.tryOther', { provider: TunnelManager.label(other) });
+    const hint = t(
+      err instanceof TunnelUnreachableError ? 'tunnel.hint.blocked' : provider === 'ngrok' ? 'tunnel.hint.cloudflare' : 'tunnel.hint.ngrok',
+    );
     const choice = await vscode.window.showWarningMessage(
-      `Prompt Share : impossible d'ouvrir le tunnel ${TunnelManager.label(provider)}.`,
+      t('tunnel.openFailed', { provider: TunnelManager.label(provider) }),
       { modal: true, detail: `${reason}\n\n${hint}` },
       tryOther,
     );
@@ -824,7 +827,7 @@ function stopTunnel(s: Session, notify = true): void {
   log(`Tunnel ${tunnel.provider} fermé par l'hôte.`);
   setTunnelState(s, { status: 'off', provider: tunnel.provider });
   if (notify) {
-    void vscode.window.showInformationMessage(`Prompt Share : tunnel ${TunnelManager.label(tunnel.provider)} fermé.`);
+    void vscode.window.showInformationMessage(t('tunnel.closed', { provider: TunnelManager.label(tunnel.provider) }));
   }
 }
 
@@ -841,10 +844,10 @@ async function onTunnelExit(s: Session, reason: string): Promise<void> {
   if (session !== s) {
     return;
   }
-  setTunnelState(s, { status: 'error', provider: tunnel.provider, error: `arrêté : ${reason}` });
-  const retry = 'Rouvrir le tunnel';
+  setTunnelState(s, { status: 'error', provider: tunnel.provider, error: t('tunnel.stoppedReason', { reason }) });
+  const retry = t('tunnel.reopen');
   const choice = await vscode.window.showWarningMessage(
-    `Prompt Share : le tunnel s'est arrêté (${reason}). Les invités à distance ne peuvent plus rejoindre la session.`,
+    t('tunnel.exited', { reason }),
     retry,
   );
   if (choice === retry) {
@@ -856,11 +859,11 @@ async function onTunnelExit(s: Session, reason: string): Promise<void> {
 async function startTunnelCommand(): Promise<void> {
   const preferred = preferredTunnel();
   const items: (vscode.QuickPickItem & { provider: TunnelProvider })[] = [
-    { provider: 'cloudflare', label: '$(cloud) Cloudflare', description: 'sans compte', detail: 'Nouvelle adresse à chaque fois, pas de page d’avertissement. Port 7844, parfois bloqué en entreprise.' },
-    { provider: 'ngrok', label: '$(globe) ngrok', description: 'compte gratuit', detail: 'Adresse liée au compte, page d’avertissement dans les navigateurs. Port 443, passe presque partout.' },
+    { provider: 'cloudflare', label: '$(cloud) Cloudflare', description: t('tunnel.pick.cloudflare.description'), detail: t('tunnel.pick.cloudflare.detail') },
+    { provider: 'ngrok', label: '$(globe) ngrok', description: t('tunnel.pick.ngrok.description'), detail: t('tunnel.pick.ngrok.detail') },
   ];
   items.sort((x, y) => (x.provider === preferred ? -1 : y.provider === preferred ? 1 : 0));
-  const picked = await vscode.window.showQuickPick(items, { title: 'Ouvrir un tunnel public', placeHolder: 'Service du tunnel' });
+  const picked = await vscode.window.showQuickPick(items, { title: t('tunnel.pick.title'), placeHolder: t('tunnel.pick.placeholder') });
   if (picked) {
     await startTunnel(picked.provider);
   }
@@ -869,17 +872,17 @@ async function startTunnelCommand(): Promise<void> {
 /** Partage une application locale de l'hôte avec les participants. */
 async function shareAppCommand(s: Session): Promise<void> {
   const port = await vscode.window.showInputBox({
-    title: 'Partager une application locale',
-    prompt: 'Port de l’application (ex. 8080). Les participants l’ouvriront sur localhost, chez eux, tant que le partage est actif.',
-    validateInput: (v) => (/^\d{1,5}$/.test(v.trim()) && +v > 0 && +v < 65536 ? undefined : 'Port invalide (1 à 65535).'),
+    title: t('app.share.title'),
+    prompt: t('app.share.prompt'),
+    validateInput: (v) => (/^\d{1,5}$/.test(v.trim()) && +v > 0 && +v < 65536 ? undefined : t('app.share.invalidPort')),
   });
   if (!port) {
     return;
   }
-  const label = await vscode.window.showInputBox({ title: 'Nom affiché (facultatif)', placeHolder: `localhost:${port.trim()}` });
+  const label = await vscode.window.showInputBox({ title: t('app.share.label'), placeHolder: `localhost:${port.trim()}` });
   const refusal = s.room.shareApp(Number(port), label);
   if (refusal) {
-    void vscode.window.showWarningMessage(`Prompt Share : ${refusal}`);
+    void vscode.window.showWarningMessage(t('error.prefixed', { message: refusal }));
   }
 }
 
@@ -901,7 +904,7 @@ async function openApp(port: number): Promise<void> {
 async function shareSelection(s: Session): Promise<void> {
   const editor = vscode.window.activeTextEditor ?? lastTextEditor;
   if (!editor || editor.document.isClosed) {
-    void vscode.window.showWarningMessage('Prompt Share : aucun éditeur actif à partager.');
+    void vscode.window.showWarningMessage(t('context.noEditor'));
     return;
   }
   const doc = editor.document;
@@ -909,16 +912,17 @@ async function shareSelection(s: Session): Promise<void> {
   const hasSelection = !sel.isEmpty;
   const code = hasSelection ? doc.getText(sel) : doc.getText();
   if (!code.trim()) {
-    void vscode.window.showWarningMessage('Prompt Share : rien à partager (sélection ou fichier vide).');
+    void vscode.window.showWarningMessage(t('context.empty'));
     return;
   }
   if (code.length > LARGE_CONTEXT_CHARS) {
+    const share = t('context.large.share');
     const ok = await vscode.window.showWarningMessage(
-      `Ce contexte fait ${code.length.toLocaleString()} caractères et sera renvoyé au modèle à chaque question. Partager quand même ?`,
+      t('context.large', { count: code.length.toLocaleString(uiLang()) }),
       { modal: true },
-      'Partager',
+      share,
     );
-    if (ok !== 'Partager') {
+    if (ok !== share) {
       return;
     }
   }
@@ -927,7 +931,7 @@ async function shareSelection(s: Session): Promise<void> {
     author: hostName(),
     fileName: vscode.workspace.asRelativePath(doc.uri, false),
     languageId: doc.languageId,
-    range: hasSelection ? `lignes ${sel.start.line + 1}-${endLine}` : undefined,
+    range: hasSelection ? t('context.lines', { start: sel.start.line + 1, end: endLine }) : undefined,
     code,
   };
   const conversationId = await pickTargetConversation(s);
@@ -935,11 +939,11 @@ async function shareSelection(s: Session): Promise<void> {
     return;
   }
   if (!s.room.addContext(conversationId, context)) {
-    void vscode.window.showWarningMessage("Prompt Share : cette discussion n'existe plus.");
+    void vscode.window.showWarningMessage(t('context.conversationGone'));
     return;
   }
-  const title = s.room.conversationList.find((c) => c.id === conversationId)?.title;
-  vscode.window.setStatusBarMessage(`Prompt Share : contexte partagé dans « ${title} »`, 3000);
+  const title = conversationTitle(uiLang(), s.room.conversationList.find((c) => c.id === conversationId)?.title);
+  vscode.window.setStatusBarMessage(t('context.shared', { title }), 3000);
 }
 
 /** Discussion ouverte dans la webview de l'hôte, la seule existante, ou choisie dans une liste. */
@@ -953,15 +957,17 @@ async function pickTargetConversation(s: Session): Promise<string | undefined> {
     return conversations[0].id;
   }
   const picked = await vscode.window.showQuickPick(
-    [...conversations].reverse().map((c) => ({ label: c.title, description: `créée par ${c.createdBy}`, id: c.id })),
-    { title: 'Partager dans quelle discussion ?' },
+    [...conversations]
+      .reverse()
+      .map((c) => ({ label: conversationTitle(uiLang(), c.title), description: t('conversation.createdBy', { name: c.createdBy }), id: c.id })),
+    { title: t('context.pickConversation') },
   );
   return picked?.id;
 }
 
 function cancelResponse(s: Session): void {
   if (!s.room.cancelCurrent()) {
-    void vscode.window.showInformationMessage('Prompt Share : aucune réponse en cours.');
+    void vscode.window.showInformationMessage(t('cancel.none'));
   }
 }
 
@@ -983,8 +989,8 @@ async function stopSession(): Promise<void> {
 function withSession(fn: (s: Session) => unknown): () => Promise<void> {
   return async () => {
     if (!session) {
-      const start = 'Démarrer une session';
-      const choice = await vscode.window.showWarningMessage('Prompt Share : aucune session en cours.', start);
+      const start = t('session.start.button');
+      const choice = await vscode.window.showWarningMessage(t('session.none'), start);
       if (choice === start) {
         await vscode.commands.executeCommand('promptShare.startSession');
       }
@@ -1003,20 +1009,20 @@ function updateStatusBar(participants = participantCount, pending = { count: not
   if (session) {
     const tunnel = session.tunnelState;
     statusBar.text = `$(broadcast) Prompt Share · ${participants}${tunnel.status === 'on' ? ' $(globe)' : tunnel.status === 'starting' ? ' $(sync~spin)' : ''}`;
-    statusBar.tooltip =
-      `Vous hébergez une session (${participants} participant(s)). Cliquer pour ouvrir le chat.` +
-      (tunnel.status === 'on' ? `\nTunnel ${TunnelManager.label(tunnel.provider)} : ${tunnel.url}` : '\nPas de tunnel public : seuls les invités de cette machine peuvent rejoindre.');
+    statusBar.tooltip = `${t(participants === 1 ? 'status.host.tooltip.one' : 'status.host.tooltip.other', { count: participants })}\n${
+      tunnel.status === 'on' ? t('status.host.tunnel', { provider: TunnelManager.label(tunnel.provider), url: tunnel.url ?? '' }) : t('status.host.noTunnel')
+    }`;
   } else if (guest) {
     statusBar.text = '$(plug) Prompt Share';
-    statusBar.tooltip = `Connecté à la session de ${new URL(guest.link).host}. Cliquer pour ouvrir le chat.`;
+    statusBar.tooltip = t('status.guest.tooltip', { host: new URL(guest.link).host });
   } else {
     statusBar.text = '$(comment-discussion) Prompt Share';
-    statusBar.tooltip = 'Héberger ou rejoindre une session Prompt Share';
+    statusBar.tooltip = t('status.idle.tooltip');
   }
   // Décisions en attente : visibles même quand le chat est fermé.
   if ((session || guest) && pending.count) {
     statusBar.text += ` $(bell-dot) ${pending.count}`;
-    statusBar.tooltip += `\nEn attente de votre décision : ${pending.summary || pending.count}.`;
+    statusBar.tooltip += `\n${t('status.pending', { summary: pending.summary || pending.count })}`;
     statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
   } else {
     statusBar.backgroundColor = undefined;
@@ -1083,12 +1089,12 @@ function openConversationTab(conversationId: string): void {
 async function openConversationTabCommand(): Promise<void> {
   const list = conversationsOfSession();
   if (!session && !guest) {
-    void vscode.window.showInformationMessage('Prompt Share : hébergez ou rejoignez d’abord une session.');
+    void vscode.window.showInformationMessage(t('session.hostOrJoinFirst'));
     return;
   }
   const picked = await vscode.window.showQuickPick(
-    list.map((c) => ({ label: c.title, description: `par ${c.createdBy}`, id: c.id })),
-    { title: 'Ouvrir une discussion dans un onglet', placeHolder: 'Discussion' },
+    list.map((c) => ({ label: conversationTitle(uiLang(), c.title), description: t('conversation.by', { name: c.createdBy }), id: c.id })),
+    { title: t('tab.pick.title'), placeHolder: t('tab.pick.placeholder') },
   );
   if (picked) {
     openConversationTab(picked.id);
@@ -1104,9 +1110,9 @@ function hostName(): string {
     return configured;
   }
   try {
-    return os.userInfo().username || 'Hôte';
+    return os.userInfo().username || t('host.defaultName');
   } catch {
-    return 'Hôte';
+    return t('host.defaultName');
   }
 }
 

@@ -56,24 +56,24 @@ export async function run(): Promise<void> {
     }
     ok('search_text : ni le contenu de .env ni celui de .git/config');
 
-    await refused(api, 'read_file', { path: '.env' }, /protégé/, 'read_file .env');
-    await refused(api, 'read_file', { path: '.git/config' }, /protégé/, 'read_file .git/config');
+    await refused(api, 'read_file', { path: '.env' }, /Protected file/, 'read_file .env');
+    await refused(api, 'read_file', { path: '.git/config' }, /Protected file/, 'read_file .git/config');
     const link = (name: string) => fs.lstatSync(path.join(root, name), { throwIfNoEntry: false })?.isSymbolicLink() ?? false;
     if (link('link_env')) {
-      await refused(api, 'read_file', { path: 'link_env' }, /protégé/, 'read_file link_env (lien vers .env)');
+      await refused(api, 'read_file', { path: 'link_env' }, /Protected file/, 'read_file link_env (lien vers .env)');
     }
     if (link('link_out')) {
       const inside = fs.readdirSync(path.join(root, 'link_out'))[0];
-      await refused(api, 'read_file', { path: `link_out/${inside}` }, /hors de l'espace de travail/, `read_file link_out/${inside} (lien vers un dossier système)`);
-      await refused(api, 'list_directory', { path: 'link_out' }, /hors de l'espace de travail/, 'list_directory link_out');
+      await refused(api, 'read_file', { path: `link_out/${inside}` }, /outside the workspace/, `read_file link_out/${inside} (lien vers un dossier système)`);
+      await refused(api, 'list_directory', { path: 'link_out' }, /outside the workspace/, 'list_directory link_out');
     }
-    await refused(api, 'read_file', { path: '../outside.txt' }, /hors de l'espace de travail/, 'read_file ../outside.txt');
+    await refused(api, 'read_file', { path: '../outside.txt' }, /outside the workspace/, 'read_file ../outside.txt');
     const systemFile = process.platform === 'win32' ? `${process.env.SystemRoot ?? 'C:\\Windows'}\\win.ini` : '/etc/hostname';
-    await refused(api, 'read_file', { path: systemFile }, /hors de l'espace de travail/, `read_file ${systemFile}`);
+    await refused(api, 'read_file', { path: systemFile }, /outside the workspace/, `read_file ${systemFile}`);
     if (link('dangling')) {
-      await refused(api, 'create_file', { path: 'dangling', content: 'x' }, /Lien symbolique/, 'create_file sur un lien cassé vers l’extérieur');
+      await refused(api, 'create_file', { path: 'dangling', content: 'x' }, /Symbolic link/, 'create_file sur un lien cassé vers l’extérieur');
     }
-    await refused(api, 'edit_file', { path: '.env', oldText: 'API', newText: 'X' }, /protégé/, 'edit_file .env');
+    await refused(api, 'edit_file', { path: '.env', oldText: 'API', newText: 'X' }, /Protected file/, 'edit_file .env');
     if (fs.existsSync(path.join(OUTSIDE, 'created-through-link.txt'))) throw new Error('fichier créé hors du projet');
 
     const edit = await tools.prepare('edit_file', { path: 'src/a.ts', oldText: 'hello', newText: 'bonjour' });

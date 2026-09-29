@@ -3,6 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AgentQuestion, ApprovalKind, ApprovalRequest } from './protocol';
+import type { I18nText, Lang, Params } from './i18n/core';
+import { I18nError, RoomKey, roomT, roomText } from './i18n/room';
 import { detectSandbox, resetSandbox, sandboxCommand, sandboxRuntime } from './sandbox';
 
 /**
@@ -23,12 +25,40 @@ export interface PreparedApproval extends ApprovalRequest {
 }
 
 export interface PreparedCall {
+  /** Titre dans la langue de l'hôte (repli de `titleI18n`). */
   title: string;
+  titleI18n?: I18nText;
   approval?: PreparedApproval;
   /** Outil interactif : l'agent pose une question au lieu d'agir. */
   question?: Pick<AgentQuestion, 'text' | 'options'>;
-  /** Exécute l'action ; renvoie le résultat pour le modèle et un résumé pour le chat. */
-  execute(signal: AbortSignal): Promise<{ result: string; summary?: string }>;
+  /**
+   * Exécute l'action ; renvoie le résultat pour le modèle (en anglais) et un résumé pour le chat
+   * (`summary` dans la langue de l'hôte, `summaryI18n` à traduire).
+   */
+  execute(signal: AbortSignal): Promise<ToolOutcome>;
+}
+
+export interface ToolOutcome {
+  result: string;
+  summary?: string;
+  summaryI18n?: I18nText;
+}
+
+/** Langue de l'hôte pour les textes de repli (titres, résumés, aperçus) ; anglais par défaut. */
+let hostLang: () => Lang = () => 'en';
+
+function tr(key: RoomKey, params?: Params): string {
+  return roomT(hostLang(), key, params);
+}
+
+/** Titre d'une action : texte de l'hôte et clé à traduire par chaque page. */
+function titled(key: RoomKey, params?: Params): Pick<PreparedCall, 'title' | 'titleI18n'> {
+  return { title: tr(key, params), titleI18n: roomText(key, params) };
+}
+
+/** Résumé d'une action terminée : texte de l'hôte et clé à traduire par chaque page. */
+function summarized(key: RoomKey, params?: Params): Pick<ToolOutcome, 'summary' | 'summaryI18n'> {
+  return { summary: tr(key, params), summaryI18n: roomText(key, params) };
 }
 
 interface AgentTool {
@@ -75,10 +105,15 @@ export class WorkspaceTools {
   /** Diffs des actions en attente, par id d'action, pour « Voir les modifications ». */
   private readonly diffs = new Map<string, NonNullable<PreparedApproval['diff']>>();
 
+  /** `lang` : langue de l'hôte (titres, résumés et aperçus de repli, titre du diff) ; anglais par défaut. */
   constructor(
     private readonly proposals: ProposalContentProvider,
     output: vscode.OutputChannel,
+    lang?: () => Lang,
   ) {
+    if (lang) {
+      hostLang = lang;
+    }
     this.tools = [
       listDirectoryTool(),
       findFilesTool(),
@@ -109,32 +144,32 @@ export class WorkspaceTools {
     return this.tools.filter((t) => mode === 'full' || !t.sensitive).map((t) => t.definition);
   }
 
-  /** Consignes pour le prompt système, décrivant l'espace de travail et les règles d'usage des outils. */
+  /** Consignes pour le prompt système (en anglais), décrivant l'espace de travail et les règles d'usage des outils. */
   instructions(): string {
     const mode = this.effectiveMode();
     if (mode === 'off') {
-      return "Tu n'as pas accès aux fichiers de l'hôte : réponds à partir de la conversation et du contexte partagé.";
+      return "You have no access to the host's files: answer from the conversation and the shared context.";
     }
-    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => `« ${f.name} »`).join(', ');
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => `"${f.name}"`).join(', ');
     const lines = [
-      `Tu travailles dans l'espace de travail VS Code de l'hôte (dossiers : ${folders}) via des outils, comme l'agent GitHub Copilot.`,
-      "Tu es confiné à ce projet : aucun fichier extérieur n'est accessible, et certains fichiers sensibles (.env, clés, .git…) sont protégés.",
-      'Les chemins sont relatifs à la racine du dossier ; en multi-dossier, préfixe-les par le nom du dossier.',
-      'Avant de répondre sur le code, explore-le : liste, cherche et lis les fichiers utiles plutôt que de supposer leur contenu.',
-      "Si la demande est ambiguë ou qu'un choix important revient aux utilisateurs, pose la question avec ask_user plutôt que de deviner : tous les participants la voient et le premier qui répond l'emporte.",
+      `You work in the host's VS Code workspace (folders: ${folders}) through tools, like the GitHub Copilot agent.`,
+      'You are confined to this project: no outside file is accessible, and some sensitive files (.env, keys, .git…) are protected.',
+      'Paths are relative to the folder root; in a multi-root workspace, prefix them with the folder name.',
+      'Before answering about the code, explore it: list, search and read the relevant files rather than assuming their content.',
+      'If the request is ambiguous or an important choice belongs to the users, ask with ask_user rather than guessing: all participants see the question and the first answer wins.',
     ];
     if (mode === 'full') {
       lines.push(
-        "Tu peux modifier ou créer des fichiers et lancer des commandes : chaque action est validée par l'auteur de la demande ou par l'hôte, qui peuvent refuser.",
-        "Pour modifier un fichier, lis-le d'abord puis utilise edit_file avec un extrait exact et unique du contenu actuel.",
+        'You can edit or create files and run commands: each action is approved by the author of the request or by the host, who may deny it.',
+        'To edit a file, read it first, then use edit_file with an exact and unique excerpt of the current content.',
         sandboxRuntime()
-          ? `Les commandes s'exécutent dans un bac à sable ${sandboxRuntime()!.description} avec /bin/sh (syntaxe Linux) : projet seul, sans réseau ni dossier personnel. ` +
-            `Si une commande a besoin du réseau ou de fichiers hors du projet (installation de dépendances, etc.), relance-la avec outsideProject: true : elle s'exécute alors sur la machine de l'hôte (${hostShellDescription()}) et seul l'hôte peut la valider.`
-          : `Les commandes s'exécutent sans bac à sable sur la machine de l'hôte (${hostShellDescription()}, utilise cette syntaxe) : seul l'hôte peut les valider.`,
-        "N'effectue une modification ou une commande que si la demande le justifie clairement.",
+          ? `Commands run in a ${sandboxRuntime()!.description} sandbox with /bin/sh (Linux syntax): project only, no network, no home folder. ` +
+            `If a command needs the network or files outside the project (installing dependencies, etc.), run it again with outsideProject: true: it then runs on the host's machine (${hostShellDescription()}) and only the host can approve it.`
+          : `Commands run without a sandbox on the host's machine (${hostShellDescription()}, use this syntax): only the host can approve them.`,
+        'Only make a change or run a command when the request clearly justifies it.',
       );
     } else {
-      lines.push('Tu es en lecture seule : propose les modifications dans ta réponse, sans les appliquer.');
+      lines.push('You are read-only: suggest changes in your answer without applying them.');
     }
     return lines.join('\n');
   }
@@ -143,7 +178,7 @@ export class WorkspaceTools {
     const tool = this.tools.find((t) => t.definition.name === name);
     const mode = this.effectiveMode();
     if (!tool || mode === 'off' || (tool.sensitive && mode !== 'full')) {
-      throw new Error(`Outil « ${name} » indisponible.`);
+      throw new I18nError('tool.error.unavailable', { name });
     }
     const args = typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {};
     return tool.prepare(args);
@@ -200,7 +235,7 @@ export class WorkspaceTools {
     const name = path.basename(diff.uri.path);
     const left = this.proposals.register(diff.original, name);
     const right = this.proposals.register(diff.modified, name);
-    await vscode.commands.executeCommand('vscode.diff', left, right, `${name} : modification proposée (Prompt Share)`, {
+    await vscode.commands.executeCommand('vscode.diff', left, right, tr('tool.diffTitle', { name }), {
       preview: true,
     });
     return true;
@@ -216,7 +251,7 @@ function config(): vscode.WorkspaceConfiguration {
 function workspaceFolders(): readonly vscode.WorkspaceFolder[] {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders?.length) {
-    throw new Error("Aucun dossier n'est ouvert dans VS Code chez l'hôte.");
+    throw new I18nError('tool.error.noFolder');
   }
   return folders;
 }
@@ -238,7 +273,7 @@ function resolveLexical(raw: unknown): Resolved {
   if (path.isAbsolute(input)) {
     const owner = folders.find((f) => isInside(f.uri.fsPath, input));
     if (!owner) {
-      throw new Error(`Chemin hors de l'espace de travail : ${input}`);
+      throw new I18nError('tool.error.outside', { path: input });
     }
     folder = owner;
     rel = path.relative(owner.uri.fsPath, input);
@@ -252,7 +287,7 @@ function resolveLexical(raw: unknown): Resolved {
   }
   const full = path.resolve(folder.uri.fsPath, rel);
   if (!isInside(folder.uri.fsPath, full)) {
-    throw new Error(`Chemin hors de l'espace de travail : ${input}`);
+    throw new I18nError('tool.error.outside', { path: input });
   }
   return { uri: vscode.Uri.file(full), folder, rel: toPosix(path.relative(folder.uri.fsPath, full)) };
 }
@@ -264,7 +299,7 @@ function resolveLexical(raw: unknown): Resolved {
 async function resolveSafe(raw: unknown): Promise<Resolved> {
   const resolved = resolveLexical(raw);
   if (isProtected(resolved.rel)) {
-    throw new Error(`Fichier protégé, non accessible à l'agent : ${resolved.rel}`);
+    throw new I18nError('tool.error.protected', { path: resolved.rel });
   }
   const root = await fs.promises.realpath(resolved.folder.uri.fsPath);
   // Pour un fichier à créer, on vérifie le plus proche parent existant.
@@ -280,17 +315,17 @@ async function resolveSafe(raw: unknown): Promise<Resolved> {
       }
       // Lien symbolique cassé : écrire à travers lui créerait un fichier ailleurs.
       if (await fs.promises.lstat(probe).then((st) => st.isSymbolicLink(), () => false)) {
-        throw new Error(`Lien symbolique non suivi : ${resolved.rel}`);
+        throw new I18nError('tool.error.symlink', { path: resolved.rel });
       }
       probe = parent;
     }
   }
   if (!isInside(root, real)) {
-    throw new Error(`Chemin hors de l'espace de travail (lien symbolique) : ${resolved.rel}`);
+    throw new I18nError('tool.error.outsideSymlink', { path: resolved.rel });
   }
   // Un lien interne peut pointer vers un fichier protégé (ex. config -> .env).
   if (isProtected(toPosix(path.relative(root, real)))) {
-    throw new Error(`Fichier protégé, non accessible à l'agent : ${resolved.rel}`);
+    throw new I18nError('tool.error.protected', { path: resolved.rel });
   }
   return resolved;
 }
@@ -413,14 +448,14 @@ async function readText(uri: vscode.Uri): Promise<string> {
   }
   const stat = await vscode.workspace.fs.stat(uri);
   if (stat.type & vscode.FileType.Directory) {
-    throw new Error(`${display(uri)} est un dossier.`);
+    throw new I18nError('tool.error.isDirectory', { path: display(uri) });
   }
   if (stat.size > MAX_FILE_BYTES) {
-    throw new Error(`${display(uri)} est trop volumineux (${Math.round(stat.size / 1024)} Ko).`);
+    throw new I18nError('tool.error.tooLarge', { path: display(uri), size: Math.round(stat.size / 1024) });
   }
   const bytes = await vscode.workspace.fs.readFile(uri);
   if (bytes.subarray(0, 8000).includes(0)) {
-    throw new Error(`${display(uri)} est un fichier binaire.`);
+    throw new I18nError('tool.error.binary', { path: display(uri) });
   }
   return new TextDecoder('utf-8').decode(bytes);
 }
@@ -438,7 +473,7 @@ function preview(prefix: string, text: string): string[] {
   const lines = text.split(/\r?\n/);
   const shown = lines.slice(0, MAX_PREVIEW_LINES).map((l) => `${prefix}${l}`);
   if (lines.length > MAX_PREVIEW_LINES) {
-    shown.push(`  … ${lines.length - MAX_PREVIEW_LINES} ligne(s) de plus`);
+    shown.push(tr('tool.preview.moreLines', { count: lines.length - MAX_PREVIEW_LINES }));
   }
   return shown;
 }
@@ -454,16 +489,16 @@ function listDirectoryTool(): AgentTool {
     sensitive: false,
     definition: {
       name: 'list_directory',
-      description: "Liste le contenu d'un dossier de l'espace de travail (les sous-dossiers se terminent par /).",
+      description: 'Lists the content of a workspace folder (subfolders end with /).',
       inputSchema: {
         type: 'object',
-        properties: { path: { type: 'string', description: 'Dossier relatif à la racine ; « . » pour la racine.' } },
+        properties: { path: { type: 'string', description: 'Folder relative to the root; "." for the root.' } },
       },
     },
     async prepare(input) {
       const { uri, rel } = await resolveSafe(input.path);
       return {
-        title: `Liste de ${rel || '.'}`,
+        ...titled('tool.list', { path: rel || '.' }),
         async execute() {
           const entries = (await vscode.workspace.fs.readDirectory(uri)).filter(
             ([name]) => !isProtected(rel && rel !== '.' ? `${rel}/${name}` : name),
@@ -471,9 +506,9 @@ function listDirectoryTool(): AgentTool {
           entries.sort(([a, ta], [b, tb]) => (tb & vscode.FileType.Directory) - (ta & vscode.FileType.Directory) || a.localeCompare(b));
           const lines = entries.slice(0, 500).map(([name, type]) => (type & vscode.FileType.Directory ? `${name}/` : name));
           if (entries.length > 500) {
-            lines.push(`… ${entries.length - 500} entrées de plus`);
+            lines.push(`… ${entries.length - 500} more entries`);
           }
-          return { result: lines.join('\n') || '(dossier vide)', summary: `${entries.length} entrée(s)` };
+          return { result: lines.join('\n') || '(empty folder)', ...summarized('tool.summary.entries', { count: entries.length }) };
         },
       };
     },
@@ -485,12 +520,12 @@ function findFilesTool(): AgentTool {
     sensitive: false,
     definition: {
       name: 'find_files',
-      description: 'Trouve des fichiers par motif glob (ex. « **/*.ts », « src/**/config*.json »). Ignore node_modules, .git, dist…',
+      description: 'Finds files by glob pattern (e.g. "**/*.ts", "src/**/config*.json"). Ignores node_modules, .git, dist…',
       inputSchema: {
         type: 'object',
         properties: {
-          pattern: { type: 'string', description: "Motif glob relatif aux dossiers de l'espace de travail." },
-          maxResults: { type: 'number', description: 'Nombre maximal de résultats (défaut 200).' },
+          pattern: { type: 'string', description: 'Glob pattern relative to the workspace folders.' },
+          maxResults: { type: 'number', description: 'Maximum number of results (default 200).' },
         },
         required: ['pattern'],
       },
@@ -499,15 +534,15 @@ function findFilesTool(): AgentTool {
       workspaceFolders();
       const pattern = str(input.pattern);
       if (!pattern) {
-        throw new Error('Paramètre « pattern » manquant.');
+        throw new I18nError('tool.error.missingParam', { name: 'pattern' });
       }
       const max = Math.min(int(input.maxResults) ?? 200, 1000);
       return {
-        title: `Recherche de fichiers « ${pattern} »`,
+        ...titled('tool.findFiles', { pattern }),
         async execute() {
           const uris = (await vscode.workspace.findFiles(pattern, SEARCH_EXCLUDE_GLOB, max * 2)).filter(visible).slice(0, max);
           const lines = uris.map(display).sort();
-          return { result: lines.join('\n') || 'Aucun fichier trouvé.', summary: `${uris.length} fichier(s)` };
+          return { result: lines.join('\n') || 'No files found.', ...summarized('tool.summary.files', { count: uris.length }) };
         },
       };
     },
@@ -519,13 +554,13 @@ function readFileTool(): AgentTool {
     sensitive: false,
     definition: {
       name: 'read_file',
-      description: `Lit un fichier texte de l'espace de travail, éventuellement une plage de lignes (numérotées à partir de 1). Au plus ${MAX_READ_LINES} lignes par appel.`,
+      description: `Reads a text file of the workspace, optionally a range of lines (numbered from 1). At most ${MAX_READ_LINES} lines per call.`,
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Chemin du fichier.' },
-          startLine: { type: 'number', description: 'Première ligne (incluse).' },
-          endLine: { type: 'number', description: 'Dernière ligne (incluse).' },
+          path: { type: 'string', description: 'File path.' },
+          startLine: { type: 'number', description: 'First line (included).' },
+          endLine: { type: 'number', description: 'Last line (included).' },
         },
         required: ['path'],
       },
@@ -535,7 +570,11 @@ function readFileTool(): AgentTool {
       const start = Math.max(1, int(input.startLine) ?? 1);
       const requestedEnd = int(input.endLine);
       return {
-        title: `Lecture de ${rel}${requestedEnd || start > 1 ? `, lignes ${start} à ${requestedEnd ?? 'la fin'}` : ''}`,
+        ...(requestedEnd
+          ? titled('tool.readLines', { path: rel, start, end: requestedEnd })
+          : start > 1
+            ? titled('tool.readLinesToEnd', { path: rel, start })
+            : titled('tool.read', { path: rel })),
         async execute() {
           const lines = (await readText(uri)).split(/\r?\n/);
           const end = Math.min(lines.length, requestedEnd ?? lines.length, start + MAX_READ_LINES - 1);
@@ -545,8 +584,8 @@ function readFileTool(): AgentTool {
             body = body.slice(0, MAX_READ_CHARS);
             truncated = true;
           }
-          const header = `${rel} — lignes ${start}-${end} sur ${lines.length}${truncated ? ' (tronqué : relis la suite avec startLine)' : ''}`;
-          return { result: `${header}\n${body}`, summary: `lignes ${start}-${end} sur ${lines.length}` };
+          const header = `${rel} — lines ${start}-${end} of ${lines.length}${truncated ? ' (truncated: read the rest with startLine)' : ''}`;
+          return { result: `${header}\n${body}`, ...summarized('tool.summary.lines', { start, end, total: lines.length }) };
         },
       };
     },
@@ -558,14 +597,14 @@ function searchTextTool(): AgentTool {
     sensitive: false,
     definition: {
       name: 'search_text',
-      description: "Cherche un texte ou une expression régulière dans les fichiers de l'espace de travail. Renvoie chemin:ligne: contenu.",
+      description: 'Searches for a text or a regular expression in the workspace files. Returns path:line: content.',
       inputSchema: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Texte ou expression régulière à chercher.' },
-          isRegex: { type: 'boolean', description: 'true si query est une expression régulière (défaut false).' },
-          includePattern: { type: 'string', description: 'Glob pour limiter les fichiers (ex. « src/**/*.ts »).' },
-          maxResults: { type: 'number', description: 'Nombre maximal de lignes (défaut 100).' },
+          query: { type: 'string', description: 'Text or regular expression to search for.' },
+          isRegex: { type: 'boolean', description: 'true if query is a regular expression (default false).' },
+          includePattern: { type: 'string', description: 'Glob to limit the files (e.g. "src/**/*.ts").' },
+          maxResults: { type: 'number', description: 'Maximum number of lines (default 100).' },
         },
         required: ['query'],
       },
@@ -574,21 +613,21 @@ function searchTextTool(): AgentTool {
       const folders = workspaceFolders();
       const query = str(input.query);
       if (!query) {
-        throw new Error('Paramètre « query » manquant.');
+        throw new I18nError('tool.error.missingParam', { name: 'query' });
       }
       const isRegex = input.isRegex === true;
       const include = str(input.includePattern);
       const max = Math.min(int(input.maxResults) ?? 100, 500);
       return {
-        title: `Recherche de « ${query.length > 40 ? `${query.slice(0, 39)}…` : query} »`,
+        ...titled('tool.search', { query: query.length > 40 ? `${query.slice(0, 39)}…` : query }),
         async execute(signal) {
           const rg = findRipgrep();
           const hits = rg
             ? await searchWithRipgrep(rg, folders, query, isRegex, include, max, signal)
             : await searchWithScan(query, isRegex, include, max);
           return {
-            result: hits.length ? hits.join('\n') : 'Aucun résultat.',
-            summary: `${hits.length}${hits.length >= max ? '+' : ''} résultat(s)`,
+            result: hits.length ? hits.join('\n') : 'No results.',
+            ...summarized(hits.length >= max ? 'tool.summary.resultsMore' : 'tool.summary.results', { count: hits.length }),
           };
         },
       };
@@ -601,21 +640,21 @@ function diagnosticsTool(): AgentTool {
     sensitive: false,
     definition: {
       name: 'get_diagnostics',
-      description: "Renvoie les erreurs et avertissements (compilateur, linter) connus de VS Code, pour un fichier ou tout l'espace de travail.",
+      description: 'Returns the errors and warnings (compiler, linter) known to VS Code, for a file or the whole workspace.',
       inputSchema: {
         type: 'object',
-        properties: { path: { type: 'string', description: "Fichier à examiner ; absent : tout l'espace de travail." } },
+        properties: { path: { type: 'string', description: 'File to examine; omitted: the whole workspace.' } },
       },
     },
     async prepare(input) {
       const target = input.path ? await resolveSafe(input.path) : undefined;
       return {
-        title: target ? `Problèmes dans ${target.rel}` : 'Problèmes du projet',
+        ...(target ? titled('tool.problemsIn', { path: target.rel }) : titled('tool.problems')),
         async execute() {
           const all: [vscode.Uri, readonly vscode.Diagnostic[]][] = target
             ? [[target.uri, vscode.languages.getDiagnostics(target.uri)]]
             : vscode.languages.getDiagnostics();
-          const severity = ['erreur', 'avertissement', 'info', 'suggestion'];
+          const severity = ['error', 'warning', 'info', 'hint'];
           const lines: string[] = [];
           for (const [file, diags] of all) {
             // Seulement les fichiers du projet : VS Code connaît aussi des fichiers ouverts ailleurs.
@@ -624,13 +663,13 @@ function diagnosticsTool(): AgentTool {
             }
             for (const d of diags) {
               if (d.severity <= vscode.DiagnosticSeverity.Warning) {
-                lines.push(`${display(file)}:${d.range.start.line + 1}:${d.range.start.character + 1} ${severity[d.severity]} : ${d.message}`);
+                lines.push(`${display(file)}:${d.range.start.line + 1}:${d.range.start.character + 1} ${severity[d.severity]}: ${d.message}`);
               }
             }
           }
           return {
-            result: lines.slice(0, 300).join('\n') || 'Aucune erreur ni avertissement.',
-            summary: `${lines.length} problème(s)`,
+            result: lines.slice(0, 300).join('\n') || 'No errors or warnings.',
+            ...summarized('tool.summary.problems', { count: lines.length }),
           };
         },
       };
@@ -644,12 +683,12 @@ function askUserTool(): AgentTool {
     definition: {
       name: 'ask_user',
       description:
-        "Pose une question aux participants du chat et attend la première réponse (choix entre options ou réponse libre). Tous voient la question et n'importe qui peut répondre. À utiliser quand la demande est ambiguë ou qu'une décision revient aux utilisateurs.",
+        'Asks the chat participants a question and waits for the first answer (choice between options or free answer). Everyone sees the question and anyone can answer. Use it when the request is ambiguous or a decision belongs to the users.',
       inputSchema: {
         type: 'object',
         properties: {
-          question: { type: 'string', description: 'La question, courte et précise.' },
-          options: { type: 'array', items: { type: 'string' }, description: 'Réponses proposées (2 à 6), facultatif.' },
+          question: { type: 'string', description: 'The question, short and precise.' },
+          options: { type: 'array', items: { type: 'string' }, description: 'Suggested answers (2 to 6), optional.' },
         },
         required: ['question'],
       },
@@ -657,13 +696,13 @@ function askUserTool(): AgentTool {
     async prepare(input) {
       const text = str(input.question)?.trim();
       if (!text) {
-        throw new Error('Paramètre « question » manquant.');
+        throw new I18nError('tool.error.missingParam', { name: 'question' });
       }
       const options = Array.isArray(input.options)
         ? input.options.filter((o): o is string => typeof o === 'string' && !!o.trim()).map((o) => o.trim().slice(0, 120)).slice(0, 6)
         : [];
       return {
-        title: 'Question',
+        ...titled('tool.question'),
         question: { text: text.slice(0, 1000), options },
         async execute() {
           return { result: '' };
@@ -681,13 +720,13 @@ function editFileTool(): AgentTool {
     definition: {
       name: 'edit_file',
       description:
-        "Remplace dans un fichier existant un extrait exact (oldText, qui doit apparaître une seule fois) par newText. Lis le fichier avant. Chaque modification est validée.",
+        'Replaces an exact excerpt (oldText, which must appear only once) with newText in an existing file. Read the file first. Each change is approved.',
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Chemin du fichier.' },
-          oldText: { type: 'string', description: 'Extrait exact du contenu actuel, avec suffisamment de contexte pour être unique.' },
-          newText: { type: 'string', description: 'Texte de remplacement.' },
+          path: { type: 'string', description: 'File path.' },
+          oldText: { type: 'string', description: 'Exact excerpt of the current content, with enough context to be unique.' },
+          newText: { type: 'string', description: 'Replacement text.' },
         },
         required: ['path', 'oldText', 'newText'],
       },
@@ -697,44 +736,44 @@ function editFileTool(): AgentTool {
       const oldText = str(input.oldText);
       const newText = str(input.newText);
       if (!oldText || newText === undefined) {
-        throw new Error('Paramètres « oldText » et « newText » requis.');
+        throw new I18nError('tool.error.editParams');
       }
       const original = await readText(uri);
       const eol = original.includes('\r\n') ? '\r\n' : '\n';
       const find = oldText.replace(/\r?\n/g, eol);
       const first = original.indexOf(find);
       if (first < 0) {
-        throw new Error(`Extrait introuvable dans ${rel} : relis le fichier et recopie le texte exact.`);
+        throw new I18nError('tool.error.excerptNotFound', { path: rel });
       }
       if (original.indexOf(find, first + 1) >= 0) {
-        throw new Error(`Extrait présent plusieurs fois dans ${rel} : ajoute du contexte pour le rendre unique.`);
+        throw new I18nError('tool.error.excerptAmbiguous', { path: rel });
       }
       const replacement = newText.replace(/\r?\n/g, eol);
       const modified = original.slice(0, first) + replacement + original.slice(first + find.length);
       const line = original.slice(0, first).split(/\r?\n/).length;
       return {
-        title: `Modifier ${rel}`,
+        ...titled('tool.edit', { path: rel }),
         approval: {
           kind: 'write',
           hostOnly: false,
           canShowDiff: true,
-          preview: [`@@ ${rel}, ligne ${line}`, ...preview('- ', oldText), ...preview('+ ', newText)].join('\n'),
+          preview: [tr('tool.preview.line', { path: rel, line }), ...preview('- ', oldText), ...preview('+ ', newText)].join('\n'),
           diff: { uri, original, modified },
         },
         async execute() {
           const doc = await vscode.workspace.openTextDocument(uri);
           if (doc.getText() !== original) {
-            throw new Error(`${rel} a changé entre-temps : relis-le avant de réessayer.`);
+            throw new I18nError('tool.error.changed', { path: rel });
           }
           const edit = new vscode.WorkspaceEdit();
           edit.replace(uri, new vscode.Range(doc.positionAt(first), doc.positionAt(first + find.length)), replacement);
           if (!(await vscode.workspace.applyEdit(edit))) {
-            throw new Error('VS Code a refusé la modification.');
+            throw new I18nError('tool.error.editRefused');
           }
           await doc.save();
           return {
-            result: `Modification appliquée à ${rel}.`,
-            summary: `+${countLines(replacement)} −${countLines(find)}`,
+            result: `Change applied to ${rel}.`,
+            ...summarized('tool.summary.raw', { text: `+${countLines(replacement)} −${countLines(find)}` }),
           };
         },
       };
@@ -747,12 +786,12 @@ function createFileTool(): AgentTool {
     sensitive: true,
     definition: {
       name: 'create_file',
-      description: "Crée un nouveau fichier (le fichier ne doit pas exister ; utilise edit_file sinon). Chaque création est validée.",
+      description: 'Creates a new file (the file must not exist; use edit_file otherwise). Each creation is approved.',
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Chemin du nouveau fichier.' },
-          content: { type: 'string', description: 'Contenu complet du fichier.' },
+          path: { type: 'string', description: 'Path of the new file.' },
+          content: { type: 'string', description: 'Full content of the file.' },
         },
         required: ['path', 'content'],
       },
@@ -761,23 +800,23 @@ function createFileTool(): AgentTool {
       const { uri, rel } = await resolveSafe(input.path);
       const content = str(input.content);
       if (content === undefined) {
-        throw new Error('Paramètre « content » requis.');
+        throw new I18nError('tool.error.requiredParam', { name: 'content' });
       }
       if (await exists(uri)) {
-        throw new Error(`${rel} existe déjà : utilise edit_file pour le modifier.`);
+        throw new I18nError('tool.error.exists', { path: rel });
       }
       return {
-        title: `Créer ${rel}`,
+        ...titled('tool.create', { path: rel }),
         approval: {
           kind: 'write',
           hostOnly: false,
           canShowDiff: true,
-          preview: [`@@ nouveau fichier ${rel}`, ...preview('+ ', content)].join('\n'),
+          preview: [tr('tool.preview.newFile', { path: rel }), ...preview('+ ', content)].join('\n'),
           diff: { uri, original: '', modified: content },
         },
         async execute() {
           await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
-          return { result: `Fichier créé : ${rel}.`, summary: `+${countLines(content)}` };
+          return { result: `File created: ${rel}.`, ...summarized('tool.summary.raw', { text: `+${countLines(content)}` }) };
         },
       };
     },
@@ -790,17 +829,17 @@ function runCommandTool(output: vscode.OutputChannel): AgentTool {
     definition: {
       name: 'run_command',
       description:
-        `Exécute une commande shell dans un dossier du projet et renvoie sa sortie (délai max ${COMMAND_TIMEOUT_MS / 1000} s, pas d'interaction). ` +
-        'Par défaut, la commande tourne dans un bac à sable : seul le projet est visible et modifiable, sans réseau. ' +
-        "Mets outsideProject à true si elle a besoin du réseau ou d'éléments hors du projet : seul l'hôte peut alors la valider.",
+        `Runs a shell command in a project folder and returns its output (timeout ${COMMAND_TIMEOUT_MS / 1000} s, no interaction). ` +
+        'By default, the command runs in a sandbox: only the project is visible and writable, no network. ' +
+        'Set outsideProject to true if it needs the network or things outside the project: only the host can then approve it.',
       inputSchema: {
         type: 'object',
         properties: {
-          command: { type: 'string', description: 'Commande à exécuter.' },
-          cwd: { type: 'string', description: 'Dossier de travail relatif (défaut : racine).' },
+          command: { type: 'string', description: 'Command to run.' },
+          cwd: { type: 'string', description: 'Relative working folder (default: root).' },
           outsideProject: {
             type: 'boolean',
-            description: "true si la commande doit accéder au réseau ou à des fichiers hors du projet (validation par l'hôte uniquement).",
+            description: 'true if the command must access the network or files outside the project (approval by the host only).',
           },
         },
         required: ['command'],
@@ -809,23 +848,23 @@ function runCommandTool(output: vscode.OutputChannel): AgentTool {
     async prepare(input) {
       const command = str(input.command)?.trim();
       if (!command) {
-        throw new Error('Paramètre « command » manquant.');
+        throw new I18nError('tool.error.missingParam', { name: 'command' });
       }
       const { uri: cwd, rel } = await resolveSafe(input.cwd);
       const rt = sandboxRuntime();
       const sandboxed = input.outsideProject !== true && !!rt && rt.toSandbox(cwd.fsPath) !== undefined;
       const where = sandboxed
-        ? `bac à sable ${rt!.description} : projet seul, sans réseau`
+        ? tr('tool.where.sandbox', { sandbox: rt!.description })
         : rt
-          ? `HORS bac à sable (${hostShellDescription()}) : accès au réseau et à toute la machine`
-          : `sans bac à sable (${hostShellDescription()}) : accès à toute la machine`;
+          ? tr('tool.where.outside', { shell: hostShellDescription() })
+          : tr('tool.where.noSandbox', { shell: hostShellDescription() });
       return {
-        title: sandboxed ? 'Exécuter dans le terminal' : 'Exécuter hors du projet',
+        ...titled(sandboxed ? 'tool.run' : 'tool.runOutside'),
         approval: {
           kind: 'command',
           hostOnly: !sandboxed,
           canShowDiff: false,
-          preview: `$ ${command}\n# dossier : ${rel || '.'} — ${where}`,
+          preview: `$ ${command}\n${tr('tool.preview.cwd', { path: rel || '.', where })}`,
         },
         execute: (signal) => runShell(command, cwd.fsPath, sandboxed, signal, output),
       };
@@ -915,7 +954,7 @@ function runShell(
   sandboxed: boolean,
   signal: AbortSignal,
   output: vscode.OutputChannel,
-): Promise<{ result: string; summary: string }> {
+): Promise<ToolOutcome> {
   return new Promise((resolve) => {
     output.appendLine(`\n$ ${command}   (dans ${cwd}${sandboxed ? ', bac à sable' : ', HORS bac à sable'})`);
     const rt = sandboxRuntime();
@@ -925,7 +964,7 @@ function runShell(
         const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
         sandboxArgs = sandboxCommand(rt!, { folders, hidden: folders.flatMap(protectedEntries), cwd }, command);
       } catch (err) {
-        resolve({ result: `échec : ${(err as Error).message}`, summary: 'échec' });
+        resolve({ result: `failed: ${(err as Error).message}`, ...summarized('tool.cmd.failedShort') });
         return;
       }
     }
@@ -956,12 +995,19 @@ function runShell(
     const finish = (code: number | null, error?: string) => {
       clearTimeout(timer);
       signal.removeEventListener('abort', kill);
-      const tail = out.length > MAX_COMMAND_OUTPUT ? `…(début tronqué)\n${out.slice(-MAX_COMMAND_OUTPUT)}` : out;
-      const status = error ?? (code === null ? 'interrompue' : `code de sortie ${code}`);
-      output.appendLine(`[${status}]`);
-      resolve({ result: `${status}\n${tail || '(aucune sortie)'}`, summary: status });
+      const tail = out.length > MAX_COMMAND_OUTPUT ? `…(start truncated)\n${out.slice(-MAX_COMMAND_OUTPUT)}` : out;
+      // Pour le modèle, en anglais ; pour le chat, résumé traduisible.
+      const status = error !== undefined ? `failed: ${error}` : code === null ? 'interrupted' : `exit code ${code}`;
+      const shown =
+        error !== undefined
+          ? summarized('tool.cmd.failed', { error })
+          : code === null
+            ? summarized('tool.cmd.interrupted')
+            : summarized('tool.cmd.exit', { code });
+      output.appendLine(`[${shown.summary}]`);
+      resolve({ result: `${status}\n${tail || '(no output)'}`, ...shown });
     };
-    child.on('error', (err) => finish(null, `échec : ${err.message}`));
+    child.on('error', (err) => finish(null, err.message));
     child.on('close', (code) => finish(code));
   });
 }

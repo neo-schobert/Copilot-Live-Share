@@ -36,7 +36,7 @@ class FakeBackend implements ModelBackend {
   }
 
   async ask({ turns, modelId, interaction, author, authorClientId, noTools }: ModelRequest, signal: AbortSignal) {
-    if (noTools && turns[0].content.startsWith('Tu compactes')) {
+    if (noTools && turns[0].content.startsWith('You are compacting')) {
       this.compactions.push(turns[0].content);
       async function* summary(): AsyncGenerator<ModelEvent> {
         yield { type: 'text', text: 'RÉSUMÉ-TEST : alice a posé des questions.' };
@@ -103,14 +103,14 @@ class Client {
     ws.on('close', (code) => (this.closeCode = code));
   }
 
-  static async join(name: string, token = GUEST): Promise<Client> {
+  static async join(name: string, token = GUEST, lang = 'fr'): Promise<Client> {
     const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=${token}`);
     await new Promise<void>((resolve, reject) => {
       ws.once('open', () => resolve());
       ws.once('error', reject);
     });
     const c = new Client(ws);
-    c.send({ type: 'hello', name, clientId: `${name}-client-id` });
+    c.send({ type: 'hello', name, clientId: `${name}-client-id`, lang });
     const welcome = await c.waitFor((m) => m.type === 'welcome');
     if (welcome.type === 'welcome') {
       c.conv = welcome.conversations[0].id;
@@ -176,6 +176,7 @@ async function main() {
   const tunnelCalls: string[] = [];
   const room = new ChatRoom(backend, {
     historyLength: () => 20,
+    defaultLang: () => 'fr',
     policy: () => policy,
     appRefusal: (port) => (port === PORT ? 'Le serveur de la session est déjà partagé.' : undefined),
     onAppsChanged: (apps) => server.closeRelays((port) => !apps.some((a) => a.port === port)),
@@ -252,6 +253,10 @@ async function main() {
   const wsl1 = parseWslProbe(`${head}BWRAPFAIL\n`, 'wsl.exe', '');
   assert.equal(wsl1.status, 'bubblewrapFails');
   assert.match(wsl1.detail, /wsl --set-version Ubuntu 2/);
+  for (const lang of ['fr', 'en', 'de'] as const) {
+    assert.match(parseWslProbe(`${head}BWRAPFAIL\n`, 'wsl.exe', '', [], lang).detail, /wsl --set-version Ubuntu 2/, `commande WSL gardée (${lang})`);
+  }
+  assert.match(wsl1.detail, /does not work/, 'anglais par défaut');
   const ready = parseWslProbe(
     `${head}BWRAP /usr/bin/bwrap\nLINK /bin usr/bin\nDIR /etc\nPATHDIR /home/neo/.nvm/versions/node/v22/bin\nNODEROOT /home/neo/.nvm/versions/node/v22\n` +
       'PATHDIR /usr/bin\nPATHDIR /mnt/c/Windows/system32\nPATHDIR /home/neo\n',
@@ -415,7 +420,7 @@ async function main() {
   const slowId = room.askAsHost(alice.conv, 'Encore une question lente', 'neo');
   const queuedId = room.askAsHost(alice.conv, 'Question à retirer', 'neo');
   room.cancelQuestion(queuedId);
-  await alice.waitFor((m) => m.type === 'entry' && m.entry.kind === 'system' && m.entry.text.includes('retirée'));
+  await alice.waitFor((m) => m.type === 'entry' && m.entry.kind === 'system' && m.entry.text.includes('retirée') && m.entry.i18n?.key === 'system.questionRemoved');
   room.cancelQuestion(slowId);
   await alice.waitFor((m) => m.type === 'entryUpdate' && m.status === 'cancelled' && room.answerTo(slowId)?.id === m.entryId);
   assert.equal(room.answerTo(queuedId), undefined);
@@ -663,6 +668,24 @@ async function main() {
   assert.ok(![alice, bob2].some((c) => c.messages.some((m) => m.type === 'tunnel')), "l'état du tunnel n'est envoyé qu'à l'hôte");
   host2.ws.close();
   ok("Tunnel et réglages : service choisi transmis, état envoyé à l'hôte seul, ouverture, arrêt et réglages réservés à l'hôte");
+
+  // 11 sexies. Langue : chaque participant reçoit les messages du serveur dans la sienne
+  const english = await Client.join('eve', GUEST, 'en');
+  const german = await Client.join('gus', GUEST, 'de');
+  english.send({ type: 'cancel' });
+  german.send({ type: 'cancel' });
+  await english.waitFor((m) => m.type === 'error' && m.message === 'Only the host can cancel a response.');
+  await german.waitFor((m) => m.type === 'error' && m.message === 'Nur der Host kann eine Antwort abbrechen.');
+  english.send({ type: 'fork', conversationId: 'inexistante' });
+  await english.waitFor((m) => m.type === 'error' && m.message === 'This conversation no longer exists.');
+  german.send({ type: 'deleteConversation', conversationId: english.conv });
+  await german.waitFor((m) => m.type === 'error' && m.message === 'Nur der Host kann eine Unterhaltung löschen.');
+  english.send({ type: 'setLang', lang: 'fr' });
+  english.send({ type: 'cancel' });
+  await english.waitFor((m) => m.type === 'error' && m.message === "Seul l'hôte peut annuler une réponse.");
+  english.ws.close();
+  german.ws.close();
+  ok('Langue : messages du serveur dans la langue de chaque participant (anglais, allemand), changement en cours de session');
 
   // 12. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");

@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import type { ChatRoom } from './chatRoom';
-import type { AssistantEntry, ChatEntry, Conversation, QueueState, ServerMessage, ToolActivity, UserEntry } from './protocol';
+import type { AssistantEntry, ChatEntry, Conversation, I18nText, QueueState, ServerMessage, ToolActivity, UserEntry } from './protocol';
+import { conversationTitle, roomText } from './i18n/extension';
+import { t, uiLang } from './i18n/vscode';
 
 /**
  * Affiche les discussions de la session dans le panneau Chat natif de VS Code
@@ -195,7 +197,7 @@ export class NativeChatBridge implements vscode.Disposable {
   }
 
   private itemFor(conv: Conversation): vscode.ChatSessionItem {
-    const item = this.controller.createChatSessionItem(resourceFor(conv.id), conv.title);
+    const item = this.controller.createChatSessionItem(resourceFor(conv.id), displayTitle(conv));
     const entries = this.room.entriesOf(conv.id);
     const questions = entries.filter((e) => e.kind === 'user').length;
     const authors = new Set(entries.flatMap((e) => (e.kind === 'user' ? [e.author] : [])));
@@ -203,8 +205,9 @@ export class NativeChatBridge implements vscode.Disposable {
     const waiting = this.queue.pending.some((q) => q.conversationId === conv.id);
     item.iconPath = new vscode.ThemeIcon('broadcast');
     item.status = answering || waiting ? vscode.ChatSessionStatus.InProgress : vscode.ChatSessionStatus.Completed;
-    item.description = `${questions} question(s)${authors.size ? ` · ${[...authors].join(', ')}` : ''}`;
-    item.tooltip = `Discussion partagée créée par ${conv.createdBy}`;
+    const count = t(questions === 1 ? 'native.questions.one' : 'native.questions.other', { count: questions });
+    item.description = authors.size ? t('native.item.descriptionAuthors', { count, authors: [...authors].join(', ') }) : count;
+    item.tooltip = t('native.item.tooltip', { name: conv.createdBy });
     const last = entries[entries.length - 1];
     item.timing = { created: conv.createdAt, lastRequestStarted: last?.timestamp };
     return item;
@@ -217,13 +220,15 @@ export class NativeChatBridge implements vscode.Disposable {
     const conv = this.room.getConversation(conversationId);
     if (!conv) {
       return {
-        title: 'Discussion supprimée',
-        history: [new vscode.ChatResponseTurn2([new vscode.ChatResponseMarkdownPart("Cette discussion n'existe plus.")], {}, SESSION_TYPE)],
+        title: t('native.deleted.title'),
+        history: [new vscode.ChatResponseTurn2([new vscode.ChatResponseMarkdownPart(t('native.deleted.body'))], {}, SESSION_TYPE)],
         requestHandler: undefined,
       };
     }
 
-    this.pendingTabs.push({ conversationId, title: conv.title, at: Date.now() });
+    // Même titre que celui de la session : l'onglet est reconnu par son libellé.
+    const title = displayTitle(conv);
+    this.pendingTabs.push({ conversationId, title, at: Date.now() });
     // L'onglet peut déjà exister (réouverture) ou apparaître juste après.
     this.matchTabs(vscode.window.tabGroups.all.flatMap((g) => g.tabs));
     this.stale.delete(conversationId);
@@ -242,11 +247,11 @@ export class NativeChatBridge implements vscode.Disposable {
     const pushQuestion = (e: ChatEntry) => history.push(requestTurn(this.promptOf(e)));
     for (const e of entries) {
       if (e.kind === 'summary') {
-        history.push(requestTurn(`📦 Discussion compactée par ${e.author}`));
-        history.push(responseTurn(`_Résumé envoyé au modèle à la place des échanges précédents :_\n\n${e.text}`));
+        history.push(requestTurn(t('native.summary.request', { name: e.author })));
+        history.push(responseTurn(t('native.summary.response', { text: e.text })));
       } else if (e.kind === 'context') {
         pushQuestion(e);
-        history.push(responseTurn('_Contexte ajouté à la discussion._'));
+        history.push(responseTurn(t('native.context.added')));
       } else if (e.kind === 'user' && e.id !== streamingQuestion) {
         pushQuestion(e);
         const answer = answers.get(e.id);
@@ -266,7 +271,7 @@ export class NativeChatBridge implements vscode.Disposable {
     }
 
     return {
-      title: conv.title,
+      title,
       history,
       activeResponseCallback,
       requestHandler: (request, context, stream, token) => this.handleRequest(request, context, stream, token),
@@ -276,10 +281,10 @@ export class NativeChatBridge implements vscode.Disposable {
   private promptOf(e: ChatEntry): string {
     if (e.kind === 'context') {
       const where = e.range ? `${e.fileName} (${e.range})` : e.fileName;
-      return `📎 Contexte partagé par ${e.author} : ${where}\n\n\`\`\`${e.languageId}\n${e.code}\n\`\`\``;
+      return `${t('native.context.shared', { name: e.author, where })}\n\n\`\`\`${e.languageId}\n${e.code}\n\`\`\``;
     }
     if (e.kind === 'user') {
-      return e.author === this.hostName() && e.isHost ? e.text : `${e.author} : ${e.text}`;
+      return e.author === this.hostName() && e.isHost ? e.text : t('native.userPrompt', { author: e.author, text: e.text });
     }
     return '';
   }
@@ -295,7 +300,7 @@ export class NativeChatBridge implements vscode.Disposable {
     const resource = context.chatSessionContext?.chatSessionItem.resource;
     const conversationId = resource ? conversationIdOf(resource) : undefined;
     if (!conversationId || !this.room.getConversation(conversationId)) {
-      stream.markdown("Cette discussion n'existe plus dans la session partagée. Ouvrez-en une autre depuis la liste des sessions.");
+      stream.markdown(t('native.missing'));
       return {};
     }
     const modelId = request.model?.vendor === 'copilot' ? request.model.id : undefined;
@@ -353,27 +358,27 @@ export class NativeChatBridge implements vscode.Disposable {
           return first;
         };
         if (tool.status === 'running') {
-          stream.progress(tool.title);
+          stream.progress(toolTitle(tool));
         } else if (tool.status === 'awaitingApproval' && tool.approval && answerId && once('approval')) {
           // Carte de validation façon Copilot, avec boutons.
-          const scope = tool.approval.hostOnly ? ' — hors du projet' : '';
-          stream.markdown(`\n\n**${tool.title}**${scope}\n\n\`\`\`diff\n${tool.approval.preview}\n\`\`\`\n`);
+          const heading = tool.approval.hostOnly ? t('native.approval.hostOnly', { title: toolTitle(tool) }) : `**${toolTitle(tool)}**`;
+          stream.markdown(`\n\n${heading}\n\n\`\`\`diff\n${tool.approval.preview}\n\`\`\`\n`);
           const args = (decision: string) => [answerId, tool.id, decision];
-          stream.button({ command: 'promptShare.resolveApproval', title: 'Autoriser', arguments: args('once') });
+          stream.button({ command: 'promptShare.resolveApproval', title: t('button.allow'), arguments: args('once') });
           if (!tool.approval.hostOnly) {
-            stream.button({ command: 'promptShare.resolveApproval', title: 'Autoriser pour la session', arguments: args('session') });
+            stream.button({ command: 'promptShare.resolveApproval', title: t('button.allowSession'), arguments: args('session') });
           }
           if (tool.approval.canShowDiff) {
-            stream.button({ command: 'promptShare.showDiff', title: 'Voir les modifications', arguments: [tool.id] });
+            stream.button({ command: 'promptShare.showDiff', title: t('button.viewChanges'), arguments: [tool.id] });
           }
-          stream.button({ command: 'promptShare.resolveApproval', title: 'Refuser', arguments: args('deny') });
+          stream.button({ command: 'promptShare.resolveApproval', title: t('button.deny'), arguments: args('deny') });
         } else if (tool.status === 'awaitingAnswer' && tool.question && answerId && once('question')) {
           stream.markdown(`\n\n❓ **${tool.question.text}**\n\n`);
           // Tout participant peut répondre, l'hôte aussi depuis le chat natif.
           for (const option of tool.question.options) {
             stream.button({ command: 'promptShare.answerQuestion', title: option, arguments: [answerId, tool.id, option] });
           }
-          stream.button({ command: 'promptShare.answerQuestion', title: 'Répondre…', arguments: [answerId, tool.id] });
+          stream.button({ command: 'promptShare.answerQuestion', title: t('button.answer'), arguments: [answerId, tool.id] });
         } else if ((tool.status === 'done' || tool.status === 'rejected' || tool.status === 'error') && once('end')) {
           stream.markdown(`\n\n${toolLine(tool)}\n\n`);
         }
@@ -382,7 +387,7 @@ export class NativeChatBridge implements vscode.Disposable {
       const showQueue = (queue: QueueState) => {
         const position = queue.pending.findIndex((q) => q.entryId === questionId);
         if (position >= 0) {
-          stream.progress(`En attente dans la file (position ${position + 1})…`);
+          stream.progress(t('native.queue.position', { position: position + 1 }));
         }
       };
 
@@ -398,7 +403,7 @@ export class NativeChatBridge implements vscode.Disposable {
           }
         }
         if (existing.status !== 'streaming') {
-          resolve(resultFor(existing.status, existing.error));
+          resolve(resultFor(existing.status, existing.error, existing.errorI18n));
           return;
         }
       } else {
@@ -410,7 +415,7 @@ export class NativeChatBridge implements vscode.Disposable {
           case 'entry':
             if (msg.entry.kind === 'assistant' && msg.entry.replyTo === questionId) {
               answerId = msg.entry.id;
-              stream.progress('Le modèle répond…');
+              stream.progress(t('native.answering'));
             }
             break;
           case 'chunk':
@@ -425,7 +430,7 @@ export class NativeChatBridge implements vscode.Disposable {
             break;
           case 'entryUpdate':
             if (msg.entryId === answerId && msg.status !== 'streaming') {
-              finish(resultFor(msg.status, msg.error));
+              finish(resultFor(msg.status, msg.error, msg.errorI18n));
             }
             break;
           case 'queue':
@@ -435,7 +440,7 @@ export class NativeChatBridge implements vscode.Disposable {
             break;
           case 'conversationDeleted':
           case 'sessionEnded':
-            finish({ errorDetails: { message: 'La discussion ou la session partagée a été fermée.' } });
+            finish({ errorDetails: { message: t('native.closed') } });
             break;
         }
       });
@@ -454,6 +459,15 @@ export class NativeChatBridge implements vscode.Disposable {
 function isChatTab(tab: vscode.Tab): boolean {
   const TabInputChat = (vscode as unknown as { TabInputChat?: new () => unknown }).TabInputChat;
   return TabInputChat ? tab.input instanceof TabInputChat : false;
+}
+
+/** Titre affiché d'une discussion (session et onglet du chat natif). */
+function displayTitle(conv: Conversation): string {
+  return conversationTitle(uiLang(), conv.title);
+}
+
+function toolTitle(tool: ToolActivity): string {
+  return roomText(uiLang(), tool.titleI18n, tool.title);
 }
 
 function resourceFor(conversationId: string): vscode.Uri {
@@ -475,18 +489,18 @@ function responseTurn(markdown: string): vscode.ChatResponseTurn2 {
 /** Question sans réponse : en attente de l'hôte (avec ses boutons), refusée, ou dans la file. */
 function pendingTurn(question: UserEntry): vscode.ChatResponseTurn2 {
   if (question.review === 'rejected') {
-    return responseTurn(`_Non envoyée au modèle : refusée par ${question.reviewedBy ?? "l'hôte"}._`);
+    return responseTurn(question.reviewedBy ? t('native.rejectedBy', { name: question.reviewedBy }) : t('native.rejectedByHost'));
   }
   if (question.review !== 'pending') {
-    return responseTurn("_En attente dans la file d'attente…_");
+    return responseTurn(t('native.queued'));
   }
   const decide = (title: string, accept: boolean) =>
     new vscode.ChatResponseCommandButtonPart({ command: 'promptShare.reviewQuestion', title, arguments: [question.id, accept] });
   return new vscode.ChatResponseTurn2(
     [
-      new vscode.ChatResponseMarkdownPart(`_Question de ${question.author} : l'envoyer au modèle avec votre compte ?_`),
-      decide('Envoyer au modèle', true),
-      decide('Refuser', false),
+      new vscode.ChatResponseMarkdownPart(t('native.review', { name: question.author })),
+      decide(t('button.sendToModel'), true),
+      decide(t('button.deny'), false),
     ],
     {},
     SESSION_TYPE,
@@ -495,18 +509,21 @@ function pendingTurn(question: UserEntry): vscode.ChatResponseTurn2 {
 
 function renderAnswer(answer: AssistantEntry): string {
   const body = answer.parts.map((p) => (p.type === 'text' ? p.text : `\n\n${toolLine(p.tool)}\n\n`)).join('');
-  const header = answer.model ? `_${answer.model} · réponse à ${answer.replyToAuthor}_\n\n` : '';
+  const header = answer.model ? `${t('native.answer.header', { model: answer.model, name: answer.replyToAuthor })}\n\n` : '';
+  const error = answer.errorI18n || answer.error ? roomText(uiLang(), answer.errorI18n, answer.error ?? '') : t('native.error');
   const footer =
-    answer.status === 'cancelled' ? '\n\n_Réponse annulée._' : answer.status === 'error' ? `\n\n⚠️ ${answer.error ?? 'Erreur'}` : '';
-  return `${header}${body || (answer.status === 'done' ? '_(réponse vide)_' : '')}${footer}`;
+    answer.status === 'cancelled' ? `\n\n${t('native.answer.cancelled')}` : answer.status === 'error' ? `\n\n⚠️ ${error}` : '';
+  return `${header}${body || (answer.status === 'done' ? t('native.answer.empty') : '')}${footer}`;
 }
 
 function toolLine(tool: ToolActivity): string {
   const icon = { done: '✓', error: '⚠️', rejected: '⛔', running: '⏳', awaitingApproval: '✋', awaitingAnswer: '❓' }[tool.status];
-  const answer = tool.answer ? ` — réponse de ${tool.answeredBy ?? '?'} : « ${tool.answer} »` : '';
-  return `> ${icon} ${tool.question ? tool.question.text : tool.title}${answer}${tool.detail ? ` — ${tool.detail}` : ''}`;
+  const answer = tool.answer ? t('native.tool.answer', { name: tool.answeredBy ?? '?', answer: tool.answer }) : '';
+  const detail = tool.detail || tool.detailI18n ? ` — ${roomText(uiLang(), tool.detailI18n, tool.detail ?? '')}` : '';
+  return `> ${icon} ${tool.question ? tool.question.text : toolTitle(tool)}${answer}${detail}`;
 }
 
-function resultFor(status: AssistantEntry['status'], error?: string): vscode.ChatResult {
-  return status === 'error' ? { errorDetails: { message: error ?? 'Erreur du modèle.' } } : {};
+function resultFor(status: AssistantEntry['status'], error?: string, errorI18n?: I18nText): vscode.ChatResult {
+  const message = errorI18n || error ? roomText(uiLang(), errorI18n, error ?? '') : t('native.modelError');
+  return status === 'error' ? { errorDetails: { message } } : {};
 }

@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import type { ApprovalDecision, ChatEntry, Conversation, ServerMessage, ToolActivity } from './protocol';
+import { conversationTitle, roomText } from './i18n/extension';
+import { t, uiLang } from './i18n/vscode';
 
 /**
  * Notifications de la session dans VS Code, pour l'hôte comme pour un invité qui a rejoint
@@ -100,7 +102,7 @@ export class SessionNotifier {
           const entry = this.entries.get(msg.entryId);
           const question = entry?.kind === 'assistant' ? this.entries.get(entry.replyTo) : undefined;
           if (msg.status === 'done' && question?.kind === 'user' && this.isMine(question.clientId) && this.level() === 'all') {
-            this.inform(`answer:${msg.entryId}`, `Réponse à votre question dans « ${this.title(question.conversationId)} ».`, question.conversationId);
+            this.inform(`answer:${msg.entryId}`, t('notify.answered', { title: this.title(question.conversationId) }), question.conversationId);
           }
         }
         break;
@@ -111,7 +113,7 @@ export class SessionNotifier {
         if (question?.kind === 'user') {
           question.review = msg.review;
           if (msg.review === 'rejected' && this.isMine(question.clientId) && !this.identity()?.isHost) {
-            this.inform(`rejected:${msg.entryId}`, `${msg.by} n’a pas envoyé votre question au modèle.`, question.conversationId);
+            this.inform(`rejected:${msg.entryId}`, t('notify.rejected', { name: msg.by }), question.conversationId);
           }
         }
         break;
@@ -134,7 +136,11 @@ export class SessionNotifier {
         this.changed();
         this.notifyReview(entry.id, entry.author, entry.text, entry.conversationId);
       } else if (live && !this.isMine(entry.clientId) && entry.review !== 'pending' && this.level() === 'all') {
-        this.inform(`entry:${entry.id}`, `${entry.author} dans « ${this.title(entry.conversationId)} » : ${excerpt(entry.text, 120)}`, entry.conversationId);
+        this.inform(
+          `entry:${entry.id}`,
+          t('notify.entry', { author: entry.author, title: this.title(entry.conversationId), text: excerpt(entry.text, 120) }),
+          entry.conversationId,
+        );
       }
     } else if (entry.kind === 'assistant' && entry.status === 'streaming') {
       for (const part of entry.parts) {
@@ -186,12 +192,12 @@ export class SessionNotifier {
     if (!this.shouldNotify(key)) {
       return;
     }
-    const accept = 'Envoyer au modèle';
-    const reject = 'Refuser';
-    const open = 'Ouvrir';
+    const accept = t('button.sendToModel');
+    const reject = t('button.deny');
+    const open = t('button.open');
     void this.ask(
       key,
-      () => vscode.window.showInformationMessage(`Prompt Share — question de ${author} : « ${excerpt(text, 200)} »`, accept, reject, open),
+      () => vscode.window.showInformationMessage(t('notify.review', { author, text: excerpt(text, 200) }), accept, reject, open),
       (choice) => {
         if (choice === open) {
           this.actions.open(conversationId);
@@ -211,25 +217,25 @@ export class SessionNotifier {
     }
     const approval = tool.approval!;
     const isHost = !!this.identity()?.isHost;
-    const allow = 'Autoriser';
-    const allowSession = 'Autoriser pour la session';
-    const diff = 'Voir les modifications';
-    const deny = 'Refuser';
-    const open = 'Ouvrir';
+    const allow = t('button.allow');
+    const allowSession = t('button.allowSession');
+    const diff = t('button.viewChanges');
+    const deny = t('button.deny');
+    const open = t('button.open');
     const buttons = [
       allow,
       ...(isHost && !approval.hostOnly ? [allowSession] : []),
       ...(isHost && approval.canShowDiff && this.actions.showDiff ? [diff] : [open]),
       deny,
     ];
-    const scope = approval.hostOnly ? ' (hors du projet — vous seul pouvez décider)' : '';
+    const params = {
+      author,
+      title: roomText(uiLang(), tool.titleI18n, tool.title),
+      preview: approval.preview.split('\n').slice(0, 6).join('\n'),
+    };
     void this.ask(
       key,
-      () =>
-        vscode.window.showWarningMessage(
-          `Prompt Share — ${author} : ${tool.title}${scope}\n${approval.preview.split('\n').slice(0, 6).join('\n')}`,
-          ...buttons,
-        ),
+      () => vscode.window.showWarningMessage(t(approval.hostOnly ? 'notify.approval.hostOnly' : 'notify.approval', params), ...buttons),
       (choice) => {
         if (choice === diff) {
           this.actions.showDiff?.(tool.id);
@@ -254,19 +260,19 @@ export class SessionNotifier {
       return;
     }
     const question = tool.question!;
-    const free = 'Répondre…';
-    const open = 'Ouvrir';
+    const free = t('button.answer');
+    const open = t('button.open');
     const options = question.options.slice(0, 3);
     void this.ask(
       key,
-      () => vscode.window.showInformationMessage(`Prompt Share — l’agent demande (pour ${question.requesterName}) : ${question.text}`, ...options, free, open),
+      () => vscode.window.showInformationMessage(t('notify.question', { name: question.requesterName, text: question.text }), ...options, free, open),
       async (choice) => {
         if (choice === open) {
           this.actions.open(conversationId);
           return true;
         }
         const text =
-          choice === free ? await vscode.window.showInputBox({ title: "Réponse à l'agent", prompt: question.text, ignoreFocusOut: true }) : choice;
+          choice === free ? await vscode.window.showInputBox({ title: t('notify.answerAgent.title'), prompt: question.text, ignoreFocusOut: true }) : choice;
         if (text && this.pending.has(key)) {
           this.actions.answer(entryId, tool.id, text);
         }
@@ -296,8 +302,8 @@ export class SessionNotifier {
     if (!this.shouldNotify(key)) {
       return;
     }
-    const open = 'Ouvrir';
-    void vscode.window.showInformationMessage(`Prompt Share — ${text}`, open).then((choice) => {
+    const open = t('button.open');
+    void vscode.window.showInformationMessage(t('notify.inform', { text }), open).then((choice) => {
       if (choice === open) {
         this.actions.open(conversationId);
       }
@@ -311,7 +317,7 @@ export class SessionNotifier {
   }
 
   private title(conversationId: string): string {
-    return this.conversationList.find((c) => c.id === conversationId)?.title ?? 'discussion';
+    return conversationTitle(uiLang(), this.conversationList.find((c) => c.id === conversationId)?.title);
   }
 
   private drop(pred: (p: Pending) => boolean): void {
@@ -333,9 +339,9 @@ export class SessionNotifier {
       counts[p.kind]++;
     }
     const parts = [
-      counts.review ? `${counts.review} question(s) d’invités à accepter` : '',
-      counts.approval ? `${counts.approval} action(s) de l’agent à valider` : '',
-      counts.question ? `${counts.question} question(s) de l’agent` : '',
+      counts.review ? t(counts.review === 1 ? 'pending.reviews.one' : 'pending.reviews.other', { count: counts.review }) : '',
+      counts.approval ? t(counts.approval === 1 ? 'pending.approvals.one' : 'pending.approvals.other', { count: counts.approval }) : '',
+      counts.question ? t(counts.question === 1 ? 'pending.questions.one' : 'pending.questions.other', { count: counts.question }) : '',
     ].filter(Boolean);
     this.onPendingChange(this.pending.size, parts.join(', '));
   }

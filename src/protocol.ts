@@ -1,3 +1,7 @@
+import type { I18nText, Lang } from './i18n/core';
+
+export type { I18nText, Lang } from './i18n/core';
+
 /**
  * Messages WebSocket échangés entre le serveur (extension hôte) et la page de chat.
  * Ce fichier est importé par les deux côtés : il ne doit contenir que des types
@@ -138,6 +142,9 @@ export interface ToolActivity {
   answer?: string;
   /** Participant qui a répondu. */
   answeredBy?: string;
+  /** `title` et `detail` à traduire dans la langue de chaque page (le texte brut sert de repli). */
+  titleI18n?: I18nText;
+  detailI18n?: I18nText;
 }
 
 /** Morceau d'une réponse, dans l'ordre d'affichage : texte ou action d'outil. */
@@ -156,6 +163,8 @@ export interface AssistantEntry extends BaseEntry {
   status: AssistantStatus;
   model?: string;
   error?: string;
+  /** `error` à traduire dans la langue de chaque page. */
+  errorI18n?: I18nText;
 }
 
 /** Code partagé par l'hôte depuis son éditeur. */
@@ -173,7 +182,10 @@ export interface ContextEntry extends BaseEntry {
 export interface SystemEntry extends BaseEntry {
   kind: 'system';
   level: 'info' | 'error';
+  /** Texte dans la langue de l'hôte (repli). */
   text: string;
+  /** Texte à traduire dans la langue de chaque page. */
+  i18n?: I18nText;
 }
 
 /**
@@ -227,7 +239,10 @@ export interface QueueState {
 // ---- Client -> serveur ----
 
 export type ClientMessage =
-  | { type: 'hello'; name: string; clientId: string }
+  /** `lang` : langue de la page, pour les messages que le serveur lui adresse. */
+  | { type: 'hello'; name: string; clientId: string; lang?: Lang }
+  /** Langue de la page changée en cours de session. */
+  | { type: 'setLang'; lang: Lang }
   /** `modelId` absent : modèle par défaut de la session. */
   | { type: 'ask'; conversationId: string; text: string; modelId?: string }
   | { type: 'cancel' }
@@ -296,6 +311,7 @@ export type ServerMessage =
       status: AssistantStatus;
       model?: string;
       error?: string;
+      errorI18n?: I18nText;
     }
   /** Décision de l'hôte sur une question d'invité. */
   | { type: 'questionReview'; entryId: string; review: QuestionReview; by: string }
@@ -326,7 +342,7 @@ export const LIMITS = {
 } as const;
 
 /** Titre d'une discussion tant qu'aucune question n'y a été posée. */
-export const DEFAULT_CONVERSATION_TITLE = 'Nouvelle discussion';
+export const DEFAULT_CONVERSATION_TITLE = '';
 
 /** Codes de fermeture WebSocket applicatifs (plage 4000-4999). */
 export const CLOSE_CODES = {

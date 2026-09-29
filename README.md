@@ -206,6 +206,16 @@ Si le service choisi échoue (réseau filtré, compte…), l'extension affiche l
 
 **Partager le lien** : envoyez le lien copié (il contient le token). Toute personne qui possède ce lien peut rejoindre le chat et poser des questions. Pour révoquer l'accès, arrêtez la session et redémarrez-en une : un nouveau token est généré.
 
+## Langues
+
+Prompt Share existe en **français**, **anglais** et **allemand**. Chaque participant a sa langue :
+
+- dans VS Code, le réglage `promptShare.language` (`auto` par défaut : langue de VS Code, anglais si elle n'est pas prise en charge) ;
+- dans un navigateur, la langue du navigateur ;
+- dans les deux cas, le sélecteur de langue (écran d'accueil, fenêtre **Participants**) la change à chaud ; dans VS Code, il modifie le réglage.
+
+Les messages du serveur (refus, messages système, actions de l'agent) s'affichent dans la langue de chacun : un invité germanophone voit l'interface en allemand, même si l'hôte est francophone. Les réponses du modèle suivent la langue de l'auteur de la question. Les titres des commandes et des réglages suivent la langue de VS Code.
+
 ## Contexte, compactage et fork
 
 - **Jauge du contexte** : sous la zone de saisie, un anneau et un pourcentage indiquent la taille de ce que le modèle reçoit avec chaque question de la discussion (consigne et outils, dernier résumé, échanges récents), en tokens du modèle, par rapport à son maximum. Un clic affiche le détail. Elle passe à l'orange à 75 %, au rouge à 90 %.
@@ -245,6 +255,7 @@ L'hôte peut rendre accessible aux participants une application qui tourne sur s
 | `promptShare.wslSandbox` | `true` | Sous Windows, isole les commandes dans WSL avec bubblewrap si disponibles. |
 | `promptShare.wslDistro` | `""` | Distribution WSL du bac à sable (vide : distribution par défaut). |
 | `promptShare.nativeChat` | `true` | Affiche les discussions dans le panneau Chat natif (API expérimentale, voir plus haut). |
+| `promptShare.language` | `auto` | Langue de l'interface : `auto` (langue de VS Code), `fr`, `en`, `de`. Se change aussi depuis le chat. |
 | `promptShare.tunnelProvider` | `cloudflare` | Service présélectionné dans **Inviter** (le dernier choisi y est mémorisé) : `cloudflare` (sans compte) ou `ngrok` (compte gratuit, adresse liée au compte). |
 | `promptShare.notifications` | `decisions` | Notifications de VS Code : `decisions` (quand une décision vous attend), `all` (aussi les nouvelles questions et les réponses à vos questions), `off`. |
 | `promptShare.reviewGuestQuestions` | `true` | Les questions des invités attendent l'accord de l'hôte avant d'être envoyées au modèle. |

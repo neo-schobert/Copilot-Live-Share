@@ -27,6 +27,8 @@ import {
   UserEntry,
 } from './protocol';
 import type { Connection, ConnectionHandler } from './server';
+import { I18nText, isLang, Lang, Params } from './i18n/core';
+import { I18nError, renderRoomText, RoomKey, roomT, roomText } from './i18n/room';
 
 /**
  * État d'une session de chat : discussions, historique, participants et file
@@ -57,6 +59,8 @@ export interface ModelRequest {
   interaction: ToolInteraction;
   /** Sans outils (compactage : simple résumé). */
   noTools?: boolean;
+  /** Langue de l'hôte, pour les notes insérées dans la réponse. */
+  lang?: Lang;
 }
 
 /**
@@ -140,6 +144,8 @@ export interface ChatRoomOptions {
   onInviteRequested?: (publicUrl: string | undefined, copy: boolean) => Promise<InviteResult>;
   /** L'hôte demande à voir le diff complet d'une action. */
   onShowDiff?: (entryId: string, toolId: string) => void;
+  /** Langue de l'hôte : repli des textes générés par le serveur, et langue d'une page qui ne la précise pas. */
+  defaultLang?: () => Lang;
   /** Règles de la session (lues à chaque question). Absent : aucune validation, pas de limite. */
   policy?: () => SessionPolicy;
   /** Une question d'invité attend l'accord de l'hôte. */
@@ -150,8 +156,8 @@ export interface ChatRoomOptions {
   onTunnelStop?: () => void;
   /** L'hôte change un réglage de la session depuis le chat. */
   onSessionOption?: (option: SessionOption, value: boolean) => void;
-  /** Motif de refus du partage de ce port (ex. port du serveur de session), sinon undefined. */
-  appRefusal?: (port: number) => string | undefined;
+  /** Motif de refus du partage de ce port (ex. port du serveur de session), sinon undefined. Texte brut ou à traduire. */
+  appRefusal?: (port: number) => string | I18nText | undefined;
   /** Liste des applications partagées modifiée (coupure des relais d'un port retiré). */
   onAppsChanged?: (apps: SharedApp[]) => void;
 }
@@ -165,6 +171,8 @@ interface Waiter<T> {
 
 interface ClientState extends Participant {
   joined: boolean;
+  /** Langue de la page, pour les messages qui lui sont adressés. */
+  lang: Lang;
 }
 
 interface QueuedQuestion extends QueueItem {
@@ -180,21 +188,22 @@ interface ConversationState extends Conversation {
   measuring?: number;
 }
 
-const SUMMARY_PREFIX = '[Résumé des échanges précédents de cette discussion, fait par compactage]';
+// Textes envoyés au modèle : en anglais (le modèle répond dans la langue de l'auteur de la question).
+const SUMMARY_PREFIX = '[Summary of the previous exchanges of this conversation, produced by compaction]';
 
 const COMPACT_PROMPT = [
-  'Tu compactes une discussion de programmation partagée entre plusieurs personnes.',
-  'Résume les échanges ci-dessous pour qu’un assistant puisse poursuivre la discussion sans eux :',
-  'objectifs, décisions prises, fichiers et code concernés (chemins, noms de fonctions), problèmes rencontrés et solutions,',
-  'questions en suspens, et qui a demandé quoi (pseudos).',
-  'Sois factuel et concis (400 mots au plus), en Markdown, dans la langue de la discussion. Ne réponds à aucune question.',
+  'You are compacting a programming conversation shared between several people.',
+  'Summarize the exchanges below so that an assistant can continue the conversation without them:',
+  'goals, decisions made, files and code involved (paths, function names), problems encountered and their solutions,',
+  'open questions, and who asked for what (names).',
+  'Be factual and concise (400 words at most), in Markdown, in the language of the conversation. Do not answer any question.',
 ].join('\n');
 
 const SYSTEM_PROMPT = [
-  'Tu es un assistant de programmation dans un chat partagé entre plusieurs personnes.',
-  'Chaque message utilisateur est préfixé par le pseudo de son auteur, sous la forme « pseudo: message ».',
-  "Les blocs « Contexte partagé » contiennent du code partagé par l'hôte depuis son éditeur.",
-  "Réponds à la dernière question, en Markdown, dans la langue de son auteur. Tu peux t'adresser à lui par son pseudo.",
+  'You are a programming assistant in a chat shared between several people.',
+  'Each user message is prefixed with the name of its author, in the form "name: message".',
+  'The "Shared context" blocks contain code shared by the host from their editor.',
+  'Answer the last question, in Markdown, in the language of its author. You may address them by their name.',
 ].join('\n');
 
 export class ChatRoom implements ConnectionHandler {
@@ -221,13 +230,18 @@ export class ChatRoom implements ConnectionHandler {
     private readonly backend: ModelBackend,
     private readonly options: ChatRoomOptions,
   ) {
-    this.createConversation(options.hostName ?? 'hôte', '');
+    this.createConversation(options.hostName ?? roomT(this.hostLang(), 'participant.host'), '');
+  }
+
+  /** Langue de l'hôte : textes générés par le serveur (repli) et appels de l'extension. */
+  private hostLang(): Lang {
+    return this.options.defaultLang?.() ?? 'en';
   }
 
   // ---- ConnectionHandler ----
 
   onOpen(conn: Connection): void {
-    this.clients.set(conn, { clientId: '', name: '', isHost: conn.isHost, viewing: null, joined: false });
+    this.clients.set(conn, { clientId: '', name: '', isHost: conn.isHost, viewing: null, joined: false, lang: this.hostLang() });
   }
 
   onClose(conn: Connection): void {
@@ -246,34 +260,44 @@ export class ChatRoom implements ConnectionHandler {
     }
     const msg = parseClientMessage(data);
     if (!msg) {
-      conn.send({ type: 'error', message: 'Message invalide.' });
+      conn.send({ type: 'error', message: roomT(state.lang, 'error.invalidMessage') });
       return;
     }
 
     if (msg.type === 'hello') {
+      if (msg.lang) {
+        state.lang = msg.lang;
+      }
       this.handleHello(conn, state, msg.name, msg.clientId);
       return;
     }
     if (!state.joined) {
-      conn.send({ type: 'error', message: "Choisissez d'abord un pseudo." });
+      conn.send({ type: 'error', message: roomT(state.lang, 'error.chooseName') });
+      return;
+    }
+    if (msg.type === 'setLang') {
+      state.lang = msg.lang;
       return;
     }
     const fail = (message: string) => conn.send({ type: 'error', message });
+    /** Refus traduit dans la langue de ce participant. */
+    const refuse = (key: RoomKey, params?: Params) => fail(roomT(state.lang, key, params));
+    const refuseText = (text: I18nText | undefined) => text && fail(renderRoomText(state.lang, text));
 
     switch (msg.type) {
       case 'ask':
-        this.enqueueQuestion(state, msg.conversationId, msg.text, msg.modelId, fail);
+        this.enqueueQuestion(state, msg.conversationId, msg.text, msg.modelId, refuseText);
         break;
       case 'cancel':
         if (!state.isHost) {
-          fail("Seul l'hôte peut annuler une réponse.");
+          refuse('error.hostOnlyCancel');
         } else if (!this.cancelCurrent()) {
-          fail('Aucune réponse en cours.');
+          refuse('error.noActiveResponse');
         }
         break;
       case 'invite':
         if (!state.isHost) {
-          fail("Seul l'hôte peut obtenir le lien d'invitation.");
+          refuse('error.hostOnlyInvite');
         } else if (this.options.onInviteRequested) {
           void this.options.onInviteRequested(msg.publicUrl, msg.copy).then((result) => conn.send({ type: 'invite', ...result }));
         }
@@ -291,7 +315,7 @@ export class ChatRoom implements ConnectionHandler {
         break;
       case 'createConversation':
         if (this.conversations.length >= LIMITS.maxConversations) {
-          fail(`Nombre maximal de discussions atteint (${LIMITS.maxConversations}).`);
+          refuse('error.maxConversations', { max: LIMITS.maxConversations });
         } else {
           this.createConversation(state.name, state.clientId);
         }
@@ -308,7 +332,7 @@ export class ChatRoom implements ConnectionHandler {
       }
       case 'deleteConversation':
         if (!state.isHost) {
-          fail("Seul l'hôte peut supprimer une discussion.");
+          refuse('error.hostOnlyDelete');
         } else {
           this.deleteConversation(msg.conversationId);
         }
@@ -316,7 +340,7 @@ export class ChatRoom implements ConnectionHandler {
       case 'approve': {
         const refusal = this.approvalRefusal(state, msg.entryId, msg.toolId, msg.decision);
         if (refusal) {
-          fail(refusal);
+          refuse(refusal);
         } else {
           this.resolveApproval(msg.entryId, msg.toolId, msg.decision, state.name);
         }
@@ -330,10 +354,10 @@ export class ChatRoom implements ConnectionHandler {
       case 'shareApp':
       case 'unshareApp': {
         if (!state.isHost) {
-          fail("Seul l'hôte peut partager une application.");
+          refuse('error.hostOnlyShareApp');
           break;
         }
-        const refusal = msg.type === 'shareApp' ? this.shareApp(msg.port, msg.label) : (this.unshareApp(msg.port), undefined);
+        const refusal = msg.type === 'shareApp' ? this.shareApp(msg.port, msg.label, state.lang) : (this.unshareApp(msg.port), undefined);
         if (refusal) {
           fail(refusal);
         }
@@ -341,20 +365,22 @@ export class ChatRoom implements ConnectionHandler {
       }
       case 'startTunnel':
         if (!state.isHost) {
-          fail("Seul l'hôte peut ouvrir un tunnel.");
+          refuse('error.hostOnlyStartTunnel');
         } else if (this.options.onTunnelRequested) {
           void this.options.onTunnelRequested(msg.provider).then((result) => conn.send({ type: 'invite', ...result }));
         }
         break;
       case 'compact': {
-        const refusal = state.isHost ? this.compact(msg.conversationId, state.name, state.clientId) : "Seul l'hôte peut compacter une discussion (requête au modèle).";
+        const refusal = state.isHost
+          ? this.compact(msg.conversationId, state.name, state.clientId, state.lang)
+          : roomT(state.lang, 'error.hostOnlyCompact');
         if (refusal) {
           fail(refusal);
         }
         break;
       }
       case 'fork': {
-        const refusal = this.fork(msg.conversationId, msg.upToEntryId, state.name, state.clientId);
+        const refusal = this.fork(msg.conversationId, msg.upToEntryId, state.name, state.clientId, state.lang);
         if (refusal) {
           fail(refusal);
         }
@@ -362,29 +388,29 @@ export class ChatRoom implements ConnectionHandler {
       }
       case 'setSessionOption':
         if (!state.isHost) {
-          fail("Seul l'hôte peut changer les réglages de la session.");
+          refuse('error.hostOnlySettings');
         } else {
           this.options.onSessionOption?.(msg.option, msg.value);
         }
         break;
       case 'stopTunnel':
         if (!state.isHost) {
-          fail("Seul l'hôte peut fermer le tunnel.");
+          refuse('error.hostOnlyStopTunnel');
         } else {
           this.options.onTunnelStop?.();
         }
         break;
       case 'reviewQuestion':
         if (!state.isHost) {
-          fail("Seul l'hôte peut accepter ou refuser une question.");
+          refuse('error.hostOnlyReview');
         } else if (!this.reviewQuestion(msg.entryId, msg.accept, state.name)) {
-          fail("Cette question n'attend plus de validation.");
+          refuse('error.reviewExpired');
         }
         break;
       case 'answer': {
         // Tout participant peut répondre ; la première réponse l'emporte.
         if (!this.answerQuestion(msg.entryId, msg.toolId, msg.text, state.name)) {
-          fail("Cette question n'attend plus de réponse.");
+          refuse('error.answerExpired');
         }
         break;
       }
@@ -480,11 +506,11 @@ export class ChatRoom implements ConnectionHandler {
   }
 
   /** Motif de refus si ce participant ne peut pas prendre cette décision, sinon undefined. */
-  private approvalRefusal(state: ClientState, entryId: string, toolId: string, decision: ApprovalDecision): string | undefined {
+  private approvalRefusal(state: ClientState, entryId: string, toolId: string, decision: ApprovalDecision): RoomKey | undefined {
     const waiter = this.approvals.get(key(entryId, toolId));
     const approval = waiter?.info.tool.approval;
     if (!approval) {
-      return "Cette action n'attend plus de validation.";
+      return 'error.approvalExpired';
     }
     if (state.isHost) {
       return undefined;
@@ -493,13 +519,13 @@ export class ChatRoom implements ConnectionHandler {
     const question = answer?.kind === 'assistant' ? this.entries.find((e) => e.id === answer.replyTo) : undefined;
     const isRequester = question?.kind === 'user' && question.clientId === state.clientId;
     if (!isRequester) {
-      return "Seuls l'hôte et l'auteur de la demande peuvent décider.";
+      return 'error.approvalNotAllowed';
     }
     if (approval.hostOnly) {
-      return "Cette action sort du projet : seul l'hôte peut la valider ou la refuser.";
+      return 'error.approvalHostOnly';
     }
     if (decision === 'session') {
-      return "Seul l'hôte peut autoriser une action pour toute la session.";
+      return 'error.approvalSessionHostOnly';
     }
     return undefined;
   }
@@ -543,18 +569,19 @@ export class ChatRoom implements ConnectionHandler {
 
   /**
    * Met en file le compactage d'une discussion : le modèle résume ses échanges, et ce
-   * résumé remplace, pour la suite, l'historique envoyé au modèle. Renvoie un motif de refus.
+   * résumé remplace, pour la suite, l'historique envoyé au modèle. Renvoie un motif de refus
+   * dans la langue `lang` (par défaut celle de l'hôte).
    */
-  compact(conversationId: string, author: string, clientId: string): string | undefined {
+  compact(conversationId: string, author: string, clientId: string, lang: Lang = this.hostLang()): string | undefined {
     const conv = this.findConversation(conversationId);
     if (!conv) {
-      return "Cette discussion n'existe plus.";
+      return roomT(lang, 'error.conversationGone');
     }
     if ([...this.queue, ...(this.current ? [this.current.item] : [])].some((q) => q.kind === 'compact' && q.conversationId === conversationId)) {
-      return 'Compactage déjà en cours pour cette discussion.';
+      return roomT(lang, 'error.compactInProgress');
     }
     if (!this.historyUnits(conversationId).units.length) {
-      return 'Rien à compacter : aucun échange depuis le dernier résumé.';
+      return roomT(lang, 'error.nothingToCompact');
     }
     this.queue.push({ entryId: newId(), conversationId, clientId, author, text: '', kind: 'compact' });
     this.broadcastQueue();
@@ -565,19 +592,20 @@ export class ChatRoom implements ConnectionHandler {
   /**
    * Copie une discussion jusqu'à une entrée (incluse, avec sa réponse s'il s'agit d'une
    * question) dans une nouvelle discussion. Les questions sans réponse ne sont pas copiées.
+   * Renvoie un motif de refus dans la langue `lang` (par défaut celle de l'hôte).
    */
-  fork(conversationId: string, upToEntryId: string | undefined, author: string, clientId: string): string | undefined {
+  fork(conversationId: string, upToEntryId: string | undefined, author: string, clientId: string, lang: Lang = this.hostLang()): string | undefined {
     const source = this.findConversation(conversationId);
     if (!source) {
-      return "Cette discussion n'existe plus.";
+      return roomT(lang, 'error.conversationGone');
     }
     if (this.conversations.length >= LIMITS.maxConversations) {
-      return `Nombre maximal de discussions atteint (${LIMITS.maxConversations}).`;
+      return roomT(lang, 'error.maxConversations', { max: LIMITS.maxConversations });
     }
     const entries = this.entriesOf(conversationId);
     let end = upToEntryId ? entries.findIndex((e) => e.id === upToEntryId) : entries.length - 1;
     if (end < 0) {
-      return "Ce message n'existe plus.";
+      return roomT(lang, 'error.messageGone');
     }
     const cut = entries[end];
     if (cut.kind === 'user') {
@@ -604,7 +632,7 @@ export class ChatRoom implements ConnectionHandler {
     }
     const conv: ConversationState = {
       id: newId(),
-      title: sanitizeLine(`${source.title} (fork)`, LIMITS.maxTitleLength),
+      title: sanitizeLine(roomT(lang, 'conv.forkTitle', { title: source.title || roomT(lang, 'conv.untitled') }), LIMITS.maxTitleLength),
       createdAt: Date.now(),
       createdBy: author,
       createdByClientId: clientId,
@@ -634,17 +662,17 @@ export class ChatRoom implements ConnectionHandler {
     }
   }
 
-  /** Partage une application locale de l'hôte. Renvoie un motif de refus, ou undefined. */
-  shareApp(port: number, rawLabel?: string): string | undefined {
+  /** Partage une application locale de l'hôte. Renvoie un motif de refus (dans la langue `lang`, par défaut celle de l'hôte), ou undefined. */
+  shareApp(port: number, rawLabel?: string, lang: Lang = this.hostLang()): string | undefined {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      return 'Port invalide (1 à 65535).';
+      return roomT(lang, 'error.invalidPort');
     }
     const refusal = this.options.appRefusal?.(port);
     if (refusal) {
-      return refusal;
+      return typeof refusal === 'string' ? refusal : renderRoomText(lang, refusal);
     }
     if (!this.apps.has(port) && this.apps.size >= LIMITS.maxSharedApps) {
-      return `Au plus ${LIMITS.maxSharedApps} applications partagées.`;
+      return roomT(lang, 'error.maxSharedApps', { max: LIMITS.maxSharedApps });
     }
     const label = sanitizeLine(rawLabel ?? '', LIMITS.maxTitleLength) || `localhost:${port}`;
     this.apps.set(port, { port, label });
@@ -709,15 +737,17 @@ export class ChatRoom implements ConnectionHandler {
 
   /**
    * Pose une question au nom de l'hôte depuis VS Code. Renvoie l'id de la question,
-   * ou lève une Error si elle est refusée.
+   * ou lève une Error si elle est refusée (message dans la langue de l'hôte, `i18n` pour la traduire).
    */
   askAsHost(conversationId: string, text: string, author: string, modelId?: string): string {
-    const state: ClientState = { clientId: LOCAL_HOST_CLIENT_ID, name: author, isHost: true, viewing: null, joined: true };
-    let error: string | undefined;
+    const lang = this.hostLang();
+    const state: ClientState = { clientId: LOCAL_HOST_CLIENT_ID, name: author, isHost: true, viewing: null, joined: true, lang };
+    let error: I18nText | undefined;
     const knownModel = modelId && this.models.available.some((m) => m.id === modelId) ? modelId : undefined;
     const id = this.enqueueQuestion(state, conversationId, text, knownModel, (m) => (error = m));
     if (!id) {
-      throw new Error(error ?? 'Question vide.');
+      const refusal: I18nText = error ?? roomText('error.emptyQuestion');
+      throw Object.assign(new Error(renderRoomText(lang, refusal)), { i18n: refusal });
     }
     return id;
   }
@@ -731,7 +761,7 @@ export class ChatRoom implements ConnectionHandler {
     const before = this.queue.length;
     removeWhere(this.queue, (q) => q.entryId === entryId);
     if (this.queue.length !== before) {
-      this.addSystemMessage(entryId, 'Question retirée de la file.');
+      this.addSystemMessage(entryId, 'system.questionRemoved');
       this.broadcastQueue();
     }
   }
@@ -771,7 +801,7 @@ export class ChatRoom implements ConnectionHandler {
   private handleHello(conn: Connection, state: ClientState, rawName: string, rawClientId: string): void {
     const name = sanitizeLine(rawName, LIMITS.maxNameLength);
     if (!name) {
-      conn.send({ type: 'error', message: 'Pseudo invalide.' });
+      conn.send({ type: 'error', message: roomT(state.lang, 'error.invalidName') });
       conn.close(CLOSE_CODES.protocolError, 'Invalid name');
       return;
     }
@@ -802,11 +832,11 @@ export class ChatRoom implements ConnectionHandler {
     conversationId: string,
     rawText: string,
     rawModelId: string | undefined,
-    fail: (message: string) => void,
+    fail: (refusal: I18nText) => void,
   ): string | undefined {
     const conv = this.findConversation(conversationId);
     if (!conv) {
-      fail("Cette discussion n'existe plus.");
+      fail(roomText('error.conversationGone'));
       return undefined;
     }
     const text = rawText.trim();
@@ -814,24 +844,24 @@ export class ChatRoom implements ConnectionHandler {
       return undefined;
     }
     if (text.length > LIMITS.maxQuestionLength) {
-      fail(`Question trop longue (max ${LIMITS.maxQuestionLength} caractères).`);
+      fail(roomText('error.questionTooLong', { max: LIMITS.maxQuestionLength }));
       return undefined;
     }
     let modelId: string | undefined;
     if (rawModelId) {
       if (!state.isHost && !this.models.guestsCanChoose) {
-        fail("L'hôte a fixé le modèle : choix de modèle non autorisé.");
+        fail(roomText('error.modelFixed'));
         return undefined;
       }
       if (!this.models.available.some((m) => m.id === rawModelId)) {
-        fail("Ce modèle n'est plus disponible. Choisissez-en un autre.");
+        fail(roomText('error.modelUnavailable'));
         return undefined;
       }
       modelId = rawModelId;
     }
     const pendingForClient = [...this.queue, ...this.awaitingReview].filter((q) => q.clientId === state.clientId).length;
     if (pendingForClient >= LIMITS.maxPendingPerClient) {
-      fail(`Vous avez déjà ${pendingForClient} questions en attente.`);
+      fail(roomText('error.tooManyPending', { count: pendingForClient }));
       return undefined;
     }
     const policy = this.policy();
@@ -890,7 +920,7 @@ export class ChatRoom implements ConnectionHandler {
    * Limite horaire des questions d'invités, pour toute la session (un invité peut changer
    * d'identifiant client). Les questions en attente de l'hôte comptent déjà.
    */
-  private guestLimitRefusal(policy: SessionPolicy): string | undefined {
+  private guestLimitRefusal(policy: SessionPolicy): I18nText | undefined {
     const limit = Math.floor(policy.guestQuestionsPerHour);
     if (limit <= 0) {
       return undefined;
@@ -901,16 +931,19 @@ export class ChatRoom implements ConnectionHandler {
       return undefined;
     }
     const minutes = this.guestSent.length ? Math.max(1, Math.ceil((this.guestSent[0] + HOUR_MS - now) / 60_000)) : undefined;
-    return (
-      `L'hôte a limité les questions des invités à ${limit} par heure pour la session.` +
-      (minutes ? ` Prochaine question possible dans ${minutes} min.` : " Attendez que l'hôte traite les questions en attente.")
-    );
+    return minutes ? roomText('error.guestLimitWait', { limit, minutes }) : roomText('error.guestLimitPending', { limit });
   }
 
-  private addSystemMessage(nearEntryId: string, text: string): void {
+  /** Entrée système : `text` dans la langue de l'hôte (repli), `i18n` traduit par chaque page. */
+  private systemEntry(conversationId: string, level: 'info' | 'error', key: RoomKey, params?: Params): ChatEntry {
+    const i18n = roomText(key, params);
+    return { kind: 'system', id: newId(), conversationId, timestamp: Date.now(), level, text: renderRoomText(this.hostLang(), i18n), i18n };
+  }
+
+  private addSystemMessage(nearEntryId: string, key: RoomKey, params?: Params): void {
     const near = this.entries.find((e) => e.id === nearEntryId);
     if (near) {
-      this.pushEntry({ kind: 'system', id: newId(), conversationId: near.conversationId, timestamp: Date.now(), level: 'info', text });
+      this.pushEntry(this.systemEntry(near.conversationId, 'info', key, params));
     }
   }
 
@@ -955,7 +988,7 @@ export class ChatRoom implements ConnectionHandler {
     this.broadcast({ type: 'conversationDeleted', conversationId: id });
     // Il reste toujours au moins une discussion.
     if (!this.conversations.length) {
-      this.createConversation('hôte', '');
+      this.createConversation(roomT(this.hostLang(), 'participant.host'), '');
     }
     this.broadcastQueue();
     this.broadcastParticipants();
@@ -1009,6 +1042,7 @@ export class ChatRoom implements ConnectionHandler {
           author: item.author,
           authorClientId: item.clientId,
           interaction: this.interactionFor(entry, signal),
+          lang: this.hostLang(),
         },
         signal,
       );
@@ -1032,7 +1066,11 @@ export class ChatRoom implements ConnectionHandler {
         entry.status = 'cancelled';
       } else {
         entry.status = 'error';
-        entry.error = err instanceof Error ? err.message : String(err);
+        const i18n = errorText(err);
+        entry.error = i18n ? renderRoomText(this.hostLang(), i18n) : err instanceof Error ? err.message : String(err);
+        if (i18n) {
+          entry.errorI18n = i18n;
+        }
       }
     }
     if (!this.disposed) {
@@ -1042,6 +1080,7 @@ export class ChatRoom implements ConnectionHandler {
         status: entry.status,
         model: entry.model,
         error: entry.error,
+        ...(entry.errorI18n ? { errorI18n: entry.errorI18n } : {}),
       });
     }
   }
@@ -1136,7 +1175,7 @@ export class ChatRoom implements ConnectionHandler {
         if (!answer || answer.status === 'streaming' || answer.status === 'error' || !answer.text) {
           continue;
         }
-        const reply = answer.status === 'cancelled' ? `${answer.text}\n\n[réponse interrompue]` : answer.text;
+        const reply = answer.status === 'cancelled' ? `${answer.text}\n\n[answer interrupted]` : answer.text;
         units.push([
           { role: 'user', content: `${e.author}: ${e.text}` },
           { role: 'assistant', content: reply },
@@ -1152,10 +1191,10 @@ export class ChatRoom implements ConnectionHandler {
     const { units, summary } = this.historyUnits(item.conversationId);
     const transcript = units
       .flat()
-      .map((t) => (t.role === 'assistant' ? `Assistant : ${t.content}` : t.content))
+      .map((t) => (t.role === 'assistant' ? `Assistant: ${t.content}` : t.content))
       .join('\n\n');
     const before = this.findConversation(item.conversationId)?.context?.tokens;
-    const content = [COMPACT_PROMPT, summary ? `Résumé précédent (à intégrer) :\n${summary.text}` : '', `Échanges :\n${transcript}`]
+    const content = [COMPACT_PROMPT, summary ? `Previous summary (to integrate):\n${summary.text}` : '', `Exchanges:\n${transcript}`]
       .filter(Boolean)
       .join('\n\n');
     try {
@@ -1167,6 +1206,7 @@ export class ChatRoom implements ConnectionHandler {
           authorClientId: item.clientId,
           interaction: { approval: async () => ({ decision: 'deny', by: '' }), answer: async () => ({ text: '', by: '' }) },
           noTools: true,
+          lang: this.hostLang(),
         },
         signal,
       );
@@ -1180,7 +1220,7 @@ export class ChatRoom implements ConnectionHandler {
         }
       }
       if (!text.trim() || !this.findConversation(item.conversationId)) {
-        throw new Error('résumé vide');
+        throw new I18nError('system.compactEmpty');
       }
       this.pushEntry({
         kind: 'summary',
@@ -1194,14 +1234,15 @@ export class ChatRoom implements ConnectionHandler {
       });
     } catch (err) {
       if (!signal.aborted && this.findConversation(item.conversationId)) {
-        this.pushEntry({
-          kind: 'system',
-          id: newId(),
-          conversationId: item.conversationId,
-          timestamp: Date.now(),
-          level: 'error',
-          text: `Compactage impossible : ${err instanceof Error ? err.message : String(err)}`,
-        });
+        const i18n = errorText(err);
+        this.pushEntry(
+          i18n?.key === 'system.compactEmpty'
+            ? this.systemEntry(item.conversationId, 'error', 'system.compactEmpty')
+            : this.systemEntry(item.conversationId, 'error', 'system.compactFailed', {
+                // Erreur du modèle : rendue dans la langue de l'hôte (pas de traduction imbriquée).
+                error: i18n ? renderRoomText(this.hostLang(), i18n) : err instanceof Error ? err.message : String(err),
+              }),
+        );
       }
     }
   }
@@ -1293,7 +1334,11 @@ function parseClientMessage(data: string): ClientMessage | undefined {
   const str = (v: unknown): v is string => typeof v === 'string';
   switch (m.type) {
     case 'hello':
-      return str(m.name) && str(m.clientId) ? { type: 'hello', name: m.name, clientId: m.clientId } : undefined;
+      return str(m.name) && str(m.clientId)
+        ? { type: 'hello', name: m.name, clientId: m.clientId, lang: isLang(m.lang) ? m.lang : undefined }
+        : undefined;
+    case 'setLang':
+      return isLang(m.lang) ? { type: 'setLang', lang: m.lang } : undefined;
     case 'ask':
       if (!str(m.text) || !str(m.conversationId) || (m.modelId !== undefined && !str(m.modelId))) {
         return undefined;
@@ -1371,7 +1416,16 @@ function publicConversation({ id, title, createdAt, createdBy, createdByClientId
 
 function formatContext(e: ContextEntry): string {
   const where = e.range ? `${e.fileName} (${e.range})` : e.fileName;
-  return `[Contexte partagé par ${e.author} : ${where}]\n\`\`\`${e.languageId}\n${e.code}\n\`\`\``;
+  return `[Shared context from ${e.author}: ${where}]\n\`\`\`${e.languageId}\n${e.code}\n\`\`\``;
+}
+
+/** Texte traduisible d'une erreur (I18nError, ou Error portant un champ `i18n`). */
+function errorText(err: unknown): I18nText | undefined {
+  if (err instanceof I18nError) {
+    return err.i18n;
+  }
+  const i18n = (err as { i18n?: unknown } | null)?.i18n;
+  return i18n && typeof i18n === 'object' && typeof (i18n as I18nText).key === 'string' ? (i18n as I18nText) : undefined;
 }
 
 /** Fusionne les messages consécutifs de même rôle pour garantir l'alternance user/assistant. */

@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "isolatedModules": true
   },
-  "include": ["./**/*.ts", "../protocol.ts"]
+  "include": ["./**/*.ts", "../protocol.ts", "../i18n/*.ts"]
 }
