@@ -11,6 +11,8 @@ import { ChatController, ChatViewProvider, ConnectionTarget, inviteTarget, ViewS
 import { NativeChatBridge } from './nativeChat';
 import { consumePendingStart, prepareEnvironment } from './wslSetup';
 import { ChatServer } from './server';
+import { PortForwarder } from './portForward';
+import { Tunnel, TunnelManager, TunnelProvider, TunnelUnreachableError } from './tunnel';
 
 const CONFIG = 'promptShare';
 /** Au-delà, le partage de contexte demande confirmation (le modèle a une fenêtre limitée). */
@@ -21,6 +23,8 @@ class Session {
   publicUrl: string | undefined;
   /** Intégration au panneau Chat natif, si l'API proposée est disponible. */
   nativeChat: NativeChatBridge | undefined;
+  /** Tunnel public ouvert par l'extension (arrêté avec la session). */
+  tunnel: Tunnel | undefined;
 
   constructor(
     readonly server: ChatServer,
@@ -34,6 +38,8 @@ class Session {
   }
 
   async stop(): Promise<void> {
+    this.tunnel?.stop();
+    this.tunnel = undefined;
     this.nativeChat?.dispose();
     this.nativeChat = undefined;
     this.room.dispose("L'hôte a arrêté la session.");
@@ -60,6 +66,9 @@ const log = (message: string) => {
 };
 let chatView: ChatViewProvider | undefined;
 let notifier: SessionNotifier;
+let tunnels: TunnelManager;
+/** Invité dans VS Code : relais vers les applications partagées par l'hôte. */
+let forwarder: PortForwarder | undefined;
 /** Dernier nombre de participants connu (barre d'état). */
 let participantCount = 0;
 /** Derniers évènements de la vue (diagnostic, tests). */
@@ -86,6 +95,8 @@ export interface PromptShareApi {
   readonly conversations: () => { id: string; title: string }[];
   /** Invité : envoie un message à la session, comme le ferait la page. */
   readonly sendToSession: (msg: object) => boolean;
+  /** Port local d'une application partagée (relais chez un invité), sans ouvrir de navigateur. */
+  readonly localPortOfApp: (port: number) => Promise<number>;
   /** Nombre de décisions qui attendent ce participant (pastille). */
   readonly pendingDecisions: () => number;
   readonly viewEvents: () => string[];
@@ -105,13 +116,19 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
     viewEvents.push(m);
   });
   notifier = createNotifier();
+  tunnels = new TunnelManager(context.globalStorageUri, log);
   chatView.onServerMessage = (data) => {
     // Invité dans VS Code : les messages de la session passent par la vue et les onglets.
     if (guest && !session) {
+      let msg: ServerMessage;
       try {
-        notifier.feed(JSON.parse(data) as ServerMessage);
+        msg = JSON.parse(data) as ServerMessage;
       } catch {
-        // Message illisible : ignoré.
+        return; // Message illisible : ignoré.
+      }
+      notifier.feed(msg);
+      if (msg.type === 'sharedApps' || msg.type === 'welcome') {
+        forwarder?.keepOnly((msg.type === 'welcome' ? msg.apps : msg.apps).map((a) => a.port));
       }
     }
   };
@@ -138,6 +155,8 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
     vscode.commands.registerCommand('promptShare.copyInviteLink', withSession(copyInviteLink)),
     vscode.commands.registerCommand('promptShare.openChat', () => chatView?.reveal()),
     vscode.commands.registerCommand('promptShare.openConversationTab', openConversationTabCommand),
+    vscode.commands.registerCommand('promptShare.startTunnel', withSession(startTunnelCommand)),
+    vscode.commands.registerCommand('promptShare.shareApp', withSession(shareAppCommand)),
     vscode.commands.registerCommand('promptShare.shareSelection', withSession(shareSelection)),
     vscode.commands.registerCommand('promptShare.cancelResponse', withSession(cancelResponse)),
     vscode.commands.registerCommand('promptShare.stopSession', withSession(stopSession)),
@@ -190,6 +209,7 @@ export function activate(context: vscode.ExtensionContext): PromptShareApi {
     openTab: (id) => openConversationTab(id),
     conversations: () => conversationsOfSession(),
     sendToSession: (msg) => !!chatView?.sendToSession(msg),
+    localPortOfApp,
     pendingDecisions: () => notifier.pendingCount,
     get sandboxReady() {
       return sandboxReady;
@@ -385,9 +405,12 @@ function viewController(context: vscode.ExtensionContext): ChatController {
       await hostSession(context);
     },
     join: joinSession,
+    openApp,
     leave: async (ended) => {
       if (guest) {
         guest = undefined;
+        forwarder?.dispose();
+        forwarder = undefined;
         notifier.reset();
         viewStatus = {};
         updateStatusBar(0);
@@ -467,7 +490,7 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
 
   const guestToken = crypto.randomBytes(24).toString('base64url');
   const hostToken = crypto.randomBytes(24).toString('base64url');
-  const room = new ChatRoom(new CopilotBackend(tools, log), {
+  const room: ChatRoom = new ChatRoom(new CopilotBackend(tools, log), {
     historyLength: () => vscode.workspace.getConfiguration(CONFIG).get<number>('historyLength', 20),
     hostName: hostName(),
     onParticipantsChanged: (p) => updateStatusBar(p.length),
@@ -476,15 +499,19 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     onShowDiff: (_entryId, toolId) => void tools.showDiff(toolId),
     onInviteRequested: inviteFromChat,
     policy: sessionPolicy,
+    onTunnelRequested: () => startTunnel(),
+    appRefusal: (p: number): string | undefined => (p === server.port ? 'C’est le port de la session elle-même : il est déjà partagé par le lien d’invitation.' : undefined),
+    onAppsChanged: (apps) => server.closeRelays((p: number) => !apps.some((a) => a.port === p)),
   });
   notifier.reset();
   room.subscribe((msg) => notifier.feed(msg));
-  const server = new ChatServer(
+  const server: ChatServer = new ChatServer(
     {
       port,
       guestToken,
       hostToken,
       indexHtml,
+      isPortShared: (p: number): boolean => room.isAppShared(p),
       assets: {
         '/client.js': { contentType: 'text/javascript; charset=utf-8', body: clientJs },
         '/style.css': { contentType: 'text/css; charset=utf-8', body: styleCss },
@@ -673,6 +700,133 @@ async function inviteFromChat(publicUrl: string | undefined, copy: boolean): Pro
     result.copied = true;
   }
   return result;
+}
+
+/**
+ * Ouvre un tunnel public vers la session (Cloudflare par défaut, ou ngrok) et copie le lien
+ * d'invitation. Déjà ouvert : renvoie simplement le lien.
+ */
+async function startTunnel(): Promise<InviteResult> {
+  const s = session;
+  if (!s) {
+    return { publicUrl: '', localUrl: '', copied: false, error: 'Aucune session en cours.' };
+  }
+  let provider = vscode.workspace.getConfiguration(CONFIG).get<TunnelProvider>('tunnelProvider', 'cloudflare');
+  if (s.tunnel) {
+    return { ...(await inviteFromChat(s.tunnel.url, true)), tunnel: TunnelManager.label(s.tunnel.provider) };
+  }
+  try {
+    const onExit = (reason: string) => void onTunnelExit(s, reason);
+    let tunnel: Tunnel | undefined;
+    try {
+      tunnel = await tunnels.open(provider, s.server.port, onExit);
+    } catch (err) {
+      if (!(err instanceof TunnelUnreachableError) || !(await offerNgrokFallback(err.message))) {
+        throw err;
+      }
+      provider = 'ngrok';
+      tunnel = await tunnels.open(provider, s.server.port, onExit);
+    }
+    if (!tunnel) {
+      return { publicUrl: '', localUrl: s.localUrl, copied: false, error: 'Ouverture du tunnel annulée.' };
+    }
+    if (session !== s) {
+      tunnel.stop();
+      return { publicUrl: '', localUrl: '', copied: false, error: 'La session est terminée.' };
+    }
+    s.tunnel = tunnel;
+    const result = { ...(await inviteFromChat(tunnel.url, true)), tunnel: TunnelManager.label(provider) };
+    void vscode.window.showInformationMessage(`Prompt Share : tunnel ${TunnelManager.label(provider)} ouvert, lien d'invitation copié.`);
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`Tunnel : échec (${message}).`);
+    void showError(`impossible d'ouvrir le tunnel : ${message}`);
+    return { publicUrl: '', localUrl: s.localUrl, copied: false, error: `Tunnel impossible : ${message}` };
+  }
+}
+
+/** Cloudflare injoignable (réseau filtré) : proposer ngrok, qui passe par le port 443. */
+async function offerNgrokFallback(reason: string): Promise<boolean> {
+  log(`Tunnel Cloudflare injoignable : ${reason}`);
+  const once = 'Utiliser ngrok';
+  const always = 'Toujours utiliser ngrok';
+  const choice = await vscode.window.showWarningMessage(
+    'Prompt Share : le tunnel Cloudflare est injoignable depuis ce réseau.',
+    {
+      modal: true,
+      detail:
+        'Le réseau bloque probablement le port 7844 utilisé par Cloudflare (pare-feu d’entreprise ou d’école). ' +
+        'ngrok passe par le port 443, comme un site web, mais demande un compte gratuit.',
+    },
+    once,
+    always,
+  );
+  if (choice === always) {
+    await vscode.workspace.getConfiguration(CONFIG).update('tunnelProvider', 'ngrok', vscode.ConfigurationTarget.Global);
+  }
+  return choice === once || choice === always;
+}
+
+/** Le tunnel s'est arrêté de lui-même : le lien public ne fonctionne plus. */
+async function onTunnelExit(s: Session, reason: string): Promise<void> {
+  if (!s.tunnel) {
+    return; // Arrêt normal, avec la session.
+  }
+  if (s.publicUrl === s.tunnel.url) {
+    s.publicUrl = undefined;
+  }
+  s.tunnel = undefined;
+  if (session !== s) {
+    return;
+  }
+  const retry = 'Rouvrir le tunnel';
+  const choice = await vscode.window.showWarningMessage(
+    `Prompt Share : le tunnel s'est arrêté (${reason}). Les invités à distance ne peuvent plus rejoindre la session.`,
+    retry,
+  );
+  if (choice === retry) {
+    await startTunnelCommand();
+  }
+}
+
+async function startTunnelCommand(): Promise<void> {
+  const result = await startTunnel();
+  if (!result.error && result.link) {
+    chatView?.postState();
+  }
+}
+
+/** Partage une application locale de l'hôte avec les participants. */
+async function shareAppCommand(s: Session): Promise<void> {
+  const port = await vscode.window.showInputBox({
+    title: 'Partager une application locale',
+    prompt: 'Port de l’application (ex. 8080). Les participants l’ouvriront sur localhost, chez eux, tant que le partage est actif.',
+    validateInput: (v) => (/^\d{1,5}$/.test(v.trim()) && +v > 0 && +v < 65536 ? undefined : 'Port invalide (1 à 65535).'),
+  });
+  if (!port) {
+    return;
+  }
+  const label = await vscode.window.showInputBox({ title: 'Nom affiché (facultatif)', placeHolder: `localhost:${port.trim()}` });
+  const refusal = s.room.shareApp(Number(port), label);
+  if (refusal) {
+    void vscode.window.showWarningMessage(`Prompt Share : ${refusal}`);
+  }
+}
+
+/** Port local d'une application partagée : le sien chez l'hôte, un relais chez un invité. */
+async function localPortOfApp(port: number): Promise<number> {
+  if (!session && guest) {
+    forwarder ??= new PortForwarder(guest.target, log);
+    return forwarder.forward(port);
+  }
+  return port;
+}
+
+/** Ouvre une application partagée dans le navigateur. */
+async function openApp(port: number): Promise<void> {
+  const localPort = await localPortOfApp(port);
+  await vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${localPort}/`));
 }
 
 async function shareSelection(s: Session): Promise<void> {

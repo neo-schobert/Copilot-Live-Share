@@ -12,6 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { installBubblewrapInWsl, parseWslProbe, sandboxCommand, SandboxRuntime, windowsToWsl } from '../src/sandbox';
 import { ChatServer } from '../src/server';
+import { PortForwarder } from '../src/portForward';
 
 const PORT = 37170;
 const GUEST = 'guest-token-123';
@@ -163,6 +164,8 @@ async function main() {
   const room = new ChatRoom(backend, {
     historyLength: () => 20,
     policy: () => policy,
+    appRefusal: (port) => (port === PORT ? 'Le serveur de la session est déjà partagé.' : undefined),
+    onAppsChanged: (apps) => server.closeRelays((port) => !apps.some((a) => a.port === port)),
     onReviewRequested: (pending) => reviews.push(pending),
     onInviteRequested: async (publicUrl, copy) => ({
       publicUrl: publicUrl ?? '',
@@ -178,6 +181,7 @@ async function main() {
       hostToken: HOST,
       indexHtml: '<html><script src="client.js?token=__TOKEN__"></script></html>',
       assets: { '/client.js': { contentType: 'text/javascript', body: 'ok' } },
+      isPortShared: (port) => room.isAppShared(port),
     },
     room,
   );
@@ -537,6 +541,52 @@ async function main() {
   assert.equal(backend.calls.length, calls + 3);
   policy.guestQuestionsPerHour = 0;
   ok("Limite horaire : questions d'invités refusées au-delà, avec le délai d'attente ; l'hôte n'est pas limité");
+
+  // 11 quater. Application locale de l'hôte partagée, ouverte par un invité via le relais TCP
+  const app = http.createServer((req, res) => {
+    if (req.url === '/gros') {
+      res.end(Buffer.alloc(3 * 1024 * 1024, 'x'));
+      return;
+    }
+    res.setHeader('Content-Type', 'text/plain');
+    res.end(`app:${req.method}:${req.url}`);
+  });
+  await new Promise<void>((r) => app.listen(0, '127.0.0.1', () => r()));
+  const appPort = (app.address() as { port: number }).port;
+  const forwarder = new PortForwarder({ url: `ws://127.0.0.1:${PORT}/ws?token=${GUEST}`, headers: {} });
+  const fetchLocal = (port: number, pathName = '/') =>
+    new Promise<{ status: number; body: string }>((resolve, reject) => {
+      http
+        .get(`http://127.0.0.1:${port}${pathName}`, (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (d: Buffer) => chunks.push(d));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
+        })
+        .on('error', reject);
+    });
+  assert.equal(await wsRejected(`/tcp?token=${GUEST}&port=${appPort}`), 403, 'port non partagé : refusé');
+  bob2.send({ type: 'shareApp', port: appPort });
+  await bob2.waitFor((m) => m.type === 'error' && m.message.includes("Seul l'hôte"));
+  host.send({ type: 'shareApp', port: PORT });
+  await host.waitFor((m) => m.type === 'error' && m.message.includes('déjà partagé'));
+  host.send({ type: 'shareApp', port: appPort, label: 'Serveur de dev' });
+  const shared = await bob2.waitFor((m) => m.type === 'sharedApps' && m.apps.length === 1);
+  assert.ok(shared.type === 'sharedApps' && shared.apps[0].label === 'Serveur de dev');
+  assert.equal(await wsRejected(`/tcp?token=wrong&port=${appPort}`), 401);
+  const localPort = await forwarder.forward(appPort);
+  const appPage = await fetchLocal(localPort, '/index.html?x=1');
+  assert.equal(appPage.body, 'app:GET:/index.html?x=1');
+  const big = await fetchLocal(localPort, '/gros');
+  assert.equal(big.body.length, 3 * 1024 * 1024, 'gros transfert complet');
+  const parallel = await Promise.all(Array.from({ length: 8 }, (_, i) => fetchLocal(localPort, `/p${i}`)));
+  assert.deepEqual(parallel.map((r) => r.body), Array.from({ length: 8 }, (_, i) => `app:GET:/p${i}`));
+  host.send({ type: 'unshareApp', port: appPort });
+  await bob2.waitFor((m) => m.type === 'sharedApps' && m.apps.length === 0);
+  await sleep(50);
+  await assert.rejects(fetchLocal(localPort), 'plus de partage : connexion coupée');
+  forwarder.dispose();
+  app.close();
+  ok("Application de l'hôte partagée : ouverte chez l'invité via le relais (gros transfert, 8 requêtes parallèles), hôte seul, port non partagé refusé");
 
   // 12. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");

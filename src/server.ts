@@ -1,8 +1,9 @@
 import * as crypto from 'crypto';
 import * as http from 'http';
+import * as net from 'net';
 import type { Duplex } from 'stream';
 import { WebSocket, WebSocketServer } from 'ws';
-import { CLOSE_CODES, LIMITS, ServerMessage, WS_PATH } from './protocol';
+import { CLOSE_CODES, LIMITS, ServerMessage, TCP_PATH, WS_PATH } from './protocol';
 
 /**
  * Serveur HTTP + WebSocket local. Ne connaît rien du chat lui-même : il sert
@@ -25,6 +26,8 @@ export interface ServerOptions {
   indexHtml: string;
   /** Fichiers servis par chemin (ex. « /client.js »). */
   assets: Record<string, StaticAsset>;
+  /** Applications locales partagées par l'hôte : seuls ces ports sont joignables par le relais TCP. */
+  isPortShared?: (port: number) => boolean;
 }
 
 export interface Connection {
@@ -42,6 +45,9 @@ export interface ConnectionHandler {
 
 const HEARTBEAT_MS = 30_000;
 const LISTEN_HOST = '127.0.0.1';
+/** Relais TCP : connexions simultanées au plus, et seuils de contrôle de flux. */
+const MAX_TCP_RELAYS = 256;
+const TCP_PAUSE_BYTES = 1024 * 1024;
 
 type Role = 'host' | 'guest';
 
@@ -70,7 +76,10 @@ class WsConnection implements Connection {
 export class ChatServer {
   private readonly http: http.Server;
   private readonly wss: WebSocketServer;
+  private readonly tcpWss: WebSocketServer;
   private readonly connections = new Set<WsConnection>();
+  /** Relais TCP ouverts, par port partagé. */
+  private readonly relays = new Map<WebSocket, number>();
   private heartbeat: NodeJS.Timeout | undefined;
   private nextId = 1;
 
@@ -80,6 +89,7 @@ export class ChatServer {
   ) {
     this.http = http.createServer((req, res) => this.handleHttp(req, res));
     this.wss = new WebSocketServer({ noServer: true, maxPayload: LIMITS.maxPayloadBytes });
+    this.tcpWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
     this.http.on('upgrade', (req, socket, head) => this.handleUpgrade(req, socket, head));
   }
 
@@ -119,6 +129,8 @@ export class ChatServer {
       conn.socket.terminate();
     }
     this.connections.clear();
+    this.closeRelays(() => true);
+    await new Promise<void>((resolve) => this.tcpWss.close(() => resolve()));
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => {
       if (!this.http.listening) {
@@ -175,8 +187,21 @@ export class ChatServer {
     send(res, 404, 'text/plain; charset=utf-8', 'Not Found\n');
   }
 
+  /** Coupe les relais TCP d'un port (partage arrêté). */
+  closeRelays(pred: (port: number) => boolean): void {
+    for (const [ws, port] of this.relays) {
+      if (pred(port)) {
+        ws.terminate();
+      }
+    }
+  }
+
   private handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
     const url = new URL(req.url ?? '/', 'http://localhost');
+    if (url.pathname === `/${TCP_PATH}`) {
+      this.handleTcpUpgrade(req, socket, head, url);
+      return;
+    }
     const role = url.pathname === `/${WS_PATH}` ? this.roleForToken(url.searchParams.get('token')) : undefined;
     if (!role) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
@@ -184,6 +209,56 @@ export class ChatServer {
       return;
     }
     this.wss.handleUpgrade(req, socket, head, (ws) => this.onSocket(ws, role === 'host'));
+  }
+
+  private handleTcpUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer, url: URL): void {
+    const port = Number(url.searchParams.get('port'));
+    const refuse = (status: string) => {
+      socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      socket.destroy();
+    };
+    if (!this.roleForToken(url.searchParams.get('token'))) {
+      refuse('401 Unauthorized');
+    } else if (!Number.isInteger(port) || !this.options.isPortShared?.(port)) {
+      refuse('403 Forbidden');
+    } else if (this.relays.size >= MAX_TCP_RELAYS) {
+      refuse('503 Service Unavailable');
+    } else {
+      this.tcpWss.handleUpgrade(req, socket, head, (ws) => this.relayTcp(ws, port));
+    }
+  }
+
+  /** Relie une connexion WebSocket à une connexion TCP vers l'application locale partagée. */
+  private relayTcp(ws: WebSocket, port: number): void {
+    this.relays.set(ws, port);
+    const tcp = net.connect(port, LISTEN_HOST);
+    const close = () => {
+      this.relays.delete(ws);
+      tcp.destroy();
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    };
+    tcp.on('data', (data) => {
+      ws.send(data, { binary: true }, () => {
+        if (tcp.isPaused() && ws.bufferedAmount < TCP_PAUSE_BYTES / 4) {
+          tcp.resume();
+        }
+      });
+      if (ws.bufferedAmount > TCP_PAUSE_BYTES) {
+        tcp.pause();
+      }
+    });
+    ws.on('message', (data: Buffer) => {
+      if (!tcp.write(data)) {
+        ws.pause();
+        tcp.once('drain', () => ws.resume());
+      }
+    });
+    tcp.on('close', close);
+    tcp.on('error', close);
+    ws.on('close', close);
+    ws.on('error', close);
   }
 
   private onSocket(ws: WebSocket, isHost: boolean): void {

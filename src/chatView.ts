@@ -36,6 +36,8 @@ export interface ChatController {
   join(name: string, link: string): Promise<void>;
   /** `ended` : la session est déjà terminée, on revient simplement à l'accueil. */
   leave(ended: boolean): Promise<void>;
+  /** Ouvre une application partagée par l'hôte (relayée chez un invité). */
+  openApp(port: number): Promise<void>;
 }
 
 /** Code de fermeture relayé à la page quand la connexion est refusée (lien invalide, session arrêtée). */
@@ -51,7 +53,8 @@ type PageMessage =
   | { type: 'scc-disconnect'; id: string }
   | { type: 'scc-open-tab'; conversationId: string; title?: string }
   | { type: 'scc-title'; title: string }
-  | { type: 'scc-close-panel' };
+  | { type: 'scc-close-panel' }
+  | { type: 'scc-open-app'; port: number };
 
 /**
  * Une page de chat dans VS Code (la vue latérale, ou un onglet d'éditeur consacré à une
@@ -304,6 +307,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'scc-close-panel':
         panel?.dispose();
+        break;
+      case 'scc-open-app':
+        if (Number.isInteger(msg.port)) {
+          void this.controller.openApp(msg.port).catch((err: Error) => {
+            this.log(`Application partagée : ${err.message}`);
+            void vscode.window.showErrorMessage(`Prompt Share : impossible d'ouvrir l'application (${err.message}).`);
+          });
+        }
         break;
     }
   }

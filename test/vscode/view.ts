@@ -4,6 +4,7 @@
  * La synchronisation entre les deux instances passe par des fichiers.
  */
 import * as fs from 'fs';
+import * as http from 'http';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { PromptShareApi } from '../../src/extension';
@@ -18,6 +19,19 @@ const QUESTION = 'Question de test depuis VS Code';
 const sync = (name: string) => path.join(SYNC, name);
 const flag = (name: string) => fs.writeFileSync(sync(name), 'ok');
 const flagged = (name: string) => fs.existsSync(sync(name)) || undefined;
+const APP_PORT = 37195;
+
+function httpGet(port: number, pathName: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    http
+      .get(`http://127.0.0.1:${port}${pathName}`, (res) => {
+        let body = '';
+        res.on('data', (d) => (body += d));
+        res.on('end', () => resolve(body));
+      })
+      .on('error', reject);
+  });
+}
 
 /** Onglets d'éditeur Prompt Share (webviews) ouverts dans cette fenêtre. */
 const chatTabs = () =>
@@ -93,6 +107,16 @@ export async function run(): Promise<void> {
       const after = api.hostedSession()?.participants ?? [];
       if (after.length !== 2) throw new Error(`participants après l'ouverture des onglets : ${after.join(', ')}`);
       ok(`vue et onglets d'un même participant : toujours ${after.length} participants (${after.join(', ')})`);
+
+      // Application locale de l'hôte, partagée depuis le chat.
+      const app = http.createServer((req, res) => res.end(`app-hote:${req.url}`));
+      await new Promise<void>((r) => app.listen(APP_PORT, '127.0.0.1', () => r()));
+      if (!api.sendToSession({ type: 'shareApp', port: APP_PORT, label: 'Serveur de dev' })) throw new Error('partage non envoyé');
+      flag('app-shared.txt');
+      const body = await until("l'invité ouvre l'application", () => (fs.existsSync(sync('app-ok.txt')) ? fs.readFileSync(sync('app-ok.txt'), 'utf8') : undefined), 30_000);
+      if (body !== 'app-hote:/depuis-invite') throw new Error(`réponse de l'application chez l'invité : ${body}`);
+      ok("application de l'hôte (localhost:37195) partagée et ouverte chez l'invité par le relais");
+      app.close();
       fs.writeFileSync(doneFile, 'ok');
     } else {
       const link = await until("lien d'invitation de l'hôte", () => (fs.existsSync(linkFile) ? fs.readFileSync(linkFile, 'utf8') : undefined));
@@ -108,6 +132,12 @@ export async function run(): Promise<void> {
       ok(`invité : discussion ouverte dans un onglet d'éditeur (« ${tab.label} »)`);
       await sleep(1500); // Laisse l'onglet se connecter avant la vérification de l'hôte.
       flag('guest-tab.txt');
+      await until("application partagée par l'hôte", () => flagged('app-shared.txt'));
+      await sleep(500);
+      const localPort = await api.localPortOfApp(APP_PORT);
+      const body = await httpGet(localPort, '/depuis-invite');
+      fs.writeFileSync(sync('app-ok.txt'), body);
+      ok(`application de l'hôte ouverte sur localhost:${localPort} (relais) : « ${body} »`);
       await until("confirmation de l'hôte", () => fs.existsSync(doneFile) || undefined);
       ok("l'hôte voit ce participant : session rejointe depuis VS Code, sans navigateur");
     }

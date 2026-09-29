@@ -9,6 +9,7 @@ import {
   QueueState,
   ServerMessage,
   SessionPolicy,
+  SharedApp,
   ToolActivity,
   UserEntry,
   WS_PATH,
@@ -65,6 +66,17 @@ const homeStatus = $<HTMLElement>('home-status');
 const leaveBtn = $<HTMLButtonElement>('leave');
 const policyNote = $<HTMLElement>('policy-note');
 const openTabBtn = $<HTMLButtonElement>('open-tab');
+const tunnelBtn = $<HTMLButtonElement>('tunnel-btn');
+const tunnelStatus = $<HTMLElement>('tunnel-status');
+const appsWrap = $<HTMLElement>('apps-wrap');
+const appsBtn = $<HTMLButtonElement>('apps-btn');
+const appsCount = $<HTMLElement>('apps-count');
+const appsPop = $<HTMLElement>('apps-pop');
+const appsHint = $<HTMLElement>('apps-hint');
+const appsList = $<HTMLUListElement>('apps-list');
+const appsForm = $<HTMLFormElement>('apps-form');
+const appsPort = $<HTMLInputElement>('apps-port');
+const appsLabel = $<HTMLInputElement>('apps-label');
 const inviteWarn = Object.assign(document.createElement('p'), { className: 'hint warn' });
 
 // ---- État ----
@@ -91,6 +103,8 @@ const entries = new Map<string, ChatEntry>();
 const entryEls = new Map<string, HTMLElement>();
 let participants: Participant[] = [];
 let policy: SessionPolicy = { reviewGuestQuestions: false, guestQuestionsPerHour: 0 };
+/** Applications locales partagées par l'hôte. */
+let apps: SharedApp[] = [];
 let queue: QueueState = { current: null, pending: [] };
 let models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
 /** Modèle choisi par ce participant ; '' = modèle par défaut de la session. */
@@ -313,6 +327,7 @@ function endSession(reason: string): void {
   renderConversations();
   updateComposer();
   updateActivity();
+  renderApps();
   rerenderActive();
 }
 
@@ -333,6 +348,7 @@ function handle(msg: ServerMessage): void {
       queue = msg.queue;
       models = msg.models;
       policy = msg.policy;
+      apps = msg.apps ?? [];
       if (panelConversation) {
         if (!conversations.some((c) => c.id === panelConversation)) {
           closePanel();
@@ -348,6 +364,7 @@ function handle(msg: ServerMessage): void {
       renderModels();
       updateActivity();
       renderPolicy();
+      renderApps();
       inviteBtn.hidden = !me.isHost;
       break;
     }
@@ -469,6 +486,15 @@ function handle(msg: ServerMessage): void {
       policy = msg.policy;
       renderPolicy();
       break;
+    case 'sharedApps': {
+      const added = msg.apps.filter((a) => !apps.some((b) => b.port === a.port));
+      apps = msg.apps;
+      renderApps();
+      if (!me?.isHost && added.length) {
+        toast(`L’hôte partage « ${added[0].label} » : ouvrez-la depuis le bouton Applications.`);
+      }
+      break;
+    }
     case 'participants':
       participants = msg.participants;
       for (const id of typing.keys()) {
@@ -1243,6 +1269,7 @@ function toggleInvite(open = invitePop.hidden): void {
   inviteBtn.setAttribute('aria-expanded', String(open));
   if (open) {
     togglePeople(false);
+    toggleApps(false);
     send({ type: 'invite', copy: false }); // Préremplit l'URL publique déjà connue.
     inviteUrl.focus();
   }
@@ -1258,10 +1285,26 @@ inviteForm.addEventListener('submit', (e) => {
   send({ type: 'invite', publicUrl: inviteUrl.value.trim(), copy: true });
 });
 
+tunnelBtn.addEventListener('click', () => {
+  if (send({ type: 'startTunnel' })) {
+    tunnelBtn.disabled = true;
+    tunnelStatus.hidden = false;
+    tunnelStatus.textContent = 'Ouverture du tunnel… Suivez les éventuelles questions dans VS Code (téléchargement, compte ngrok).';
+  }
+});
+
 function renderInvite(msg: Extract<ServerMessage, { type: 'invite' }>): void {
+  if (tunnelBtn.disabled || msg.tunnel) {
+    tunnelBtn.disabled = false;
+    tunnelStatus.hidden = !msg.tunnel;
+    tunnelStatus.textContent = msg.tunnel ? `Tunnel ${msg.tunnel} actif : ${msg.publicUrl}` : '';
+  }
+  if (msg.tunnel) {
+    tunnelBtn.lastElementChild!.textContent = 'Copier le lien d’invitation';
+  }
   const port = /:(\d+)/.exec(msg.localUrl)?.[1] ?? '3717';
   inviteHint.replaceChildren(
-    document.createTextNode('Exposez le port '),
+    document.createTextNode('Ou, avec votre propre tunnel, exposez le port '),
     Object.assign(document.createElement('code'), { textContent: port }),
     document.createTextNode(' avec '),
     Object.assign(document.createElement('code'), { textContent: `ngrok http ${port}` }),
@@ -1306,6 +1349,7 @@ document.addEventListener('click', (e) => {
 function togglePeople(open = peoplePopover.hidden): void {
   if (open) {
     toggleInvite(false);
+    toggleApps(false);
   }
   peoplePopover.hidden = !open;
   peopleToggle.setAttribute('aria-expanded', String(open));
@@ -1377,6 +1421,80 @@ function updateActivity(): void {
   activityEl.hidden = parts.length === 0;
   cancelBtn.hidden = !(me?.isHost && current);
 }
+
+// ---- Applications partagées par l'hôte ----
+
+/**
+ * Liste des applications locales de l'hôte. Dans VS Code, « Ouvrir » les rend accessibles
+ * sur localhost (relais par l'extension) ; un navigateur ne peut pas ouvrir de port local.
+ */
+function renderApps(): void {
+  const isHost = !!me?.isHost;
+  appsWrap.hidden = !(isHost || apps.length) || ended;
+  appsCount.hidden = !apps.length;
+  appsCount.textContent = String(apps.length);
+  appsForm.hidden = !isHost;
+  appsHint.textContent = isHost
+    ? 'Rendez une application locale (serveur de dev, site…) accessible aux participants : chez eux, elle s’ouvre sur localhost, comme chez vous. Seuls les participants de la session y ont accès.'
+    : vscodeApi
+      ? 'Applications de l’hôte : « Ouvrir » les rend accessibles sur votre localhost et les ouvre dans votre navigateur.'
+      : 'Pour ouvrir ces applications, rejoignez la session depuis VS Code avec l’extension Prompt Share : un navigateur seul ne peut pas les relayer.';
+  appsList.replaceChildren(
+    ...apps.map((app) => {
+      const li = document.createElement('li');
+      const name = document.createElement('span');
+      name.className = 'app-name';
+      name.textContent = app.label;
+      const port = document.createElement('span');
+      port.className = 'app-port';
+      port.textContent = `localhost:${app.port}`;
+      name.append(port);
+      const open = button('Ouvrir', 'secondary', () => vscodeApi?.postMessage({ type: 'scc-open-app', port: app.port }));
+      open.disabled = !vscodeApi;
+      li.append(icon('browser'), name, open);
+      if (isHost) {
+        li.append(button('Arrêter', 'secondary', () => send({ type: 'unshareApp', port: app.port })));
+      }
+      return li;
+    }),
+  );
+  if (!apps.length && !isHost) {
+    toggleApps(false);
+  }
+}
+
+function toggleApps(open = appsPop.hidden): void {
+  if (open) {
+    toggleInvite(false);
+    togglePeople(false);
+  }
+  appsPop.hidden = !open;
+  appsBtn.setAttribute('aria-expanded', String(open));
+}
+
+appsBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleApps();
+});
+
+document.addEventListener('click', (e) => {
+  if (!appsPop.hidden && !appsPop.contains(e.target as Node)) {
+    toggleApps(false);
+  }
+});
+
+appsForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const port = Number(appsPort.value.trim());
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    toast('Port invalide (1 à 65535).');
+    return;
+  }
+  if (send({ type: 'shareApp', port, label: appsLabel.value.trim() || undefined })) {
+    appsPort.value = '';
+    appsLabel.value = '';
+  }
+});
 
 /** Rappel permanent sous la saisie : quel compte répond, qui voit quoi, règles de l'hôte. */
 function renderPolicy(): void {

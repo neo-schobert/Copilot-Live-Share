@@ -71,12 +71,27 @@
           </button>
           <div id="invite-pop" class="popover invite-pop" hidden>
             <div class="section-title">Inviter des participants</div>
+            <button id="tunnel-btn" type="button" class="primary tunnel-btn"><i class="codicon codicon-globe"></i><span>Ouvrir un tunnel et copier le lien</span></button>
+            <p id="tunnel-status" class="hint" hidden></p>
             <p id="invite-hint" class="hint"></p>
             <form id="invite-form" class="invite-form">
               <input id="invite-url" type="url" placeholder="https://xxxx.ngrok-free.app" aria-label="URL publique du tunnel">
               <button type="submit" class="primary"><i class="codicon codicon-copy"></i>Copier le lien</button>
             </form>
             <div id="invite-result" class="invite-result" hidden></div>
+          </div>
+        </div>
+        <div id="apps-wrap" class="apps-wrap" hidden>
+          <button id="apps-btn" class="icon-btn apps-btn" type="button" aria-expanded="false" aria-controls="apps-pop" title="Applications partagées"><i class="codicon codicon-browser"></i><span id="apps-count" class="apps-count" hidden></span></button>
+          <div id="apps-pop" class="popover apps-pop" hidden>
+            <div class="section-title">Applications partagées</div>
+            <p id="apps-hint" class="hint"></p>
+            <ul id="apps-list" class="apps-list"></ul>
+            <form id="apps-form" class="apps-form" hidden>
+              <input id="apps-port" inputmode="numeric" maxlength="5" placeholder="Port (ex. 8080)" aria-label="Port de l'application">
+              <input id="apps-label" maxlength="60" placeholder="Nom (facultatif)" aria-label="Nom affiché">
+              <button type="submit" class="primary">Partager</button>
+            </form>
           </div>
         </div>
         <button id="leave" class="icon-btn" type="button" title="Quitter la session" hidden><i class="codicon codicon-sign-out"></i></button>

@@ -98,6 +98,8 @@ Pendant une session, hébergée ou rejointe depuis VS Code, une notification app
 | **Prompt Share: Host a Session** | Démarre une session et ouvre le chat. |
 | **Prompt Share: Join a Session** | Demande un lien d'invitation et rejoint la session. |
 | **Prompt Share: Open Chat** | Ouvre la vue du chat. |
+| **Prompt Share: Open Public Tunnel** | Ouvre un tunnel public (Cloudflare ou ngrok) et copie le lien d'invitation. |
+| **Prompt Share: Share Local App…** | Partage une application locale (port) avec les participants. |
 | **Prompt Share: Open Conversation in Editor Tab** | Ouvre une discussion dans un onglet d'éditeur (déplaçable, divisible). |
 | **Prompt Share: Leave Session** | Quitte la session rejointe, ou arrête la session hébergée. |
 | **Prompt Share: Copy Invite Link** | Copie le lien d'invitation (même chose que le bouton **Inviter** du chat). |
@@ -170,17 +172,28 @@ Cette intégration utilise une API de VS Code encore expérimentale (`chatSessio
 
 ## Exposer le chat aux invités
 
-Le serveur n'écoute que sur `127.0.0.1` : il n'est pas accessible depuis le réseau tant que l'hôte n'ouvre pas lui-même un tunnel. L'extension ne gère pas le tunnel.
+Le serveur n'écoute que sur `127.0.0.1` : il n'est pas accessible depuis le réseau tant que l'hôte n'ouvre pas de tunnel.
 
-**Avec ngrok**
+**En un clic** : **Inviter** → **Ouvrir un tunnel et copier le lien** (ou **Prompt Share: Open Public Tunnel**). L'extension :
 
-```bash
-ngrok http 3717
-```
+1. cherche l'outil du tunnel (`promptShare.tunnelProvider`) dans le PATH, puis dans son propre dossier ;
+2. s'il manque, propose de le **télécharger depuis sa source officielle** (GitHub de Cloudflare, ou distribution de ngrok), sans installation système ;
+3. pour ngrok, demande une fois le **jeton** du compte gratuit (enregistré dans la configuration de ngrok) ;
+4. ouvre le tunnel et **copie le lien d'invitation**.
 
-Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Copy Invite Link** et collez-la.
+Le tunnel se ferme avec la session. S'il s'arrête avant, une notification propose de le rouvrir.
 
-> Sur le plan gratuit, ngrok affiche une page d'avertissement à la première visite ; les invités cliquent sur « Visit Site ».
+| | Cloudflare (par défaut) | ngrok |
+|---|---|---|
+| Compte | aucun | gratuit, avec jeton |
+| Adresse | nouvelle à chaque session (`….trycloudflare.com`) | liée au compte |
+| Page d'avertissement pour les navigateurs | non | oui (« Visit Site ») |
+| Limites | 200 requêtes simultanées, sans garantie de disponibilité ([doc](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)) | 1 Go et 20 000 requêtes par mois ([doc](https://ngrok.com/docs/pricing-limits/free-plan-limits)) |
+| Réseaux filtrés | port 7844 souvent bloqué en entreprise | port 443, passe presque partout |
+
+Si Cloudflare est injoignable depuis le réseau, l'extension propose de passer à ngrok (une fois, ou toujours).
+
+**Avec votre propre tunnel** : lancez-le vers le port de la session (`ngrok http 3717`, `cloudflared tunnel --url http://127.0.0.1:3717`…), puis collez son adresse dans **Inviter**.
 
 **Avec le port forwarding de VS Code**
 
@@ -189,6 +202,15 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 3. Copiez l'adresse transférée, puis **Copy Invite Link** et collez-la.
 
 **Partager le lien** : envoyez le lien copié (il contient le token). Toute personne qui possède ce lien peut rejoindre le chat et poser des questions. Pour révoquer l'accès, arrêtez la session et redémarrez-en une : un nouveau token est généré.
+
+## Partager une application locale
+
+L'hôte peut rendre accessible aux participants une application qui tourne sur sa machine (serveur de dev sur `localhost:8080`, API, site…) : bouton **Applications** en haut du chat → port et nom → **Partager** (ou **Prompt Share: Share Local App…**).
+
+- **Invités dans VS Code** : **Ouvrir** rend l'application accessible sur **leur** `localhost` (même port si possible) et l'ouvre dans leur navigateur. Comme les serveurs partagés de Live Share, le trafic est relayé tel quel (WebSocket, rechargement à chaud, chemins absolus compris) dans la connexion de la session, protégée par le jeton : l'application n'est pas publiée sur Internet.
+- **Invités dans un navigateur** : ils voient la liste, mais un navigateur seul ne peut pas relayer un port local ; il leur faut l'extension.
+- Seul l'hôte partage et arrête un partage ; arrêter coupe aussitôt les connexions en cours. Au plus 10 applications à la fois.
+- Le trafic passe par le tunnel de la session : avec ngrok gratuit, il compte dans le 1 Go mensuel.
 
 ## Côté participants
 
@@ -214,6 +236,7 @@ Copiez l'URL `https://….ngrok-free.app` affichée par ngrok, puis lancez **Cop
 | `promptShare.wslSandbox` | `true` | Sous Windows, isole les commandes dans WSL avec bubblewrap si disponibles. |
 | `promptShare.wslDistro` | `""` | Distribution WSL du bac à sable (vide : distribution par défaut). |
 | `promptShare.nativeChat` | `true` | Affiche les discussions dans le panneau Chat natif (API expérimentale, voir plus haut). |
+| `promptShare.tunnelProvider` | `cloudflare` | Service du bouton « Ouvrir un tunnel » : `cloudflare` (sans compte) ou `ngrok` (compte gratuit, adresse liée au compte). |
 | `promptShare.notifications` | `decisions` | Notifications de VS Code : `decisions` (quand une décision vous attend), `all` (aussi les nouvelles questions et les réponses à vos questions), `off`. |
 | `promptShare.reviewGuestQuestions` | `true` | Les questions des invités attendent l'accord de l'hôte avant d'être envoyées au modèle. |
 | `promptShare.guestQuestionsPerHour` | `60` | Nombre maximal de questions d'invités envoyées au modèle par heure, pour toute la session (`0` : pas de limite). |

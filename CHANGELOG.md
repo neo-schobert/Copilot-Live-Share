@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Bouton « Ouvrir un tunnel » : tunnel Cloudflare (sans compte) ou ngrok, outil téléchargé depuis sa source officielle avec accord, jeton ngrok demandé une fois, lien d'invitation copié. Repli proposé vers ngrok si Cloudflare est bloqué par le réseau.
+- Partage d'applications locales de l'hôte (serveur de dev, API…) : les invités dans VS Code les ouvrent sur leur localhost, via un relais protégé par le jeton de la session.
+
 ## 0.1.1
 
 - Discussions dans des onglets d'éditeur : à glisser, diviser ou détacher, comme le Chat de VS Code. Vue et onglets comptent pour un seul participant.

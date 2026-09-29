@@ -52,6 +52,12 @@ export interface UserEntry extends BaseEntry {
 
 export type QuestionReview = 'pending' | 'approved' | 'rejected';
 
+/** Application locale de l'hôte (serveur de dev, site…) rendue accessible aux participants. */
+export interface SharedApp {
+  port: number;
+  label: string;
+}
+
 /** Règles de la session fixées par l'hôte, affichées aux participants. */
 export interface SessionPolicy {
   /** Les questions des invités attendent l'accord de l'hôte avant d'être envoyées au modèle. */
@@ -203,7 +209,12 @@ export type ClientMessage =
   /** Réponse à une question de l'agent (par n'importe quel participant). */
   | { type: 'answer'; entryId: string; toolId: string; text: string }
   /** Réservé à l'hôte : accepte ou refuse une question d'invité en attente. */
-  | { type: 'reviewQuestion'; entryId: string; accept: boolean };
+  | { type: 'reviewQuestion'; entryId: string; accept: boolean }
+  /** Réservé à l'hôte : partage (ou arrête de partager) une application locale. */
+  | { type: 'shareApp'; port: number; label?: string }
+  | { type: 'unshareApp'; port: number }
+  /** Réservé à l'hôte : ouvre un tunnel public (réponse : message « invite »). */
+  | { type: 'startTunnel' };
 
 // ---- Serveur -> client ----
 
@@ -218,6 +229,7 @@ export type ServerMessage =
       queue: QueueState;
       models: ModelsState;
       policy: SessionPolicy;
+      apps: SharedApp[];
     }
   /** Discussion créée ou renommée. */
   | { type: 'conversation'; conversation: Conversation }
@@ -236,11 +248,12 @@ export type ServerMessage =
   /** Décision de l'hôte sur une question d'invité. */
   | { type: 'questionReview'; entryId: string; review: QuestionReview; by: string }
   | { type: 'policy'; policy: SessionPolicy }
+  | { type: 'sharedApps'; apps: SharedApp[] }
   | { type: 'participants'; participants: Participant[] }
   | { type: 'queue'; queue: QueueState }
   | { type: 'models'; models: ModelsState }
   /** Réponse à une demande de lien d'invitation (envoyée à l'hôte seulement). */
-  | { type: 'invite'; publicUrl: string; localUrl: string; link?: string; copied: boolean; error?: string }
+  | { type: 'invite'; publicUrl: string; localUrl: string; link?: string; copied: boolean; error?: string; tunnel?: string }
   /** Un participant écrit dans une discussion (l'indicateur expire côté client). */
   | { type: 'typing'; conversationId: string; clientId: string; name: string }
   | { type: 'error'; message: string }
@@ -253,6 +266,7 @@ export const LIMITS = {
   maxQuestionLength: 8000,
   maxAnswerLength: 2000,
   maxPendingPerClient: 5,
+  maxSharedApps: 10,
   /** Taille max d'une trame WebSocket entrante, en octets. */
   maxPayloadBytes: 64 * 1024,
 } as const;
@@ -268,3 +282,9 @@ export const CLOSE_CODES = {
 
 /** Chemin de l'endpoint WebSocket, relatif à la page. */
 export const WS_PATH = 'ws';
+
+/**
+ * Relais TCP vers une application locale partagée par l'hôte : une connexion WebSocket
+ * (données binaires) par connexion TCP, « /tcp?token=…&port=8080 ».
+ */
+export const TCP_PATH = 'tcp';

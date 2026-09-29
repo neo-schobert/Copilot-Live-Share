@@ -17,6 +17,7 @@ import {
   QueueState,
   ServerMessage,
   SessionPolicy,
+  SharedApp,
   ToolActivity,
   UserEntry,
 } from './protocol';
@@ -68,6 +69,8 @@ export interface InviteResult {
   link?: string;
   copied: boolean;
   error?: string;
+  /** Tunnel ouvert par l'extension (nom du fournisseur). */
+  tunnel?: string;
 }
 
 export interface AnswerOutcome {
@@ -132,6 +135,12 @@ export interface ChatRoomOptions {
   policy?: () => SessionPolicy;
   /** Une question d'invité attend l'accord de l'hôte. */
   onReviewRequested?: (pending: PendingReview) => void;
+  /** L'hôte demande l'ouverture d'un tunnel public depuis la page. */
+  onTunnelRequested?: () => Promise<InviteResult>;
+  /** Motif de refus du partage de ce port (ex. port du serveur de session), sinon undefined. */
+  appRefusal?: (port: number) => string | undefined;
+  /** Liste des applications partagées modifiée (coupure des relais d'un port retiré). */
+  onAppsChanged?: (apps: SharedApp[]) => void;
 }
 
 const HOUR_MS = 60 * 60_000;
@@ -170,6 +179,8 @@ export class ChatRoom implements ConnectionHandler {
   private readonly queue: QueuedQuestion[] = [];
   /** Questions d'invités en attente de l'accord de l'hôte. */
   private readonly awaitingReview: QueuedQuestion[] = [];
+  /** Applications locales partagées par l'hôte, par port. */
+  private readonly apps = new Map<number, SharedApp>();
   /** Horodatages des questions d'invités envoyées au modèle (limite horaire). */
   private readonly guestSent: number[] = [];
   private current: { item: QueuedQuestion; abort: AbortController } | undefined;
@@ -287,6 +298,25 @@ export class ChatRoom implements ConnectionHandler {
       case 'showDiff':
         if (state.isHost) {
           this.options.onShowDiff?.(msg.entryId, msg.toolId);
+        }
+        break;
+      case 'shareApp':
+      case 'unshareApp': {
+        if (!state.isHost) {
+          fail("Seul l'hôte peut partager une application.");
+          break;
+        }
+        const refusal = msg.type === 'shareApp' ? this.shareApp(msg.port, msg.label) : (this.unshareApp(msg.port), undefined);
+        if (refusal) {
+          fail(refusal);
+        }
+        break;
+      }
+      case 'startTunnel':
+        if (!state.isHost) {
+          fail("Seul l'hôte peut ouvrir un tunnel.");
+        } else if (this.options.onTunnelRequested) {
+          void this.options.onTunnelRequested().then((result) => conn.send({ type: 'invite', ...result }));
         }
         break;
       case 'reviewQuestion':
@@ -455,6 +485,44 @@ export class ChatRoom implements ConnectionHandler {
     return true;
   }
 
+  /** Partage une application locale de l'hôte. Renvoie un motif de refus, ou undefined. */
+  shareApp(port: number, rawLabel?: string): string | undefined {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return 'Port invalide (1 à 65535).';
+    }
+    const refusal = this.options.appRefusal?.(port);
+    if (refusal) {
+      return refusal;
+    }
+    if (!this.apps.has(port) && this.apps.size >= LIMITS.maxSharedApps) {
+      return `Au plus ${LIMITS.maxSharedApps} applications partagées.`;
+    }
+    const label = sanitizeLine(rawLabel ?? '', LIMITS.maxTitleLength) || `localhost:${port}`;
+    this.apps.set(port, { port, label });
+    this.broadcastApps();
+    return undefined;
+  }
+
+  unshareApp(port: number): void {
+    if (this.apps.delete(port)) {
+      this.broadcastApps();
+    }
+  }
+
+  isAppShared(port: number): boolean {
+    return this.apps.has(port);
+  }
+
+  get sharedApps(): SharedApp[] {
+    return [...this.apps.values()];
+  }
+
+  private broadcastApps(): void {
+    const apps = this.sharedApps;
+    this.broadcast({ type: 'sharedApps', apps });
+    this.options.onAppsChanged?.(apps);
+  }
+
   /** Discussion d'une entrée, si elle existe encore. */
   conversationOfEntry(entryId: string): string | undefined {
     return this.entries.find((e) => e.id === entryId)?.conversationId;
@@ -535,6 +603,7 @@ export class ChatRoom implements ConnectionHandler {
     this.current?.abort.abort();
     this.queue.length = 0;
     this.awaitingReview.length = 0;
+    this.apps.clear();
     this.entries.length = 0;
     this.conversations.length = 0;
     this.clients.clear();
@@ -563,6 +632,7 @@ export class ChatRoom implements ConnectionHandler {
       queue: this.queueState(),
       models: this.models,
       policy: this.policy(),
+      apps: this.sharedApps,
     });
     this.broadcastParticipants();
   }
@@ -990,6 +1060,14 @@ function parseClientMessage(data: string): ClientMessage | undefined {
         : undefined;
     case 'showDiff':
       return str(m.entryId) && str(m.toolId) ? { type: 'showDiff', entryId: m.entryId, toolId: m.toolId } : undefined;
+    case 'shareApp':
+      return typeof m.port === 'number' && (m.label === undefined || str(m.label))
+        ? { type: 'shareApp', port: m.port, label: m.label as string | undefined }
+        : undefined;
+    case 'unshareApp':
+      return typeof m.port === 'number' ? { type: 'unshareApp', port: m.port } : undefined;
+    case 'startTunnel':
+      return { type: 'startTunnel' };
     case 'reviewQuestion':
       return str(m.entryId) && typeof m.accept === 'boolean' ? { type: 'reviewQuestion', entryId: m.entryId, accept: m.accept } : undefined;
     case 'answer':

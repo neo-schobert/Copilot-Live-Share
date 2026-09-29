@@ -2,7 +2,7 @@
   "name": "prompt-share",
   "displayName": "Prompt Share",
   "description": "Chat IA à plusieurs dans VS Code, avec les modèles GitHub Copilot de l'hôte : héberger ou rejoindre une session, agent confiné au projet, l'hôte garde la main. Projet indépendant, non affilié à GitHub ni à Microsoft.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "neo-schobert",
   "license": "MIT",
   "engines": {
@@ -36,6 +36,18 @@
         "title": "Leave Session",
         "category": "Prompt Share",
         "icon": "$(sign-out)"
+      },
+      {
+        "command": "promptShare.startTunnel",
+        "title": "Open Public Tunnel",
+        "category": "Prompt Share",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "promptShare.shareApp",
+        "title": "Share Local App…",
+        "category": "Prompt Share",
+        "icon": "$(browser)"
       },
       {
         "command": "promptShare.openConversationTab",
@@ -144,6 +156,14 @@
         {
           "command": "promptShare.openConversationTab",
           "when": "promptShare.connected"
+        },
+        {
+          "command": "promptShare.startTunnel",
+          "when": "promptShare.active"
+        },
+        {
+          "command": "promptShare.shareApp",
+          "when": "promptShare.active"
         }
       ],
       "editor/context": [
@@ -180,6 +200,16 @@
           "type": "string",
           "default": "",
           "description": "Famille du modèle Copilot utilisé par défaut (ex. « gpt-4o », « claude-sonnet-4 »). Vide : premier modèle Copilot disponible. Modifiable avec « Prompt Share: Select Default Model »."
+        },
+        "promptShare.tunnelProvider": {
+          "type": "string",
+          "enum": ["cloudflare", "ngrok"],
+          "enumDescriptions": [
+            "Tunnel rapide Cloudflare (cloudflared) : sans compte, sans page d'avertissement ; nouvelle adresse à chaque session.",
+            "ngrok : compte gratuit et jeton requis ; adresse fixe liée au compte, page d'avertissement dans les navigateurs, 1 Go par mois."
+          ],
+          "default": "cloudflare",
+          "description": "Service utilisé par le bouton « Ouvrir un tunnel » pour inviter des personnes d'autres machines. L'outil est téléchargé depuis sa source officielle, avec votre accord, s'il n'est pas installé."
         },
         "promptShare.notifications": {
           "type": "string",
