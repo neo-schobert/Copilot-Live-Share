@@ -116,6 +116,13 @@ export async function run(): Promise<void> {
       const body = await until("l'invité ouvre l'application", () => (fs.existsSync(sync('app-ok.txt')) ? fs.readFileSync(sync('app-ok.txt'), 'utf8') : undefined), 30_000);
       if (body !== 'app-hote:/depuis-invite') throw new Error(`réponse de l'application chez l'invité : ${body}`);
       ok("application de l'hôte (localhost:37195) partagée et ouverte chez l'invité par le relais");
+
+      // Réglage changé depuis le chat de l'hôte (fenêtre Participants).
+      const setting = () => vscode.workspace.getConfiguration('promptShare').get<boolean>('allowGuestModelChoice');
+      if (setting() !== false) throw new Error('les invités choisissent déjà leur modèle par défaut');
+      api.sendToSession({ type: 'setSessionOption', option: 'guestModelChoice', value: true });
+      await until('réglage modifié', () => setting() || undefined, 10_000);
+      ok('case « Les invités choisissent leur modèle » : réglage allowGuestModelChoice activé');
       app.close();
       fs.writeFileSync(doneFile, 'ok');
     } else {

@@ -66,6 +66,8 @@ Les questions des invités partent vers les modèles GitHub Copilot **avec le co
 
 Les questions de l'hôte partent directement, sans validation ni limite.
 
+L'hôte change ces règles pendant la session, depuis le chat : fenêtre **Participants** → **Réglages de la session** (« Les invités choisissent leur modèle », « Valider les questions des invités »). Les cases modifient les réglages `promptShare.allowGuestModelChoice` et `promptShare.reviewGuestQuestions`, et s'appliquent aussitôt à tous.
+
 La première question déclenche en général une demande de **consentement** de VS Code (« autoriser Prompt Share à utiliser les modèles de langage ? ») : l'hôte doit l'accepter. S'il refuse, les participants voient un message d'erreur explicite dans le chat.
 
 ### Rejoindre une session
@@ -218,7 +220,7 @@ L'hôte peut rendre accessible aux participants une application qui tourne sur s
 1. Ouvrir le lien, choisir un pseudo.
 2. Toutes les discussions de la session s'affichent, puis les nouveaux messages en temps réel.
 3. **Discussions** : la colonne de gauche liste les discussions. « + Nouvelle discussion » en ouvre une nouvelle, qui prend le titre de sa première question ; le crayon ✎ la renomme. Chaque discussion a son propre historique : le modèle ne voit que celui de la discussion où la question est posée. Un badge signale les nouveaux messages dans les autres discussions, et la liste des participants indique qui est dans quelle discussion. Seul l'hôte peut supprimer une discussion (🗑, deux clics).
-4. **Modèle** : les invités utilisent le modèle choisi par l'hôte. Si l'hôte l'autorise (`allowGuestModelChoice`), le menu sous la zone de saisie permet d'en choisir un autre ; ce choix est mémorisé par le navigateur.
+4. **Modèle** : par défaut, les invités utilisent le modèle choisi par l'hôte ; le menu sous la zone de saisie affiche alors un cadenas, et un clic explique pourquoi. Si l'hôte l'autorise, le menu permet d'en choisir un autre ; ce choix est mémorisé par le navigateur.
 5. **Accord de l'hôte** : par défaut, une question d'invité affiche « En attente de l'accord de l'hôte… » jusqu'à sa décision. Refusée, elle reste visible mais n'est jamais envoyée au modèle.
 6. Les questions sont traitées une par une, dans l'ordre d'arrivée, toutes discussions confondues ; la page indique qui reçoit une réponse et la position de sa propre question dans la file.
 7. En cas de coupure réseau, la page se reconnecte automatiquement avec le même pseudo et revient sur la même discussion.

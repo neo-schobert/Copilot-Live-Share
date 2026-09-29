@@ -117,6 +117,11 @@
           <div id="people" class="popover" hidden>
             <div class="section-title">Participants</div>
             <ul id="people-list"></ul>
+            <div id="host-options" class="host-options" hidden>
+              <div class="section-title">Réglages de la session</div>
+              <label class="host-option"><input id="opt-model-choice" type="checkbox"><span>Les invités choisissent leur modèle<small>Sinon, ils utilisent le modèle par défaut. Les modèles premium comptent dans votre quota.</small></span></label>
+              <label class="host-option"><input id="opt-review" type="checkbox"><span>Valider les questions des invités<small>Chaque question d’invité attend votre accord avant d’être envoyée au modèle.</small></span></label>
+            </div>
           </div>
         </div>
       </header>
@@ -137,7 +142,7 @@
             <span class="mode-chip" title="L'agent lit le projet et propose modifications et commandes, soumises à validation"><i class="codicon codicon-tools"></i><span class="mode-label">Agent</span></span>
             <label class="model-picker" title="Modèle utilisé pour vos questions">
               <select id="model-select" aria-label="Modèle"></select>
-              <i class="codicon codicon-chevron-down"></i>
+              <i id="model-chevron" class="codicon codicon-chevron-down"></i>
             </label>
             <span class="spacer"></span>
             <button id="cancel" class="icon-btn stop" type="button" title="Arrêter la réponse" hidden><i class="codicon codicon-debug-stop"></i></button>

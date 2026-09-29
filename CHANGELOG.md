@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+- Choix du modèle : quand il est impossible (modèle fixé par l'hôte, un seul modèle…), le menu affiche un cadenas et un clic en donne la raison, au lieu de sembler bloqué.
+- L'hôte règle depuis le chat (fenêtre Participants) si les invités choisissent leur modèle et si leurs questions sont validées.
+
 ## 0.1.3
 
 - Tunnel : choix de Cloudflare ou ngrok à l'ouverture (le dernier est présélectionné), état affiché dans « Inviter » (service, adresse, heure) avec « Copier le lien » et « Arrêter », globe dans la barre d'état, commande « Close Public Tunnel ».

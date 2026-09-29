@@ -432,6 +432,11 @@ button:disabled { cursor: default; opacity: 0.5; }
 }
 .popover ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
 .person { display: flex; align-items: center; gap: 8px; }
+.host-options { display: grid; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.host-option { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--text-strong); cursor: pointer; }
+.host-option input { margin: 2px 0 0; accent-color: var(--accent); flex: none; }
+.host-option span { display: grid; gap: 2px; min-width: 0; }
+.host-option small { color: var(--muted); font-size: 11px; }
 .person-text { min-width: 0; display: grid; }
 .person-name { display: flex; gap: 6px; align-items: center; color: var(--text-strong); }
 .person-where { font-size: 11px; color: var(--muted); background: none; border: none; padding: 0; text-align: left; }
@@ -754,6 +759,9 @@ button.person-where { color: var(--link); }
   text-overflow: ellipsis;
 }
 .model-picker select:disabled { cursor: default; }
+/* Choix impossible (modèle fixé par l'hôte, un seul modèle…) : cadenas, et un clic explique pourquoi. */
+.model-picker.locked { cursor: help; }
+.model-picker.locked select { pointer-events: none; }
 .model-picker select option { background: var(--surface); color: var(--text); }
 .model-picker .codicon { position: absolute; right: 2px; pointer-events: none; font-size: 14px; }
 .send:not(:disabled) { color: var(--text-strong); }

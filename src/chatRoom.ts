@@ -16,6 +16,7 @@ import {
   QueueItem,
   QueueState,
   ServerMessage,
+  SessionOption,
   SessionPolicy,
   SharedApp,
   TunnelProviderId,
@@ -141,6 +142,8 @@ export interface ChatRoomOptions {
   onTunnelRequested?: (provider?: TunnelProviderId) => Promise<InviteResult>;
   /** L'hôte demande la fermeture du tunnel public. */
   onTunnelStop?: () => void;
+  /** L'hôte change un réglage de la session depuis le chat. */
+  onSessionOption?: (option: SessionOption, value: boolean) => void;
   /** Motif de refus du partage de ce port (ex. port du serveur de session), sinon undefined. */
   appRefusal?: (port: number) => string | undefined;
   /** Liste des applications partagées modifiée (coupure des relais d'un port retiré). */
@@ -323,6 +326,13 @@ export class ChatRoom implements ConnectionHandler {
           fail("Seul l'hôte peut ouvrir un tunnel.");
         } else if (this.options.onTunnelRequested) {
           void this.options.onTunnelRequested(msg.provider).then((result) => conn.send({ type: 'invite', ...result }));
+        }
+        break;
+      case 'setSessionOption':
+        if (!state.isHost) {
+          fail("Seul l'hôte peut changer les réglages de la session.");
+        } else {
+          this.options.onSessionOption?.(msg.option, msg.value);
         }
         break;
       case 'stopTunnel':
@@ -1098,6 +1108,10 @@ function parseClientMessage(data: string): ClientMessage | undefined {
         : undefined;
     case 'stopTunnel':
       return { type: 'stopTunnel' };
+    case 'setSessionOption':
+      return (m.option === 'guestModelChoice' || m.option === 'reviewGuestQuestions') && typeof m.value === 'boolean'
+        ? { type: 'setSessionOption', option: m.option, value: m.value }
+        : undefined;
     case 'reviewQuestion':
       return str(m.entryId) && typeof m.accept === 'boolean' ? { type: 'reviewQuestion', entryId: m.entryId, accept: m.accept } : undefined;
     case 'answer':

@@ -2,7 +2,7 @@
   "name": "prompt-share",
   "displayName": "Prompt Share",
   "description": "Chat IA à plusieurs dans VS Code, avec les modèles GitHub Copilot de l'hôte : héberger ou rejoindre une session, agent confiné au projet, l'hôte garde la main. Projet indépendant, non affilié à GitHub ni à Microsoft.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "neo-schobert",
   "license": "MIT",
   "engines": {

@@ -229,7 +229,12 @@ export type ClientMessage =
   /** Réservé à l'hôte : ouvre un tunnel public avec ce service (réponse : message « invite »). */
   | { type: 'startTunnel'; provider?: TunnelProviderId }
   /** Réservé à l'hôte : ferme le tunnel public. */
-  | { type: 'stopTunnel' };
+  | { type: 'stopTunnel' }
+  /** Réservé à l'hôte : réglage de la session modifié depuis le chat. */
+  | { type: 'setSessionOption'; option: SessionOption; value: boolean };
+
+/** Réglages de la session que l'hôte peut changer depuis le chat. */
+export type SessionOption = 'guestModelChoice' | 'reviewGuestQuestions';
 
 // ---- Serveur -> client ----
 

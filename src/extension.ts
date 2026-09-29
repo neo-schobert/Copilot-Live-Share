@@ -503,6 +503,15 @@ async function createSession(context: vscode.ExtensionContext): Promise<void> {
     onInviteRequested: inviteFromChat,
     policy: sessionPolicy,
     onTunnelRequested: (provider) => startTunnel(provider),
+    onSessionOption: (option, value) => {
+      // Réglage utilisateur : la diffusion suit (onDidChangeConfiguration).
+      const key = option === 'guestModelChoice' ? 'allowGuestModelChoice' : 'reviewGuestQuestions';
+      log(`Réglage modifié depuis le chat : ${key} = ${value}`);
+      const config = vscode.workspace.getConfiguration(CONFIG);
+      // Une valeur propre à l'espace de travail l'emporterait sur le réglage global : on la modifie elle.
+      const target = config.inspect(key)?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+      void config.update(key, value, target);
+    },
     onTunnelStop: () => {
       if (session) {
         stopTunnel(session);

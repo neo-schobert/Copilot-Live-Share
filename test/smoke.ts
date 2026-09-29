@@ -173,6 +173,7 @@ async function main() {
       return { publicUrl: 'https://x.trycloudflare.com', localUrl: `http://127.0.0.1:${PORT}`, copied: true, tunnel: 'Cloudflare' };
     },
     onTunnelStop: () => tunnelCalls.push('stop'),
+    onSessionOption: (option, value) => tunnelCalls.push(`${option}=${value}`),
     onInviteRequested: async (publicUrl, copy) => ({
       publicUrl: publicUrl ?? '',
       localUrl: `http://127.0.0.1:${PORT}`,
@@ -607,11 +608,14 @@ async function main() {
   const host2 = await Client.join('hote', HOST);
   await host2.waitFor((m) => m.type === 'tunnel' && m.tunnel.url === 'https://x.ngrok-free.app');
   host.send({ type: 'stopTunnel' });
+  bob2.send({ type: 'setSessionOption', option: 'guestModelChoice', value: true });
+  await bob2.waitFor((m) => m.type === 'error' && m.message.includes('réglages de la session'));
+  host.send({ type: 'setSessionOption', option: 'guestModelChoice', value: true });
   await sleep(50);
-  assert.deepEqual(tunnelCalls, ['start:ngrok', 'stop']);
+  assert.deepEqual(tunnelCalls, ['start:ngrok', 'stop', 'guestModelChoice=true']);
   assert.ok(![alice, bob2].some((c) => c.messages.some((m) => m.type === 'tunnel')), "l'état du tunnel n'est envoyé qu'à l'hôte");
   host2.ws.close();
-  ok("Tunnel : service choisi transmis, état envoyé à l'hôte seul (et aux nouvelles pages de l'hôte), ouverture et arrêt réservés à l'hôte");
+  ok("Tunnel et réglages : service choisi transmis, état envoyé à l'hôte seul, ouverture, arrêt et réglages réservés à l'hôte");
 
   // 12. Arrêt : tous les clients sont prévenus et déconnectés
   room.dispose("L'hôte a arrêté la session.");

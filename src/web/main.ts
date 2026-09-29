@@ -50,6 +50,10 @@ const askForm = $<HTMLFormElement>('ask-form');
 const askInput = $<HTMLTextAreaElement>('ask-input');
 const askSend = $<HTMLButtonElement>('ask-send');
 const modelSelect = $<HTMLSelectElement>('model-select');
+const modelChevron = $<HTMLElement>('model-chevron');
+const hostOptions = $<HTMLElement>('host-options');
+const optModelChoice = $<HTMLInputElement>('opt-model-choice');
+const optReview = $<HTMLInputElement>('opt-review');
 const presenceEl = $<HTMLElement>('presence');
 const jumpBtn = $<HTMLButtonElement>('jump');
 const inviteBtn = $<HTMLButtonElement>('invite-btn');
@@ -119,6 +123,8 @@ let tunnel: TunnelState | undefined;
 const TUNNEL_LABELS: Record<TunnelProviderId, string> = { cloudflare: 'Cloudflare', ngrok: 'ngrok' };
 let queue: QueueState = { current: null, pending: [] };
 let models: ModelsState = { available: [], defaultId: null, guestsCanChoose: true };
+/** Pourquoi le choix du modèle est impossible ('' : possible). */
+let lockReason = '';
 /** Modèle choisi par ce participant ; '' = modèle par défaut de la session. */
 let chosenModel = storage('local', 'scc.model') ?? '';
 /** Participants en train d'écrire : clientId -> discussion et échéance de l'indicateur. */
@@ -497,6 +503,7 @@ function handle(msg: ServerMessage): void {
     case 'policy':
       policy = msg.policy;
       renderPolicy();
+      renderHostOptions();
       break;
     case 'tunnel':
       tunnel = msg.tunnel;
@@ -1453,9 +1460,39 @@ function renderModels(): void {
   }
   modelSelect.replaceChildren(...options);
   modelSelect.value = canChoose ? chosenModel : '';
-  modelSelect.disabled = ended || !canChoose || models.available.length < 2;
-  modelSelect.parentElement!.title = canChoose ? 'Modèle utilisé pour vos questions' : "L'hôte a fixé le modèle de la session";
+  lockReason = ended
+    ? ''
+    : !models.available.length
+      ? 'Aucun modèle Copilot disponible chez l’hôte pour le moment.'
+      : !canChoose
+        ? 'L’hôte a fixé le modèle de la session : vos questions utilisent le modèle par défaut.'
+        : models.available.length < 2
+          ? 'Un seul modèle est disponible chez l’hôte.'
+          : '';
+  modelSelect.disabled = ended || !!lockReason;
+  const picker = modelSelect.parentElement!;
+  picker.classList.toggle('locked', !!lockReason);
+  picker.title = lockReason || 'Modèle utilisé pour vos questions';
+  modelChevron.className = `codicon codicon-${lockReason ? 'lock' : 'chevron-down'}`;
+  renderHostOptions();
 }
+
+
+modelSelect.parentElement!.addEventListener('click', () => {
+  if (lockReason) {
+    toast(me?.isHost || !lockReason.startsWith('L’hôte') ? lockReason : `${lockReason} Demandez-lui de l’autoriser.`);
+  }
+});
+
+/** Réglages de la session modifiables par l'hôte depuis le chat (fenêtre Participants). */
+function renderHostOptions(): void {
+  hostOptions.hidden = !me?.isHost || ended;
+  optModelChoice.checked = models.guestsCanChoose;
+  optReview.checked = policy.reviewGuestQuestions;
+}
+
+optModelChoice.addEventListener('change', () => send({ type: 'setSessionOption', option: 'guestModelChoice', value: optModelChoice.checked }));
+optReview.addEventListener('change', () => send({ type: 'setSessionOption', option: 'reviewGuestQuestions', value: optReview.checked }));
 
 modelSelect.addEventListener('change', () => {
   chosenModel = modelSelect.value;
